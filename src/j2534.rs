@@ -108,7 +108,33 @@ impl PassThruMsg {
 /// Bench Tacoma identifiers — obviously synthetic (VIN contains `VIRTUAL`).
 pub const VIRTUAL_TACOMA_VIN: &str = "5TFRX54N0VIRT0001";
 pub const VIRTUAL_TACOMA_CAL_ID: &str = "89663-VIRT01";
+pub const VIRTUAL_TACOMA_TCM_CAL_ID: &str = "89662-VIRT01";
+pub const VIRTUAL_SILVERADO_TCM_CAL_ID: &str = "24268164-VIRT";
 pub const VIRTUAL_TACOMA_CVN_HEX: &str = "DEADBEEF";
+
+pub fn virtual_tcm_cal_id_for_profile(profile_id: &str) -> String {
+    if profile_id.contains("silverado") {
+        VIRTUAL_SILVERADO_TCM_CAL_ID.to_string()
+    } else {
+        VIRTUAL_TACOMA_TCM_CAL_ID.to_string()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BenchEcuRole {
+    Ecm,
+    Tcm,
+}
+
+fn bench_rx_id_for_tx(tx_id: u32) -> (u32, BenchEcuRole) {
+    match tx_id {
+        0x7E1 => (0x7E9, BenchEcuRole::Tcm),
+        0x7E0 => (0x7E8, BenchEcuRole::Ecm),
+        0x18DA28F1 => (0x18DAF128, BenchEcuRole::Tcm),
+        0x18DA10F1 => (0x18DAF110, BenchEcuRole::Ecm),
+        _ => (0x7E8, BenchEcuRole::Ecm),
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct J2534DeviceInfo {
@@ -548,7 +574,7 @@ impl VirtualEcuSimulator {
         }
     }
 
-    fn handle_uds_request(&mut self, req: &[u8]) -> Vec<u8> {
+    fn handle_uds_request(&mut self, req: &[u8], role: BenchEcuRole) -> Vec<u8> {
         if req.is_empty() {
             return vec![0x7F, 0x00, 0x13];
         }
@@ -628,10 +654,25 @@ impl VirtualEcuSimulator {
                             resp.extend_from_slice(VIRTUAL_TACOMA_CAL_ID.as_bytes());
                             resp
                         }
+                        0xF182 => {
+                            let mut resp = vec![0x62, 0xF1, 0x82];
+                            resp.extend_from_slice(VIRTUAL_TACOMA_TCM_CAL_ID.as_bytes());
+                            resp
+                        }
                         0x00C1 => {
-                            // GM Cal ID: 12619623
+                            // GM ECM Cal ID: 12619623
                             let mut resp = vec![0x62, 0x00, 0xC1];
                             resp.extend_from_slice(b"12619623");
+                            resp
+                        }
+                        0x00C2 => {
+                            let mut resp = vec![0x62, 0x00, 0xC2];
+                            let cal = if role == BenchEcuRole::Tcm {
+                                VIRTUAL_SILVERADO_TCM_CAL_ID
+                            } else {
+                                "24268163"
+                            };
+                            resp.extend_from_slice(cal.as_bytes());
                             resp
                         }
                         0xF010 => {
@@ -815,8 +856,10 @@ impl PassThruDevice for VirtualEcuSimulator {
                 if req_payload.len() > 2 {
                     self.rx_assembly.extend_from_slice(&req_payload[2..]);
                 }
+                let tx_id = msg.read_id();
+                let (rx_id, _) = bench_rx_id_for_tx(tx_id);
                 let fc = vec![0x30, 0x00, 0x00, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA];
-                let mut fc_msg = PassThruMsg::new_can(0x7E8, &fc);
+                let mut fc_msg = PassThruMsg::new_can(rx_id, &fc);
                 fc_msg.protocol_id = self.active_protocol;
                 self.rx_queue.push(fc_msg);
                 continue;
@@ -836,10 +879,12 @@ impl PassThruDevice for VirtualEcuSimulator {
                 req_payload.to_vec()
             };
 
-            let resp_payload = self.handle_uds_request(&complete_req);
+            let tx_id = msg.read_id();
+            let (rx_id, role) = bench_rx_id_for_tx(tx_id);
+            let resp_payload = self.handle_uds_request(&complete_req, role);
 
             if self.active_protocol == ISO15765 || self.active_protocol == CAN {
-                self.enqueue_iso_tp_response(0x7E8, &resp_payload);
+                self.enqueue_iso_tp_response(rx_id, &resp_payload);
             } else if self.active_protocol == ISO14230 {
                 // KWP2000 framing
                 let mut resp_msg = PassThruMsg::default();
