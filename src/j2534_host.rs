@@ -98,6 +98,10 @@ mod imp {
         fn is_tx_full(v: &Value) -> bool {
             v.get("full").and_then(|b| b.as_bool()) == Some(true)
         }
+
+        fn is_can_protocol(&self) -> bool {
+            self.active_protocol == ISO15765 || self.active_protocol == CAN
+        }
     }
 
     impl PassThruDevice for HostPassThruDevice {
@@ -196,10 +200,6 @@ mod imp {
 
         fn disconnect(&mut self, _channel: u32) -> Result<(), String> {
             Ok(())
-        }
-
-        fn is_can_protocol(&self) -> bool {
-            self.active_protocol == ISO15765 || self.active_protocol == CAN
         }
 
         fn read_msgs(&mut self, _channel: u32, timeout_ms: u32) -> Result<Vec<PassThruMsg>, String> {
