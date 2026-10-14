@@ -25,6 +25,7 @@ use crate::security_config::{
 };
 use std::fs;
 use std::path::PathBuf;
+use crate::simple_ux::SimpleUxState;
 use crate::surface_mesh;
 use crate::telemetry::{decode_channel_value, TelemetryBuffer, TelemetryChannelFile};
 use crate::theme::{
@@ -44,6 +45,14 @@ pub enum WorkspaceTab {
     Transmission,
     FlashDiagnostics,
     Switchboard,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BeginnerStep {
+    Connect,
+    Identify,
+    Log,
+    Calibrate,
 }
 
 pub struct WidebandApp {
@@ -111,6 +120,7 @@ pub struct WidebandApp {
 
     // UI Workspace
     pub active_tab: WorkspaceTab,
+    pub simple_ux: SimpleUxState,
 }
 
 impl WidebandApp {
@@ -200,6 +210,7 @@ impl WidebandApp {
             tcm_param_view,
             tcm_flash_confirm_open: false,
             active_tab: WorkspaceTab::Calibration,
+            simple_ux: SimpleUxState::load(),
         };
 
         if let Some(idx) = app
@@ -215,8 +226,10 @@ impl WidebandApp {
             app.log(&format!("Security config: {}", sec_note));
         }
 
-        // Auto-connect to Virtual ECU Loopback on startup for instant live preview
-        app.connect_cable();
+        app.select_profile_id("tacoma-can");
+        if !app.simple_ux.wizard_open {
+            app.connect_cable();
+        }
         app
     }
 
@@ -453,7 +466,7 @@ impl WidebandApp {
         }
     }
 
-    fn cable_is_virtual(&self) -> bool {
+    pub(crate) fn cable_is_virtual(&self) -> bool {
         if self.is_connected {
             self.active_device_virtual
         } else {
@@ -731,7 +744,7 @@ impl WidebandApp {
         let compact_badge = tier != StudioHeaderTier::Wide;
         let tabs_compact = tier != StudioHeaderTier::Wide;
         let stacked = tier != StudioHeaderTier::Wide;
-        let header_h = if stacked { 84.0 } else { 48.0 };
+        let header_h = if stacked { 112.0 } else { 76.0 };
         let profile_combo_w = match tier {
             StudioHeaderTier::Compact => 130.0,
             StudioHeaderTier::Medium => 170.0,
@@ -757,7 +770,11 @@ impl WidebandApp {
                                 self.paint_connect_controls(ui, device_combo_w);
                             });
                         });
-                        self.paint_workspace_tabs(ui, tabs_compact);
+                        if !self.simple_ux.is_beginner() {
+                            self.paint_workspace_tabs(ui, tabs_compact);
+                        }
+                        ui.add_space(4.0);
+                        self.render_skill_and_practice_bar(ui);
                     });
                 } else {
                     ui.horizontal(|ui| {
@@ -769,9 +786,13 @@ impl WidebandApp {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             self.paint_connect_controls(ui, device_combo_w);
                             ui.add_space(10.0);
-                            self.paint_workspace_tabs(ui, false);
+                            if !self.simple_ux.is_beginner() {
+                                self.paint_workspace_tabs(ui, false);
+                            }
                         });
                     });
+                    ui.add_space(2.0);
+                    self.render_skill_and_practice_bar(ui);
                 }
             });
     }
@@ -791,7 +812,7 @@ impl WidebandApp {
         &self.tcm_profiles[self.selected_tcm_profile_idx.min(self.tcm_profiles.len().saturating_sub(1))]
     }
 
-    fn paint_profile_selector(&mut self, ui: &mut egui::Ui, width: f32) {
+    pub(crate) fn paint_profile_selector(&mut self, ui: &mut egui::Ui, width: f32) {
         ui.label(egui::RichText::new("Vehicle").size(11.0).color(MUTED));
         let prev_ecm = self.selected_profile_idx;
         egui::ComboBox::from_id_salt("profile_select")
@@ -807,7 +828,7 @@ impl WidebandApp {
         }
     }
 
-    fn paint_connect_controls(&mut self, ui: &mut egui::Ui, device_combo_w: f32) {
+    pub(crate) fn paint_connect_controls(&mut self, ui: &mut egui::Ui, device_combo_w: f32) {
         if self.is_connected {
             if ui
                 .button(egui::RichText::new("Disconnect").size(11.0).color(MUTED))
@@ -993,6 +1014,7 @@ impl WidebandApp {
 impl eframe::App for WidebandApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_telemetry();
+        self.tick_virtual_ladder();
         ctx.request_repaint();
 
         theme::apply_motorsport_theme(ctx);
@@ -1000,16 +1022,21 @@ impl eframe::App for WidebandApp {
         let tier = theme::studio_header_tier(ctx);
         self.render_studio_header(ctx, tier);
 
-        // -------------------------------------------------------------------
-        // Workspace View Rendering
-        // -------------------------------------------------------------------
-        match self.active_tab {
-            WorkspaceTab::Calibration => self.render_calibration_tab(ctx),
-            WorkspaceTab::Telemetry => self.render_telemetry_tab(ctx),
-            WorkspaceTab::Transmission => self.render_transmission_tab(ctx),
-            WorkspaceTab::FlashDiagnostics => self.render_flash_tab(ctx),
-            WorkspaceTab::Switchboard => self.render_switchboard_tab(ctx),
+        if !self.simple_ux.wizard_open {
+            if self.simple_ux.is_beginner() {
+                self.render_beginner_workspace(ctx);
+            } else {
+                match self.active_tab {
+                    WorkspaceTab::Calibration => self.render_calibration_tab(ctx, false),
+                    WorkspaceTab::Telemetry => self.render_telemetry_tab(ctx, false),
+                    WorkspaceTab::Transmission => self.render_transmission_tab(ctx),
+                    WorkspaceTab::FlashDiagnostics => self.render_flash_tab(ctx),
+                    WorkspaceTab::Switchboard => self.render_switchboard_tab(ctx),
+                }
+            }
         }
+
+        self.render_ux_overlays(ctx);
     }
 }
 
@@ -1018,7 +1045,7 @@ impl eframe::App for WidebandApp {
 // ---------------------------------------------------------------------------
 
 impl WidebandApp {
-    fn render_calibration_tab(&mut self, ctx: &egui::Context) {
+    pub(crate) fn render_calibration_tab(&mut self, ctx: &egui::Context, beginner_mode: bool) {
         let (panel_default, panel_min, panel_max) = theme::side_panel_widths(ctx);
         // Left Parameter Tree
         egui::SidePanel::left("param_tree")
@@ -1065,6 +1092,11 @@ impl WidebandApp {
                                 let table_count = self.xdf.tables.len();
                                 for idx in 0..table_count {
                                     let table_id = self.xdf.tables[idx].id.clone();
+                                    if beginner_mode
+                                        && !crate::simple_ux::is_beginner_safe_table(&table_id)
+                                    {
+                                        continue;
+                                    }
                                     let table_title = self.xdf.tables[idx].title.clone();
                                     let table_desc = self.xdf.tables[idx].description.clone();
                                     let table_units = self.xdf.tables[idx].z_units.clone();
@@ -1143,6 +1175,11 @@ impl WidebandApp {
                                 );
                                 ui.add_space(4.0);
                                 for (i, c) in self.xdf.constants.iter().enumerate() {
+                                    if beginner_mode
+                                        && !crate::simple_ux::is_beginner_safe_constant(&c.id)
+                                    {
+                                        continue;
+                                    }
                                     if !param_matches_query(
                                         &self.search_query,
                                         &c.title,
@@ -1187,6 +1224,7 @@ impl WidebandApp {
                     });
             });
 
+        if !beginner_mode {
         // Right 3D Isometric Surface Mesh
         egui::SidePanel::right("surface_mesh_panel")
             .resizable(true)
@@ -1241,13 +1279,24 @@ impl WidebandApp {
                 ui.add_space(6.0);
                 self.paint_live_telemetry_card(ui);
             });
+        }
 
         // Center Heatmap Table Grid
         egui::CentralPanel::default()
             .frame(theme::panel_frame())
             .show(ctx, |ui| {
+                if beginner_mode {
+                    ui.label(
+                        egui::RichText::new(
+                            "Beginner cal subset — lambda & VE tables plus rev limiter scalar only.",
+                        )
+                        .small()
+                        .color(MUTED),
+                    );
+                    ui.add_space(4.0);
+                }
                 ui.horizontal_wrapped(|ui| {
-                    if ui.button("Open ROM (.bin / .cuw)").clicked() {
+                    if !beginner_mode && ui.button("Open ROM (.bin / .cuw)").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("ROM image", &["bin", "cuw"])
                             .pick_file()
@@ -1255,7 +1304,7 @@ impl WidebandApp {
                             self.load_rom_from_path(path);
                         }
                     }
-                    if ui.button("Open XDF").clicked() {
+                    if !beginner_mode && ui.button("Open XDF").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("TunerPro XDF", &["xdf"])
                             .pick_file()
@@ -1263,7 +1312,7 @@ impl WidebandApp {
                             self.load_xdf_from_path(path);
                         }
                     }
-                    if ui.button("Save ROM").clicked() {
+                    if !beginner_mode && ui.button("Save ROM").clicked() {
                         let mut dialog = rfd::FileDialog::new().add_filter("ROM image", &["bin"]);
                         if let Some(p) = &self.rom_path {
                             if let Some(name) = p.file_name() {
@@ -1274,23 +1323,25 @@ impl WidebandApp {
                             self.save_rom_to_path(path);
                         }
                     }
-                    let rom_label = self
-                        .rom_path
-                        .as_ref()
-                        .and_then(|p| p.file_name())
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "No ROM file".to_string());
-                    let xdf_label = self
-                        .xdf_path
-                        .as_ref()
-                        .and_then(|p| p.file_name())
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| self.xdf.title.clone());
-                    ui.label(
-                        egui::RichText::new(format!("ROM: {} | XDF: {}", rom_label, xdf_label))
-                            .small()
-                            .color(MUTED),
-                    );
+                    if !beginner_mode {
+                        let rom_label = self
+                            .rom_path
+                            .as_ref()
+                            .and_then(|p| p.file_name())
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "No ROM file".to_string());
+                        let xdf_label = self
+                            .xdf_path
+                            .as_ref()
+                            .and_then(|p| p.file_name())
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| self.xdf.title.clone());
+                        ui.label(
+                            egui::RichText::new(format!("ROM: {} | XDF: {}", rom_label, xdf_label))
+                                .small()
+                                .color(MUTED),
+                        );
+                    }
                 });
                 ui.add_space(6.0);
                 ui.separator();
@@ -1343,10 +1394,10 @@ impl WidebandApp {
                     if ui.button("  =  ").clicked() {
                         self.run_table_math('=');
                     }
-                    if ui.button("Interpolate Row").clicked() {
+                    if !beginner_mode && ui.button("Interpolate Row").clicked() {
                         self.interpolate_active_row();
                     }
-                    if ui.button("Smooth 3D").clicked() {
+                    if !beginner_mode && ui.button("Smooth 3D").clicked() {
                         self.smooth_table();
                     }
                 });
@@ -1478,7 +1529,7 @@ impl WidebandApp {
 // ---------------------------------------------------------------------------
 
 impl WidebandApp {
-    fn render_telemetry_tab(&mut self, ctx: &egui::Context) {
+    pub(crate) fn render_telemetry_tab(&mut self, ctx: &egui::Context, beginner_mode: bool) {
         let (gauge_channels, recording, def_title, stats_line, rate_rows) = {
             let buf = self.telemetry.lock().unwrap();
             let gauges: Vec<(String, String, String, [u8; 3])> = buf
@@ -1525,7 +1576,7 @@ impl WidebandApp {
         egui::TopBottomPanel::top("gauge_strip").min_height(72.0).show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Export CSV").clicked() {
+                    if !beginner_mode && ui.button("Export CSV").clicked() {
                         let path = "datalog.csv".to_string();
                         let tele = Arc::clone(&self.telemetry);
                         let has_data = tele.lock().map(|b| !b.frames.is_empty()).unwrap_or(false);
@@ -1550,7 +1601,7 @@ impl WidebandApp {
                             "Telemetry recording stopped."
                         });
                     }
-                    if ui.button("Clear").clicked() {
+                    if !beginner_mode && ui.button("Clear").clicked() {
                         self.telemetry.lock().unwrap().clear();
                         self.log("Telemetry history cleared.");
                     }
@@ -1580,9 +1631,14 @@ impl WidebandApp {
                         .color(Color32::GRAY),
                 );
             });
-            ui.label(egui::RichText::new(stats_line).size(11.0).monospace().color(MUTED));
+            if !beginner_mode {
+                ui.label(egui::RichText::new(stats_line).size(11.0).monospace().color(MUTED));
+            }
             ui.horizontal_wrapped(|ui| {
                 for (label, hz, skips) in &rate_rows {
+                    if beginner_mode {
+                        break;
+                    }
                     let color = if *skips > 0 {
                         Color32::from_rgb(0xF8, 0x51, 0x49)
                     } else {
@@ -1605,6 +1661,13 @@ impl WidebandApp {
                 }
             });
             ui.add_space(4.0);
+            if beginner_mode {
+                if ui.button("Next: Safe cal edits →").clicked() {
+                    self.simple_ux.beginner_step = BeginnerStep::Calibrate;
+                    self.sync_beginner_step_to_tab();
+                }
+                ui.add_space(4.0);
+            }
 
             let plot_h = ui.available_size().y.max(160.0);
             let buffer = self.telemetry.lock().unwrap();
@@ -2256,7 +2319,7 @@ impl WidebandApp {
         self.diag_snapshot.freeze_frames.first()
     }
 
-    fn refresh_diagnostics(&mut self) {
+    pub(crate) fn refresh_diagnostics(&mut self) {
         self.diag_last_error.clear();
         if self.active_device.is_none() {
             self.diag_last_error = "Connect cable first.".to_string();
