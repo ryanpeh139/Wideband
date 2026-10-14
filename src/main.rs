@@ -18,6 +18,7 @@ pub mod protocols;
 pub mod security_config;
 pub mod security_session;
 pub mod telemetry;
+pub mod telemetry_playback;
 pub mod surface_mesh;
 pub mod simple_ux;
 pub mod tcm;

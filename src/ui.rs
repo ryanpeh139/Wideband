@@ -23,18 +23,23 @@ use crate::security_config::{
     key_registration_label, security_mode_label, PlatformSecurity, KeyRegistration, SecurityMode,
     CHECKSUM_NOT_CONFIGURED, CHECKSUM_VALID,
 };
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use crate::simple_ux::SimpleUxState;
 use crate::surface_mesh;
-use crate::telemetry::{decode_channel_value, TelemetryBuffer, TelemetryChannelFile};
+use crate::telemetry::{decode_channel_value, TelemetryBuffer, TelemetryChannelFile, TelemetryFrame};
+use crate::telemetry_playback::{
+    import_log_csv, ImportedLog, LogMarker, MathChannelDef, TelemetryPlaybackState,
+    TelemetryViewMode,
+};
 use crate::theme::{
     self, paint_live_cell_glow, paint_studio_badge, studio_tab_button, ACCENT_CYAN, CARD_FILL,
     EMERALD, MUTED, STROKE, TEXT, heatmap_color,
 };
 use eframe::egui::{self, Color32, Stroke, Vec2};
 use egui_extras::{Column, TableBuilder};
-use egui_plot::{Line, Plot, PlotPoints};
+use egui_plot::{Line, Plot, PlotPoints, PlotUi};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -92,6 +97,7 @@ pub struct WidebandApp {
     pub trace_map: f32,
     pub live_poller_active: bool,
     pub last_poll_time: Instant,
+    pub telemetry_playback: TelemetryPlaybackState,
 
     // 3D Surface Mesh
     pub mesh_yaw: f32,
@@ -201,6 +207,7 @@ impl WidebandApp {
             trace_map: 70.0,
             live_poller_active: true,
             last_poll_time: Instant::now(),
+            telemetry_playback: TelemetryPlaybackState::default(),
             mesh_yaw: 0.785,  // 45 degrees
             mesh_pitch: 0.523, // 30 degrees
             mesh_zoom: 1.0,
@@ -1132,6 +1139,8 @@ impl eframe::App for WidebandApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_telemetry();
         self.tick_virtual_ladder();
+        let dt = ctx.input(|i| i.stable_dt) as f64;
+        self.telemetry_playback.tick_playback(dt);
         ctx.request_repaint();
 
         theme::apply_motorsport_theme(ctx);
@@ -1654,6 +1663,8 @@ impl WidebandApp {
 
 impl WidebandApp {
     pub(crate) fn render_telemetry_tab(&mut self, ctx: &egui::Context, beginner_mode: bool) {
+        let channel_defs = self.telemetry.lock().unwrap().channels.clone();
+
         let (gauge_channels, recording, def_title, stats_line, rate_rows) = {
             let buf = self.telemetry.lock().unwrap();
             let gauges: Vec<(String, String, String, [u8; 3])> = buf
@@ -1725,7 +1736,7 @@ impl WidebandApp {
                             "Telemetry recording stopped."
                         });
                     }
-                    if !beginner_mode && ui.button("Clear").clicked() {
+                    if !beginner_mode && ui.button("Clear live").clicked() {
                         self.telemetry.lock().unwrap().clear();
                         self.log("Telemetry history cleared.");
                     }
@@ -1742,48 +1753,240 @@ impl WidebandApp {
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.heading(
-                    egui::RichText::new("Definition-Driven Live Strip Chart")
-                        .size(15.0)
-                        .color(Color32::WHITE),
+        if !beginner_mode {
+        egui::SidePanel::left("telemetry_playback_panel")
+            .default_width(280.0)
+            .min_width(220.0)
+            .show(ctx, |ui| {
+                ui.heading(egui::RichText::new("Log playback").size(14.0));
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    ui.label("View:");
+                    egui::ComboBox::from_id_salt("tel_view_mode")
+                        .selected_text(Self::view_mode_label(self.telemetry_playback.mode))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.telemetry_playback.mode,
+                                TelemetryViewMode::Live,
+                                "Live",
+                            );
+                            ui.selectable_value(
+                                &mut self.telemetry_playback.mode,
+                                TelemetryViewMode::Playback,
+                                "Playback",
+                            );
+                            ui.selectable_value(
+                                &mut self.telemetry_playback.mode,
+                                TelemetryViewMode::CompareOverlay,
+                                "Compare overlay",
+                            );
+                            ui.selectable_value(
+                                &mut self.telemetry_playback.mode,
+                                TelemetryViewMode::CompareSideBySide,
+                                "Compare side-by-side",
+                            );
+                        });
+                });
+
+                if ui.button("Open CSV log…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("CSV", &["csv"])
+                        .pick_file()
+                    {
+                        match import_log_csv(&path, &channel_defs) {
+                            Ok(log) => {
+                                self.telemetry_playback.set_primary_log(log);
+                                let msg = self.telemetry_playback.status_message.clone();
+                                self.log(&msg);
+                            }
+                            Err(e) => self.log(&format!("Log import failed: {}", e)),
+                        }
+                    }
+                }
+                if ui.button("Open compare log…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("CSV", &["csv"])
+                        .pick_file()
+                    {
+                        match import_log_csv(&path, &channel_defs) {
+                            Ok(log) => {
+                                self.telemetry_playback.set_compare_log(log);
+                                let msg = self.telemetry_playback.status_message.clone();
+                                self.log(&msg);
+                            }
+                            Err(e) => self.log(&format!("Compare import failed: {}", e)),
+                        }
+                    }
+                }
+
+                if self.telemetry_playback.primary.is_some() {
+                    let frame_max = self
+                        .telemetry_playback
+                        .primary
+                        .as_ref()
+                        .map(|l| l.frames.len().saturating_sub(1))
+                        .unwrap_or(0);
+                    let mut scrub = self.telemetry_playback.scrub_frame.min(frame_max) as f32;
+                    ui.add(
+                        egui::Slider::new(&mut scrub, 0.0..=frame_max as f32)
+                            .text("Scrub")
+                            .smart_aim(false),
+                    );
+                    self.telemetry_playback.scrub_frame = scrub as usize;
+                    self.telemetry_playback.clamp_scrub();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "t = {:.2}s · frame {}/{}",
+                            self.telemetry_playback.scrub_time_sec(),
+                            self.telemetry_playback.scrub_frame + 1,
+                            frame_max + 1
+                        ))
+                        .small()
+                        .monospace(),
+                    );
+                    ui.horizontal(|ui| {
+                        let play_label = if self.telemetry_playback.playing { "⏸ Pause" } else { "▶ Play" };
+                        if ui.button(play_label).clicked() {
+                            self.telemetry_playback.playing = !self.telemetry_playback.playing;
+                        }
+                        ui.add(
+                            egui::DragValue::new(&mut self.telemetry_playback.play_speed)
+                                .speed(0.05)
+                                .range(0.25..=4.0)
+                                .suffix("×"),
+                        );
+                    });
+                }
+
+                ui.separator();
+                ui.label(egui::RichText::new("Markers").strong());
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.telemetry_playback.marker_label_draft)
+                            .hint_text("Label"),
+                    );
+                });
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.telemetry_playback.marker_comment_draft)
+                        .desired_rows(2)
+                        .hint_text("Comment"),
                 );
+                if ui.button("Add marker at scrub").clicked() {
+                    self.telemetry_playback.add_marker_at_scrub();
+                    let msg = self.telemetry_playback.status_message.clone();
+                    self.log(&msg);
+                }
+                if let Some(log) = &self.telemetry_playback.primary {
+                    for (i, m) in log.markers.iter().enumerate() {
+                        let sel = self.telemetry_playback.selected_marker == Some(i);
+                        if ui
+                            .selectable_label(sel, format!("{:.2}s — {}", m.time_sec, m.label))
+                            .clicked()
+                        {
+                            self.telemetry_playback.selected_marker = Some(i);
+                        }
+                        if sel && !m.comment.is_empty() {
+                            ui.label(egui::RichText::new(&m.comment).small().color(MUTED));
+                        }
+                    }
+                }
+
+                ui.separator();
+                ui.label(egui::RichText::new("Math channels").strong());
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.telemetry_playback.formula_draft)
+                        .hint_text("e.g. lambda / target"),
+                );
+                if ui.button("Add math channel").clicked() {
+                    let id = format!("math_{}", self.telemetry_playback.math_channels.len() + 1);
+                    self.telemetry_playback.math_channels.push(MathChannelDef {
+                        id,
+                        label: self.telemetry_playback.formula_draft.clone(),
+                        formula: self.telemetry_playback.formula_draft.clone(),
+                        unit: "".into(),
+                        color: [200, 120, 255],
+                    });
+                }
+                for ch in &self.telemetry_playback.math_channels {
+                    ui.label(
+                        egui::RichText::new(format!("{} = {}", ch.label, ch.formula))
+                            .small()
+                            .monospace(),
+                    );
+                }
+                if let (Some(log), Some(idx)) = (
+                    self.telemetry_playback.primary.as_ref(),
+                    self.telemetry_playback.primary.as_ref().map(|_| self.telemetry_playback.scrub_frame),
+                ) {
+                    if let Some(math) = self.telemetry_playback.math_channels.first() {
+                        if let Some(v) = log.eval_math(math, idx, &channel_defs) {
+                            ui.label(
+                                egui::RichText::new(format!("@ scrub: {:.4}", v))
+                                    .small()
+                                    .color(ACCENT_CYAN),
+                            );
+                        }
+                    }
+                }
+
+                if !self.telemetry_playback.status_message.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(&self.telemetry_playback.status_message)
+                            .small()
+                            .color(MUTED),
+                    );
+                }
+            });
+        }
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let mode = if beginner_mode {
+                TelemetryViewMode::Live
+            } else {
+                self.telemetry_playback.mode
+            };
+            let title = match mode {
+                TelemetryViewMode::Live => "Definition-Driven Live Strip Chart",
+                TelemetryViewMode::Playback => "CSV Log Playback",
+                TelemetryViewMode::CompareOverlay => "Multi-Log Compare (overlay)",
+                TelemetryViewMode::CompareSideBySide => "Multi-Log Compare (side-by-side)",
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.heading(egui::RichText::new(title).size(15.0).color(Color32::WHITE));
                 ui.label(
                     egui::RichText::new(format!("({})", def_title))
                         .small()
                         .color(Color32::GRAY),
                 );
             });
-            if !beginner_mode {
+            if !beginner_mode && mode == TelemetryViewMode::Live {
                 ui.label(egui::RichText::new(stats_line).size(11.0).monospace().color(MUTED));
-            }
-            ui.horizontal_wrapped(|ui| {
-                for (label, hz, skips) in &rate_rows {
-                    if beginner_mode {
-                        break;
-                    }
-                    let color = if *skips > 0 {
-                        Color32::from_rgb(0xF8, 0x51, 0x49)
-                    } else {
-                        ACCENT_CYAN
-                    };
-                    ui.label(
-                        egui::RichText::new(format!("{} {:.1} Hz", label, hz))
-                            .size(10.0)
-                            .monospace()
-                            .color(color),
-                    );
-                    if *skips > 0 {
+                ui.horizontal_wrapped(|ui| {
+                    for (label, hz, skips) in &rate_rows {
+                        let color = if *skips > 0 {
+                            Color32::from_rgb(0xF8, 0x51, 0x49)
+                        } else {
+                            ACCENT_CYAN
+                        };
                         ui.label(
-                            egui::RichText::new(format!("(-{})", skips))
+                            egui::RichText::new(format!("{} {:.1} Hz", label, hz))
                                 .size(10.0)
-                                .color(Color32::from_rgb(0xF8, 0x51, 0x49)),
+                                .monospace()
+                                .color(color),
                         );
+                        if *skips > 0 {
+                            ui.label(
+                                egui::RichText::new(format!("(-{})", skips))
+                                    .size(10.0)
+                                    .color(Color32::from_rgb(0xF8, 0x51, 0x49)),
+                            );
+                        }
+                        ui.add_space(8.0);
                     }
-                    ui.add_space(8.0);
-                }
-            });
+                });
+            }
             ui.add_space(4.0);
             if beginner_mode {
                 if ui.button("Next: Safe cal edits →").clicked() {
@@ -1794,44 +1997,227 @@ impl WidebandApp {
             }
 
             let plot_h = ui.available_size().y.max(160.0);
-            let buffer = self.telemetry.lock().unwrap();
-            let mut plot_lines: Vec<Line> = Vec::new();
-            for (ch_idx, ch) in buffer.channels.iter().enumerate() {
-                if ch.plot.is_none() {
-                    continue;
-                }
-                let scale = ch.plot_scale();
-                let mut points = Vec::new();
-                for frame in &buffer.frames {
-                    if ch_idx < frame.values.len() {
-                        points.push([frame.time_sec, frame.values[ch_idx] as f64 * scale]);
-                    }
-                }
-                let rgb = ch.plot_color();
-                let name = if scale != 1.0 {
-                    format!("{} (×{})", ch.label, scale)
-                } else {
-                    ch.label.clone()
-                };
-                plot_lines.push(
-                    Line::new(PlotPoints::new(points))
-                        .color(Color32::from_rgb(rgb[0], rgb[1], rgb[2]))
-                        .name(name),
-                );
-            }
+            let math_channels = self.telemetry_playback.math_channels.clone();
 
-            Plot::new("telemetry_oscilloscope")
-                .height(plot_h)
-                .width(ui.available_width())
-                .view_aspect(ui.available_width() / plot_h.max(1.0))
-                .show_axes([true, true])
-                .legend(egui_plot::Legend::default())
-                .show(ui, |plot_ui| {
-                    for line in plot_lines {
-                        plot_ui.line(line);
+            match mode {
+                TelemetryViewMode::Live => {
+                    let buffer = self.telemetry.lock().unwrap();
+                    let lines = Self::build_channel_plot_lines(
+                        &buffer.channels,
+                        buffer.frames.iter().collect(),
+                        &math_channels,
+                        &channel_defs,
+                        None,
+                        None,
+                    );
+                    Self::paint_telemetry_plot(ui, "telemetry_oscilloscope", plot_h, lines, &[]);
+                }
+                TelemetryViewMode::Playback => {
+                    if let Some(log) = self.telemetry_playback.primary.as_ref() {
+                        let end = self.telemetry_playback.scrub_frame + 1;
+                        let slice: Vec<&TelemetryFrame> = log.frames.iter().take(end).collect();
+                        let markers = log.markers.clone();
+                        let lines = Self::build_channel_plot_lines(
+                            &channel_defs,
+                            slice,
+                            &math_channels,
+                            &channel_defs,
+                            None,
+                            Some(log),
+                        );
+                        let playhead = log.frames.get(self.telemetry_playback.scrub_frame).map(|f| f.time_sec);
+                        Self::paint_telemetry_plot(ui, "telemetry_playback", plot_h, lines, &markers);
+                        if let Some(t) = playhead {
+                            ui.label(
+                                egui::RichText::new(format!("Playhead {:.2}s", t))
+                                    .small()
+                                    .monospace()
+                                    .color(ACCENT_CYAN),
+                            );
+                        }
+                    } else {
+                        ui.label("Open a CSV log to start playback.");
                     }
-                });
+                }
+                TelemetryViewMode::CompareOverlay | TelemetryViewMode::CompareSideBySide => {
+                    let primary = self.telemetry_playback.primary.clone();
+                    let compare = self.telemetry_playback.compare.clone();
+                    if primary.is_none() && compare.is_none() {
+                        ui.label("Load a primary log and optional compare log.");
+                    } else if mode == TelemetryViewMode::CompareSideBySide {
+                        ui.columns(2, |cols| {
+                            if let Some(log) = &primary {
+                                cols[0].label(&log.name);
+                                let frames: Vec<&TelemetryFrame> = log.frames.iter().collect();
+                                let lines = Self::build_channel_plot_lines(
+                                    &channel_defs,
+                                    frames,
+                                    &math_channels,
+                                    &channel_defs,
+                                    None,
+                                    Some(log),
+                                );
+                                Self::paint_telemetry_plot(
+                                    &mut cols[0],
+                                    "compare_a",
+                                    plot_h * 0.45,
+                                    lines,
+                                    &log.markers,
+                                );
+                            }
+                            if let Some(log) = &compare {
+                                cols[1].label(&log.name);
+                                let frames: Vec<&TelemetryFrame> = log.frames.iter().collect();
+                                let lines = Self::build_channel_plot_lines(
+                                    &channel_defs,
+                                    frames,
+                                    &math_channels,
+                                    &channel_defs,
+                                    Some([255, 120, 80]),
+                                    Some(log),
+                                );
+                                Self::paint_telemetry_plot(
+                                    &mut cols[1],
+                                    "compare_b",
+                                    plot_h * 0.45,
+                                    lines,
+                                    &[],
+                                );
+                            }
+                        });
+                    } else {
+                        let mut lines = Vec::new();
+                        if let Some(log) = &primary {
+                            let frames: Vec<&TelemetryFrame> = log.frames.iter().collect();
+                            lines.extend(Self::build_channel_plot_lines(
+                                &channel_defs,
+                                frames,
+                                &math_channels,
+                                &channel_defs,
+                                None,
+                                Some(log),
+                            ));
+                        }
+                        if let Some(log) = &compare {
+                            let frames: Vec<&TelemetryFrame> = log.frames.iter().collect();
+                            lines.extend(Self::build_channel_plot_lines(
+                                &channel_defs,
+                                frames,
+                                &[],
+                                &channel_defs,
+                                Some([255, 120, 80]),
+                                Some(log),
+                            ));
+                        }
+                        let markers = primary
+                            .as_ref()
+                            .map(|l| l.markers.clone())
+                            .unwrap_or_default();
+                        Self::paint_telemetry_plot(ui, "compare_overlay", plot_h, lines, &markers);
+                    }
+                }
+            }
         });
+    }
+
+    fn view_mode_label(mode: TelemetryViewMode) -> &'static str {
+        match mode {
+            TelemetryViewMode::Live => "Live",
+            TelemetryViewMode::Playback => "Playback",
+            TelemetryViewMode::CompareOverlay => "Compare overlay",
+            TelemetryViewMode::CompareSideBySide => "Compare side-by-side",
+        }
+    }
+
+    fn build_channel_plot_lines(
+        channel_defs: &[crate::telemetry::TelemetryChannelDef],
+        frames: Vec<&TelemetryFrame>,
+        math_channels: &[MathChannelDef],
+        eval_defs: &[crate::telemetry::TelemetryChannelDef],
+        color_override: Option<[u8; 3]>,
+        import_log: Option<&ImportedLog>,
+    ) -> Vec<Line> {
+        let mut plot_lines: Vec<Line> = Vec::new();
+        for (ch_idx, ch) in channel_defs.iter().enumerate() {
+            if ch.plot.is_none() && color_override.is_none() {
+                continue;
+            }
+            let scale = ch.plot_scale();
+            let mut points = Vec::new();
+            for frame in &frames {
+                if ch_idx < frame.values.len() {
+                    points.push([frame.time_sec, frame.values[ch_idx] as f64 * scale]);
+                }
+            }
+            if points.is_empty() {
+                continue;
+            }
+            let rgb = color_override.unwrap_or_else(|| ch.plot_color());
+            let name = if scale != 1.0 {
+                format!("{} (×{})", ch.label, scale)
+            } else {
+                ch.label.clone()
+            };
+            plot_lines.push(
+                Line::new(PlotPoints::new(points))
+                    .color(Color32::from_rgb(rgb[0], rgb[1], rgb[2]))
+                    .name(name),
+            );
+        }
+        if !frames.is_empty() && !math_channels.is_empty() {
+            let fallback = ImportedLog {
+                name: "plot".into(),
+                path: None,
+                frames: frames.iter().map(|f| (*f).clone()).collect(),
+                markers: Vec::new(),
+                extra_values: HashMap::new(),
+            };
+            let log_ref = import_log.unwrap_or(&fallback);
+            for math in math_channels {
+                let mut points = Vec::new();
+                for (fi, frame) in frames.iter().enumerate() {
+                    if let Some(v) = log_ref.eval_math(math, fi, eval_defs) {
+                        points.push([frame.time_sec, v]);
+                    }
+                }
+                if !points.is_empty() {
+                    plot_lines.push(
+                        Line::new(PlotPoints::new(points))
+                            .color(Color32::from_rgb(math.color[0], math.color[1], math.color[2]))
+                            .name(math.label.clone()),
+                    );
+                }
+            }
+        }
+        plot_lines
+    }
+
+    fn paint_telemetry_plot(
+        ui: &mut egui::Ui,
+        id: &str,
+        plot_h: f32,
+        lines: Vec<Line>,
+        markers: &[LogMarker],
+    ) {
+        Plot::new(id)
+            .height(plot_h)
+            .width(ui.available_width())
+            .view_aspect(ui.available_width() / plot_h.max(1.0))
+            .show_axes([true, true])
+            .legend(egui_plot::Legend::default())
+            .show(ui, |plot_ui: &mut PlotUi| {
+                for line in lines {
+                    plot_ui.line(line);
+                }
+                for m in markers {
+                    let x = m.time_sec;
+                    plot_ui.line(
+                        Line::new(PlotPoints::new(vec![[x, 0.0], [x, 1.0e6]]))
+                            .color(Color32::from_rgb(255, 214, 0))
+                            .name(m.label.clone()),
+                    );
+                }
+            });
     }
 
     fn format_channel_value(channel_id: &str, value: f32) -> String {
