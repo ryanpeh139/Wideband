@@ -7,6 +7,7 @@ pub mod flash_layout;
 pub mod isotp;
 pub mod j2534;
 pub mod j2534_host;
+pub mod profile_pack;
 pub mod protocols;
 pub mod security_config;
 pub mod telemetry;
@@ -247,6 +248,9 @@ mod tests {
             size_bytes: 4,
             programming_session: 0x02,
             read_session: 0x03,
+            security_profile_id: "unconfigured-test-profile".to_string(),
+            flash_layout_profile_id: "unconfigured-test-profile".to_string(),
+            checksum_profile_id: "unconfigured-test-profile".to_string(),
         };
         let unconfigured = PlatformSecurity::compute_key(&seed, &unconfigured_profile);
         assert!(unconfigured.is_err());

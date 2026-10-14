@@ -1,0 +1,37 @@
+{
+  "pack_version": 1,
+  "id": "silverado-can",
+  "name": "Chevrolet Silverado 2007+ (Delco CAN)",
+  "platform": "Chevrolet Silverado",
+  "bus": "can_isotp",
+  "diagnostic": "uds",
+  "bitrate": 500000,
+  "j2534": {
+    "protocol": "iso15765",
+    "connect_flags": 0,
+    "extended_id": true
+  },
+  "can": {
+    "request_id": "0x18DA10F1",
+    "response_id": "0x18DAF110",
+    "filter_mask": "0x1FFFFFFF"
+  },
+  "kline": {
+    "tester": "0xF1",
+    "ecu": "0x10"
+  },
+  "memory": {
+    "max_chunk": 1024,
+    "address_bytes": 4,
+    "size_bytes": 4
+  },
+  "sessions": {
+    "programming": "0x02",
+    "read": "0x03"
+  },
+  "refs": {
+    "security": "silverado-can",
+    "flash_layout": "silverado-can",
+    "checksum": "silverado-can"
+  }
+}

@@ -101,7 +101,11 @@ impl WidebandApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply_motorsport_theme(&cc.egui_ctx);
         let devices = J2534RegistryScanner::scan();
-        let profiles = EcuProfile::all();
+        let catalog = crate::profile_pack::ProfileCatalog::load_default();
+        let profiles = catalog.profiles;
+        if !catalog.load_note.is_empty() {
+            eprintln!("profiles: {}", catalog.load_note);
+        }
         let xdf = XdfDocument::sample();
 
         let stock_tables = xdf.tables.iter().map(|t| t.values.clone()).collect();
@@ -195,7 +199,7 @@ impl WidebandApp {
     fn refresh_checksum_badge(&mut self) {
         let prof = &self.profiles[self.selected_profile_idx];
         self.checksum_status =
-            PlatformSecurity::checksum_badge(&prof.id, &self.active_rom, self.rom_origin);
+            PlatformSecurity::checksum_badge(&prof.checksum_profile_id, &self.active_rom, self.rom_origin);
     }
 
     fn persist_favorites(&mut self) {
@@ -290,7 +294,7 @@ impl WidebandApp {
         }
 
         let mut image = self.active_rom.clone();
-        match PlatformSecurity::stamp_image(&prof.id, &mut image, self.rom_origin) {
+        match PlatformSecurity::stamp_image(&prof.checksum_profile_id, &mut image, self.rom_origin) {
             Ok(status) => {
                 self.checksum_status = status;
                 let nbytes = image.len();
@@ -1929,7 +1933,7 @@ impl WidebandApp {
         let prof = self.profiles[self.selected_profile_idx].clone();
         self.xdf.write_all_tables_to_rom(&mut self.active_rom, self.rom_origin);
         let prepared = match PlatformSecurity::prepare_for_flash(
-            &prof.id,
+            &prof.checksum_profile_id,
             &prof.name,
             &self.active_rom,
             self.rom_origin,
