@@ -2079,10 +2079,6 @@ impl WidebandApp {
 
         self.log("Stamping and verifying checksum before cal-only flash...");
         self.xdf.write_all_tables_to_rom(&mut self.active_rom, self.rom_origin);
-<<<<<<< HEAD
-        let prepared = match PlatformSecurity::prepare_for_flash(
-            &prof.checksum_profile_id,
-=======
         self.xdf.write_all_constants_to_rom(&mut self.active_rom, self.rom_origin);
         for flag in &self.xdf.flags {
             self.xdf.write_flag_to_rom(&mut self.active_rom, self.rom_origin, flag);
@@ -2095,8 +2091,7 @@ impl WidebandApp {
             return;
         }
         let prepared = match PlatformSecurity::ensure_flash_checksum(
-            &prof.id,
->>>>>>> b5ba17f (Add ROM loaders, checksum routines, and XDF bind improvements)
+            &prof.checksum_profile_id,
             &prof.name,
             &self.active_rom,
             self.rom_origin,
