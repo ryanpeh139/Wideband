@@ -232,6 +232,15 @@ impl PlatformSecurity {
         }
         Ok(mark_checksum(&before, image))
     }
+
+    /// Badge text for the calibration header: valid when stored checksum matches ROM, else updated.
+    pub fn checksum_badge(profile_id: &str, image: &[u8], origin: i64) -> String {
+        match PlatformSecurity::checksum_for(profile_id, image, origin) {
+            Some(group) if group.verify(image) => CHECKSUM_VALID.to_string(),
+            Some(_) => CHECKSUM_UPDATED.to_string(),
+            None => CHECKSUM_VALID.to_string(),
+        }
+    }
 }
 
 pub struct BlockChecksumGroup {

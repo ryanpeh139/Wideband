@@ -1,10 +1,13 @@
 use crate::audit_log::FlashAuditLog;
+use crate::cal_editor::{
+    cell_changed, format_cell_display, param_matches_query, table_has_edits, FavoriteTables,
+};
 use crate::definitions::{CuwFile, XdfDocument};
 use crate::flash_job::FlashJob;
 use crate::flash_layout::FlashLayoutMap;
 use crate::j2534::{connect_for_profile, create_device, J2534DeviceInfo, J2534RegistryScanner, PassThruDevice};
 use crate::protocols::{EcuIdentification, EcuIdentifier, EcuProfile};
-use crate::security_config::{PlatformSecurity, CHECKSUM_UPDATED, CHECKSUM_VALID};
+use crate::security_config::{PlatformSecurity, CHECKSUM_VALID};
 use std::fs;
 use std::path::PathBuf;
 use crate::surface_mesh;
@@ -13,7 +16,7 @@ use crate::theme::{
     self, paint_live_cell_glow, paint_studio_badge, studio_tab_button, ACCENT_CYAN, CARD_FILL,
     EMERALD, MUTED, STROKE, TEXT, heatmap_color,
 };
-use eframe::egui::{self, Color32, Pos2, Stroke, Vec2};
+use eframe::egui::{self, Color32, Stroke, Vec2};
 use egui_extras::{Column, TableBuilder};
 use egui_plot::{Line, Plot, PlotPoints};
 use std::sync::{Arc, Mutex};
@@ -41,6 +44,11 @@ pub struct WidebandApp {
     pub selected_table_idx: usize,
     pub search_query: String,
     pub stock_tables: Vec<Vec<Vec<f64>>>,
+    pub stock_constants: Vec<f64>,
+    pub stock_flags: Vec<bool>,
+    pub favorites: FavoriteTables,
+    pub favorites_path: PathBuf,
+    pub favorites_only: bool,
     pub active_cell: (usize, usize),
     pub math_amount: f64,
     pub checksum_status: String,
@@ -81,6 +89,10 @@ impl WidebandApp {
         let xdf = XdfDocument::sample();
 
         let stock_tables = xdf.tables.iter().map(|t| t.values.clone()).collect();
+        let stock_constants = xdf.constants.iter().map(|c| c.value).collect();
+        let stock_flags = xdf.flags.iter().map(|f| f.is_set).collect();
+        let favorites_path = FavoriteTables::default_path();
+        let favorites = FavoriteTables::load(&favorites_path);
         let mut rom = vec![0xFFu8; 1024 * 1024]; // 1MB mock ROM buffer
         xdf.write_all_tables_to_rom(&mut rom, 0);
 
@@ -103,6 +115,11 @@ impl WidebandApp {
             selected_table_idx: 0,
             search_query: String::new(),
             stock_tables,
+            stock_constants,
+            stock_flags,
+            favorites,
+            favorites_path,
+            favorites_only: false,
             active_cell: (0, 0),
             math_amount: 5.0,
             checksum_status: CHECKSUM_VALID.to_string(),
@@ -142,11 +159,30 @@ impl WidebandApp {
     fn commit_table_edits(&mut self) {
         let idx = self.selected_table_idx;
         self.xdf.write_table_to_rom(&mut self.active_rom, self.rom_origin, idx);
-        self.checksum_status = CHECKSUM_UPDATED.to_string();
+        self.refresh_checksum_badge();
     }
 
-    fn refresh_stock_tables(&mut self) {
+    fn refresh_stock_baseline(&mut self) {
         self.stock_tables = self.xdf.tables.iter().map(|t| t.values.clone()).collect();
+        self.stock_constants = self.xdf.constants.iter().map(|c| c.value).collect();
+        self.stock_flags = self.xdf.flags.iter().map(|f| f.is_set).collect();
+    }
+
+    fn refresh_checksum_badge(&mut self) {
+        let prof = &self.profiles[self.selected_profile_idx];
+        self.checksum_status =
+            PlatformSecurity::checksum_badge(&prof.id, &self.active_rom, self.rom_origin);
+    }
+
+    fn persist_favorites(&mut self) {
+        if let Err(e) = self.favorites.save(&self.favorites_path) {
+            self.log(&format!("Favorites save failed: {}", e));
+        }
+    }
+
+    fn toggle_table_favorite(&mut self, table_id: &str) {
+        self.favorites.toggle(table_id);
+        self.persist_favorites();
     }
 
     fn load_rom_from_path(&mut self, path: PathBuf) {
@@ -194,8 +230,8 @@ impl WidebandApp {
             Ok(msg) => {
                 self.rom_path = Some(path);
                 self.xdf.bind_from_rom(&self.active_rom, self.rom_origin);
-                self.refresh_stock_tables();
-                self.checksum_status = CHECKSUM_VALID.to_string();
+                self.refresh_stock_baseline();
+                self.refresh_checksum_badge();
                 self.log(&msg);
             }
             Err(e) => self.log(&format!("Open ROM failed: {}", e)),
@@ -212,7 +248,8 @@ impl WidebandApp {
                     let label = path.file_name().unwrap_or_default().to_string_lossy().to_string();
                     self.xdf_path = Some(path);
                     self.xdf.bind_from_rom(&self.active_rom, self.rom_origin);
-                    self.refresh_stock_tables();
+                    self.refresh_stock_baseline();
+                    self.refresh_checksum_badge();
                     self.log(&format!("Loaded XDF {} ({} tables)", label, self.xdf.tables.len()));
                 }
                 Err(e) => self.log(&format!("XDF parse failed: {}", e)),
@@ -602,10 +639,11 @@ impl WidebandApp {
                                 ui.horizontal(|ui| {
                                     ui.label(egui::RichText::new("🔍").size(12.0).color(MUTED));
                                     let edit = egui::TextEdit::singleline(&mut self.search_query)
-                                        .hint_text("Search parameters...")
+                                        .hint_text("Search name, id, units...")
                                         .frame(false)
-                                        .desired_width(ui.available_width());
+                                        .desired_width(ui.available_width() - 88.0);
                                     ui.add(edit);
+                                    ui.checkbox(&mut self.favorites_only, "★ only");
                                 });
                             });
 
@@ -622,30 +660,69 @@ impl WidebandApp {
                                 );
                                 ui.add_space(4.0);
 
-                                for (idx, table) in self.xdf.tables.iter().enumerate() {
-                                    if !self.search_query.is_empty()
-                                        && !table
-                                            .title
-                                            .to_lowercase()
-                                            .contains(&self.search_query.to_lowercase())
-                                    {
+                                let table_count = self.xdf.tables.len();
+                                for idx in 0..table_count {
+                                    let table_id = self.xdf.tables[idx].id.clone();
+                                    let table_title = self.xdf.tables[idx].title.clone();
+                                    let table_desc = self.xdf.tables[idx].description.clone();
+                                    let table_units = self.xdf.tables[idx].z_units.clone();
+                                    let table_values = self.xdf.tables[idx].values.clone();
+                                    let y_dim = self.xdf.tables[idx].y_axis.dim;
+
+                                    if self.favorites_only && !self.favorites.contains(&table_id) {
+                                        continue;
+                                    }
+                                    if !param_matches_query(
+                                        &self.search_query,
+                                        &table_title,
+                                        &table_desc,
+                                        &table_id,
+                                        &table_units,
+                                    ) {
                                         continue;
                                     }
 
                                     let is_selected = self.selected_table_idx == idx;
-                                    let badge = if table.y_axis.dim > 1 { "[3D]" } else { "[2D]" };
+                                    let badge = if y_dim > 1 { "[3D]" } else { "[2D]" };
+                                    let edited = self
+                                        .stock_tables
+                                        .get(idx)
+                                        .map(|s| table_has_edits(&table_values, s))
+                                        .unwrap_or(false);
+                                    let is_fav = self.favorites.contains(&table_id);
 
                                     ui.allocate_ui(Vec2::new(ui.available_width(), 30.0), |ui| {
                                         ui.horizontal_centered(|ui| {
+                                            let star = if is_fav { "★" } else { "☆" };
+                                            if ui
+                                                .button(egui::RichText::new(star).size(14.0).color(
+                                                    if is_fav {
+                                                        Color32::from_rgb(255, 214, 0)
+                                                    } else {
+                                                        MUTED
+                                                    },
+                                                ))
+                                                .clicked()
+                                            {
+                                                let id = table_id.clone();
+                                                self.toggle_table_favorite(&id);
+                                            }
                                             ui.add_space(2.0);
                                             ui.label(
                                                 egui::RichText::new(badge).strong().color(ACCENT_CYAN),
                                             );
                                             let title_color = if is_selected { TEXT } else { MUTED };
+                                            let title = if edited {
+                                                format!("{} •", table_title)
+                                            } else {
+                                                table_title.clone()
+                                            };
                                             if ui
                                                 .selectable_label(
                                                     is_selected,
-                                                    egui::RichText::new(&table.title).color(title_color),
+                                                    egui::RichText::new(&title)
+                                                        .color(title_color)
+                                                        .strong(),
                                                 )
                                                 .clicked()
                                             {
@@ -663,7 +740,21 @@ impl WidebandApp {
                                     egui::RichText::new("Scalar Constants").size(13.0).color(MUTED),
                                 );
                                 ui.add_space(4.0);
-                                for c in &self.xdf.constants {
+                                for (i, c) in self.xdf.constants.iter().enumerate() {
+                                    if !param_matches_query(
+                                        &self.search_query,
+                                        &c.title,
+                                        "",
+                                        &c.id,
+                                        &c.units,
+                                    ) {
+                                        continue;
+                                    }
+                                    if self.favorites_only {
+                                        continue;
+                                    }
+                                    let basis = self.stock_constants.get(i).copied().unwrap_or(c.value);
+                                    let changed = cell_changed(c.value, basis);
                                     ui.allocate_ui(Vec2::new(ui.available_width(), 28.0), |ui| {
                                         ui.horizontal_centered(|ui| {
                                             ui.add_space(2.0);
@@ -672,12 +763,20 @@ impl WidebandApp {
                                                     .strong()
                                                     .color(Color32::from_rgb(255, 193, 7)),
                                             );
+                                            let label = if changed {
+                                                format!(
+                                                    "{}: {} {}",
+                                                    c.title,
+                                                    format_cell_display(c.value, basis),
+                                                    c.units
+                                                )
+                                            } else {
+                                                format!("{}: {:.0} {}", c.title, c.value, c.units)
+                                            };
                                             ui.label(
-                                                egui::RichText::new(format!(
-                                                    "{}: {:.0} {}",
-                                                    c.title, c.value, c.units
-                                                ))
-                                                .color(TEXT),
+                                                egui::RichText::new(label)
+                                                    .color(TEXT)
+                                                    .strong(),
                                             );
                                         });
                                     });
@@ -844,12 +943,17 @@ impl WidebandApp {
                     ui.heading(egui::RichText::new(&table_title).size(16.0).color(TEXT));
                     ui.label(egui::RichText::new(format!("({})", z_units)).color(ACCENT_CYAN));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let ck_color = if self.checksum_status.contains("Valid") {
+                        let ck_color = if self.checksum_status == CHECKSUM_VALID {
                             EMERALD
                         } else {
                             Color32::from_rgb(0xF5, 0x88, 0x36)
                         };
-                        ui.label(egui::RichText::new(&self.checksum_status).size(11.0).color(ck_color).strong());
+                        ui.label(
+                            egui::RichText::new(&self.checksum_status)
+                                .size(11.0)
+                                .color(ck_color)
+                                .strong(),
+                        );
                     });
                 });
                 ui.label(egui::RichText::new(&table_desc).small().color(MUTED));
@@ -961,11 +1065,12 @@ impl WidebandApp {
                         for c in 0..cols {
                             let val = self.xdf.tables[self.selected_table_idx].values[r][c];
                             let stock_val = if r < stock.len() && c < stock[r].len() { stock[r][c] } else { val };
-                            let is_delta = (val - stock_val).abs() > 0.01;
+                            let is_delta = cell_changed(val, stock_val);
                             let is_tracked = self.active_cell == (r, c);
 
                             let bg_color = heatmap_color(val, min_val, max_val);
                             let text_color = Color32::from_rgb(0xFF, 0xFF, 0xFF);
+                            let cell_text = format_cell_display(val, stock_val);
 
                             row.col(|ui| {
                                 let rect = ui.available_rect_before_wrap();
@@ -973,19 +1078,24 @@ impl WidebandApp {
 
                                 painter.rect_filled(rect, 2.0, bg_color);
 
+                                if is_delta {
+                                    painter.rect_stroke(
+                                        rect,
+                                        2.0,
+                                        Stroke::new(1.5, Color32::from_rgb(255, 214, 0)),
+                                    );
+                                }
+
                                 if is_tracked {
                                     paint_live_cell_glow(painter, rect);
                                 }
 
-                                // If delta from stock: draw small bold gold indicator
-                                if is_delta {
-                                    let delta_pos = Pos2::new(rect.right() - 6.0, rect.top() + 4.0);
-                                    painter.circle_filled(delta_pos, 2.5, Color32::from_rgb(255, 214, 0));
-                                }
-
                                 let response = ui.selectable_label(
                                     is_tracked,
-                                    egui::RichText::new(format!("{:>6.1}", val)).monospace().strong().color(text_color),
+                                    egui::RichText::new(cell_text)
+                                        .monospace()
+                                        .strong()
+                                        .color(text_color),
                                 );
                                 if response.clicked() {
                                     self.active_cell = (r, c);
@@ -1231,7 +1341,8 @@ impl WidebandApp {
                     self.active_rom = stock.bytes;
                     self.rom_origin = stock.origin;
                     self.xdf.bind_from_rom(&self.active_rom, self.rom_origin);
-                    self.stock_tables = self.xdf.tables.iter().map(|t| t.values.clone()).collect();
+                    self.refresh_stock_baseline();
+                    self.refresh_checksum_badge();
                     self.transfer_progress = 1.0;
                     self.log(&format!(
                         "Stock read complete: {} bytes @ origin 0x{:X} (audit JSONL appended)",
@@ -1349,12 +1460,14 @@ impl WidebandApp {
                             let mut checked = self.xdf.flags[idx].is_set;
                             if ui.checkbox(&mut checked, "").changed() {
                                 self.xdf.flags[idx].is_set = checked;
-                                let flag = &self.xdf.flags[idx];
-                                self.xdf.write_flag_to_rom(&mut self.active_rom, self.rom_origin, flag);
-                                self.checksum_status = CHECKSUM_UPDATED.to_string();
+                                let flag = self.xdf.flags[idx].clone();
+                                self.xdf.write_flag_to_rom(&mut self.active_rom, self.rom_origin, &flag);
+                                self.refresh_checksum_badge();
                             }
 
                             let flag = &self.xdf.flags[idx];
+                            let stock_set = self.stock_flags.get(idx).copied().unwrap_or(flag.is_set);
+                            let flag_changed = flag.is_set != stock_set;
                             let badge_color = if flag.is_set {
                                 Color32::from_rgb(0, 230, 118)
                             } else {
@@ -1364,7 +1477,17 @@ impl WidebandApp {
                             ui.label(egui::RichText::new(status_lbl).strong().color(badge_color));
 
                             ui.vertical(|ui| {
-                                ui.label(egui::RichText::new(&flag.title).strong().color(Color32::WHITE));
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(&flag.title).strong().color(Color32::WHITE));
+                                    if flag_changed {
+                                        ui.label(
+                                            egui::RichText::new("(changed from stock)")
+                                                .small()
+                                                .strong()
+                                                .color(Color32::from_rgb(255, 214, 0)),
+                                        );
+                                    }
+                                });
                                 ui.label(egui::RichText::new(&flag.description).small().color(Color32::GRAY));
                                 ui.label(egui::RichText::new(format!("Address: 0x{:X} | Mask: 0x{:02X}", flag.address, flag.mask)).monospace().small());
                             });
