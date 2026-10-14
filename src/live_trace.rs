@@ -76,6 +76,31 @@ pub fn table_position(table: &XdfTable, value_of: impl Fn(&str) -> f32) -> Optio
     Some((row, col))
 }
 
+/// Axes where the live value is beyond the table's breakpoints (the ECU clamps to the edge
+/// cell, so the edge cell is doing work it may not be tuned for). Human-readable, e.g.
+/// `"kPa 148 > 130 max"`.
+pub fn out_of_range(table: &XdfTable, value_of: impl Fn(&str) -> f32) -> Vec<String> {
+    let mut out = Vec::new();
+    for axis in [&table.x_axis, &table.y_axis] {
+        let Some(ch) = channel_for_axis_units(&axis.units) else {
+            continue;
+        };
+        if axis.labels.len() < 2 {
+            continue;
+        }
+        let v = value_of(ch) as f64;
+        let lo = axis.labels.iter().cloned().fold(f64::MAX, f64::min);
+        let hi = axis.labels.iter().cloned().fold(f64::MIN, f64::max);
+        let name = axis.units.trim();
+        if v > hi {
+            out.push(format!("{} {:.0} > {:.0} max", name, v, hi));
+        } else if v < lo {
+            out.push(format!("{} {:.0} < {:.0} min", name, v, lo));
+        }
+    }
+    out
+}
+
 /// Nearest whole cell to a fractional position (for the table-grid glow).
 pub fn nearest_cell(pos: (f32, f32)) -> (usize, usize) {
     (pos.0.round().max(0.0) as usize, pos.1.round().max(0.0) as usize)
@@ -85,6 +110,8 @@ pub fn nearest_cell(pos: (f32, f32)) -> (usize, usize) {
 #[derive(Default)]
 pub struct LiveTrace {
     points: VecDeque<(Instant, (f32, f32))>,
+    /// Latest out-of-range messages (empty = inside the table).
+    pub out_of_range: Vec<String>,
 }
 
 impl LiveTrace {
@@ -108,6 +135,7 @@ impl LiveTrace {
 
     pub fn clear(&mut self) {
         self.points.clear();
+        self.out_of_range.clear();
     }
 
     pub fn current(&self) -> Option<(f32, f32)> {
@@ -155,6 +183,18 @@ mod tests {
     #[test]
     fn non_monotonic_axis_has_no_position() {
         assert_eq!(axis_position(&[100.0, 50.0, 200.0], 120.0), None);
+    }
+
+    #[test]
+    fn reports_out_of_range_axes() {
+        let mut t = crate::definitions::XdfDocument::sample().tables.remove(0);
+        t.x_axis.units = "RPM".into();
+        t.x_axis.labels = vec![500.0, 1000.0, 6000.0];
+        t.y_axis.units = "kPa".into();
+        t.y_axis.labels = vec![20.0, 60.0, 130.0];
+        let msgs = out_of_range(&t, |id| if id == "rpm" { 3000.0 } else { 148.0 });
+        assert_eq!(msgs, vec!["kPa 148 > 130 max".to_string()]);
+        assert!(out_of_range(&t, |id| if id == "rpm" { 3000.0 } else { 90.0 }).is_empty());
     }
 
     #[test]

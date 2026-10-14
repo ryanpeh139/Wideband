@@ -849,10 +849,11 @@ impl WidebandApp {
                 buf.push_frame();
                 // Live operating point on the selected table. Deliberately NOT written to
                 // `active_cell`: that is the user's edit selection, and math ops write to it.
-                self.xdf
-                    .tables
-                    .get(self.selected_table_idx)
-                    .and_then(|t| live_trace::table_position(t, |id| buf.value(id)))
+                let table = self.xdf.tables.get(self.selected_table_idx);
+                self.live_trace.out_of_range = table
+                    .map(|t| live_trace::out_of_range(t, |id| buf.value(id)))
+                    .unwrap_or_default();
+                table.and_then(|t| live_trace::table_position(t, |id| buf.value(id)))
             };
             match live_pos {
                 Some(pos) => self.live_trace.push(pos, now),
@@ -1124,6 +1125,18 @@ impl WidebandApp {
                     _ => "--".to_string(),
                 };
                 stat(ui, "Live cell", live_txt, EMERALD);
+                if live && !self.live_trace.out_of_range.is_empty() {
+                    // The ECU clamps to the edge cell: it's doing work it may not be tuned for.
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "\u{26A0} Off table: {} (edge cell used)",
+                            self.live_trace.out_of_range.join(", ")
+                        ))
+                        .size(10.5)
+                        .strong()
+                        .color(Color32::from_rgb(255, 152, 0)),
+                    );
+                }
                 let (sr, sc) = self.active_cell;
                 let sel_val = table
                     .and_then(|t| t.values.get(sr).and_then(|row| row.get(sc)).copied())
@@ -1501,6 +1514,7 @@ impl WidebandApp {
                         self.active_cell,
                         hover_cell,
                         &self.live_trace.trail(Instant::now()),
+                        !self.live_trace.out_of_range.is_empty(),
                     );
                     if response.clicked() {
                         if let Some(cell) = hover_cell {
