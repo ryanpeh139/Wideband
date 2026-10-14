@@ -70,6 +70,7 @@ pub struct WidebandApp {
     // 3D Surface Mesh
     pub mesh_yaw: f32,
     pub mesh_pitch: f32,
+    pub mesh_zoom: f32,
 
     // Flash & Diagnostics
     pub ecu_id: EcuIdentification,
@@ -142,6 +143,7 @@ impl WidebandApp {
             last_poll_time: Instant::now(),
             mesh_yaw: 0.785,  // 45 degrees
             mesh_pitch: 0.523, // 30 degrees
+            mesh_zoom: 1.0,
             ecu_id: EcuIdentification::default(),
             comm_log: vec!["Wideband Motorsport Studio 2.4 (Rust Native) Initialized.".to_string()],
             transfer_progress: 0.0,
@@ -486,6 +488,217 @@ impl WidebandApp {
         table.values = smoothed;
         self.commit_table_edits();
     }
+
+    fn render_studio_header(&mut self, ctx: &egui::Context, tier: theme::StudioHeaderTier) {
+        use theme::StudioHeaderTier;
+        let compact_badge = tier != StudioHeaderTier::Wide;
+        let tabs_compact = tier != StudioHeaderTier::Wide;
+        let stacked = tier != StudioHeaderTier::Wide;
+        let header_h = if stacked { 84.0 } else { 48.0 };
+        let profile_combo_w = match tier {
+            StudioHeaderTier::Compact => 130.0,
+            StudioHeaderTier::Medium => 170.0,
+            StudioHeaderTier::Wide => 200.0,
+        };
+        let device_combo_w = match tier {
+            StudioHeaderTier::Compact => 110.0,
+            StudioHeaderTier::Medium => 140.0,
+            StudioHeaderTier::Wide => 160.0,
+        };
+        egui::TopBottomPanel::top("header_bar")
+            .exact_height(header_h)
+            .frame(theme::header_frame())
+            .show(ctx, |ui| {
+                if stacked {
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            paint_studio_badge(ui, compact_badge);
+                            ui.add_space(8.0);
+                            self.paint_profile_selector(ui, profile_combo_w);
+                            self.paint_header_status_chips(ui);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                self.paint_connect_controls(ui, device_combo_w);
+                            });
+                        });
+                        self.paint_workspace_tabs(ui, tabs_compact);
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        paint_studio_badge(ui, false);
+                        ui.add_space(12.0);
+                        self.paint_profile_selector(ui, profile_combo_w);
+                        ui.add_space(8.0);
+                        self.paint_header_status_chips(ui);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            self.paint_connect_controls(ui, device_combo_w);
+                            ui.add_space(10.0);
+                            self.paint_workspace_tabs(ui, false);
+                        });
+                    });
+                }
+            });
+    }
+
+    fn paint_profile_selector(&mut self, ui: &mut egui::Ui, width: f32) {
+        ui.label(egui::RichText::new("Vehicle").size(11.0).color(MUTED));
+        egui::ComboBox::from_id_salt("profile_select")
+            .width(width)
+            .selected_text(&self.profiles[self.selected_profile_idx].name)
+            .show_ui(ui, |ui| {
+                for (idx, prof) in self.profiles.iter().enumerate() {
+                    ui.selectable_value(&mut self.selected_profile_idx, idx, &prof.name);
+                }
+            });
+    }
+
+    fn paint_connect_controls(&mut self, ui: &mut egui::Ui, device_combo_w: f32) {
+        if self.is_connected {
+            if ui
+                .button(egui::RichText::new("Disconnect").size(11.0).color(MUTED))
+                .clicked()
+            {
+                self.disconnect_cable();
+            }
+        } else if ui
+            .button(
+                egui::RichText::new("Connect")
+                    .size(11.0)
+                    .strong()
+                    .color(ACCENT_CYAN),
+            )
+            .clicked()
+        {
+            self.connect_cable();
+        }
+        ui.add_space(6.0);
+        egui::ComboBox::from_id_salt("device_select")
+            .width(device_combo_w)
+            .selected_text(
+                egui::RichText::new(&self.devices[self.selected_device_idx].name)
+                    .size(11.0)
+                    .color(MUTED),
+            )
+            .show_ui(ui, |ui| {
+                for (idx, dev) in self.devices.iter().enumerate() {
+                    ui.selectable_value(&mut self.selected_device_idx, idx, &dev.name);
+                }
+            });
+    }
+
+    fn paint_workspace_tabs(&mut self, ui: &mut egui::Ui, compact: bool) {
+        let tabs = [
+            (WorkspaceTab::Switchboard, "Switchboard"),
+            (WorkspaceTab::FlashDiagnostics, "Flash & Diag"),
+            (WorkspaceTab::Telemetry, "Telemetry"),
+            (WorkspaceTab::Calibration, "Calibration"),
+        ];
+        ui.horizontal_wrapped(|ui| {
+            for (tab, title) in tabs {
+                if studio_tab_button(ui, title, self.active_tab == tab, compact).clicked() {
+                    self.active_tab = tab;
+                }
+                ui.add_space(4.0);
+            }
+        });
+    }
+
+    fn paint_live_telemetry_card(&self, ui: &mut egui::Ui) {
+        egui::Frame::none()
+            .fill(CARD_FILL)
+            .stroke(Stroke::new(1.0, STROKE))
+            .rounding(egui::Rounding::same(4.0))
+            .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.columns(2, |cols| {
+                    cols[0].label(
+                        egui::RichText::new("Live cell tracking")
+                            .size(11.0)
+                            .strong()
+                            .color(MUTED),
+                    );
+                    cols[1].with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new("● LIVE").size(11.0).strong().color(EMERALD));
+                    });
+                });
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Engine RPM").size(10.0).color(MUTED));
+                ui.label(
+                    egui::RichText::new(format!("{:.0}", self.trace_rpm))
+                        .size(14.0)
+                        .monospace()
+                        .strong()
+                        .color(ACCENT_CYAN),
+                );
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new("MAP").size(10.0).color(MUTED));
+                ui.label(
+                    egui::RichText::new(format!("{:.1} kPa", self.trace_map))
+                        .size(14.0)
+                        .monospace()
+                        .strong()
+                        .color(ACCENT_CYAN),
+                );
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new("Active tracked cell").size(10.0).color(MUTED));
+                ui.label(
+                    egui::RichText::new(format!("Row {}, Col {}", self.active_cell.0, self.active_cell.1))
+                        .size(12.0)
+                        .monospace()
+                        .strong()
+                        .color(ACCENT_CYAN),
+                );
+            });
+    }
+
+    fn paint_header_status_chips(&self, ui: &mut egui::Ui) {
+        let (status_text, status_color) = if self.is_connected {
+            ("ONLINE", EMERALD)
+        } else {
+            ("OFFLINE", Color32::from_rgb(0xF8, 0x51, 0x49))
+        };
+        egui::Frame::none()
+            .fill(status_color.gamma_multiply(0.12))
+            .stroke(Stroke::new(1.0, status_color))
+            .rounding(egui::Rounding::same(4.0))
+            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("●").size(9.0).color(status_color));
+                    ui.label(
+                        egui::RichText::new(status_text)
+                            .size(11.0)
+                            .strong()
+                            .color(status_color),
+                    );
+                });
+            });
+
+        ui.add_space(6.0);
+
+        let batt_label = if self.is_connected {
+            format!("{:.1}V", 13.4)
+        } else {
+            "—".to_string()
+        };
+        egui::Frame::none()
+            .fill(theme::WIDGET_BG)
+            .stroke(Stroke::new(1.0, STROKE))
+            .rounding(egui::Rounding::same(4.0))
+            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("VBATT").size(10.0).color(MUTED));
+                    ui.label(
+                        egui::RichText::new(batt_label)
+                            .size(12.0)
+                            .strong()
+                            .monospace()
+                            .color(ACCENT_CYAN),
+                    );
+                });
+            });
+    }
 }
 
 impl eframe::App for WidebandApp {
@@ -495,119 +708,8 @@ impl eframe::App for WidebandApp {
 
         theme::apply_motorsport_theme(ctx);
 
-        egui::TopBottomPanel::top("header_bar")
-            .exact_height(46.0)
-            .frame(theme::header_frame())
-            .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    paint_studio_badge(ui);
-                    ui.add_space(14.0);
-
-                    ui.label(egui::RichText::new("Vehicle").size(11.0).color(MUTED));
-                    egui::ComboBox::from_id_salt("profile_select")
-                        .width(200.0)
-                        .selected_text(&self.profiles[self.selected_profile_idx].name)
-                        .show_ui(ui, |ui| {
-                            for (idx, prof) in self.profiles.iter().enumerate() {
-                                ui.selectable_value(&mut self.selected_profile_idx, idx, &prof.name);
-                            }
-                        });
-
-                    ui.add_space(10.0);
-
-                    let (status_text, status_color) = if self.is_connected {
-                        ("ONLINE", EMERALD)
-                    } else {
-                        ("OFFLINE", Color32::from_rgb(0xF8, 0x51, 0x49))
-                    };
-                    egui::Frame::none()
-                        .fill(status_color.gamma_multiply(0.12))
-                        .stroke(Stroke::new(1.0, status_color))
-                        .rounding(egui::Rounding::same(4.0))
-                        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("●").size(9.0).color(status_color));
-                                ui.label(
-                                    egui::RichText::new(status_text)
-                                        .size(11.0)
-                                        .strong()
-                                        .color(status_color),
-                                );
-                            });
-                        });
-
-                    ui.add_space(8.0);
-
-                    let batt_v = if self.is_connected { 13.4 } else { 0.0 };
-                    let batt_label = if self.is_connected {
-                        format!("{:.1}V", batt_v)
-                    } else {
-                        "—".to_string()
-                    };
-                    egui::Frame::none()
-                        .fill(theme::WIDGET_BG)
-                        .stroke(Stroke::new(1.0, STROKE))
-                        .rounding(egui::Rounding::same(4.0))
-                        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("VBATT").size(10.0).color(MUTED));
-                                ui.label(
-                                    egui::RichText::new(batt_label)
-                                        .size(12.0)
-                                        .strong()
-                                        .monospace()
-                                        .color(ACCENT_CYAN),
-                                );
-                            });
-                        });
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_space(6.0);
-                        let tabs = [
-                            (WorkspaceTab::Switchboard, "Switchboard"),
-                            (WorkspaceTab::FlashDiagnostics, "Flash & Diag"),
-                            (WorkspaceTab::Telemetry, "Telemetry"),
-                            (WorkspaceTab::Calibration, "Calibration"),
-                        ];
-                        for (tab, title) in tabs {
-                            if studio_tab_button(ui, title, self.active_tab == tab).clicked() {
-                                self.active_tab = tab;
-                            }
-                            ui.add_space(6.0);
-                        }
-
-                        ui.add_space(12.0);
-                        if self.is_connected {
-                            if ui
-                                .button(egui::RichText::new("Disconnect").size(11.0).color(MUTED))
-                                .clicked()
-                            {
-                                self.disconnect_cable();
-                            }
-                        } else if ui
-                            .button(egui::RichText::new("Connect").size(11.0).strong().color(ACCENT_CYAN))
-                            .clicked()
-                        {
-                            self.connect_cable();
-                        }
-                        ui.add_space(8.0);
-                        egui::ComboBox::from_id_salt("device_select")
-                            .width(160.0)
-                            .selected_text(
-                                egui::RichText::new(&self.devices[self.selected_device_idx].name)
-                                    .size(11.0)
-                                    .color(MUTED),
-                            )
-                            .show_ui(ui, |ui| {
-                                for (idx, dev) in self.devices.iter().enumerate() {
-                                    ui.selectable_value(&mut self.selected_device_idx, idx, &dev.name);
-                                }
-                            });
-                    });
-                });
-            });
+        let tier = theme::studio_header_tier(ctx);
+        self.render_studio_header(ctx, tier);
 
         // -------------------------------------------------------------------
         // Workspace View Rendering
@@ -627,11 +729,12 @@ impl eframe::App for WidebandApp {
 
 impl WidebandApp {
     fn render_calibration_tab(&mut self, ctx: &egui::Context) {
+        let (panel_default, panel_min, panel_max) = theme::side_panel_widths(ctx);
         // Left Parameter Tree
         egui::SidePanel::left("param_tree")
             .resizable(true)
-            .default_width(260.0)
-            .width_range(200.0..=350.0)
+            .default_width(panel_default)
+            .width_range(panel_min..=panel_max)
             .frame(theme::panel_frame())
             .show(ctx, |ui| {
                 egui::ScrollArea::both()
@@ -650,7 +753,7 @@ impl WidebandApp {
                                     let edit = egui::TextEdit::singleline(&mut self.search_query)
                                         .hint_text("Search name, id, units...")
                                         .frame(false)
-                                        .desired_width(ui.available_width() - 88.0);
+                                        .desired_width(ui.available_width().max(60.0));
                                     ui.add(edit);
                                     ui.checkbox(&mut self.favorites_only, "★ only");
                                 });
@@ -797,25 +900,37 @@ impl WidebandApp {
         // Right 3D Isometric Surface Mesh
         egui::SidePanel::right("surface_mesh_panel")
             .resizable(true)
-            .default_width(260.0)
-            .width_range(200.0..=350.0)
+            .default_width(panel_default)
+            .width_range(panel_min..=panel_max)
             .frame(theme::panel_frame())
             .show(ctx, |ui| {
-                ui.heading(egui::RichText::new("3D Surface Mesh").size(14.0).color(ACCENT_CYAN));
-                ui.label(egui::RichText::new("Drag to rotate pitch & yaw").small().color(MUTED));
+                ui.horizontal_wrapped(|ui| {
+                    ui.heading(egui::RichText::new("3D Surface Mesh").size(14.0).color(ACCENT_CYAN));
+                    ui.label(
+                        egui::RichText::new("Drag: orbit · Scroll: zoom")
+                            .small()
+                            .color(MUTED),
+                    );
+                });
                 ui.add_space(4.0);
 
                 let avail = ui.available_size();
-                let telemetry_reserve = 128.0;
-                let mesh_size = Vec2::new(
-                    avail.x.max(120.0),
-                    (avail.y - telemetry_reserve).max(140.0),
-                );
+                let telemetry_reserve = 118.0_f32.min(avail.y * 0.34);
+                let mesh_h = (avail.y - telemetry_reserve).max(96.0);
+                let mesh_side = avail.x.min(mesh_h).max(96.0);
+                let mesh_size = Vec2::new(mesh_side, mesh_side);
                 let (response, painter) =
                     ui.allocate_painter(mesh_size, egui::Sense::drag());
                 if response.dragged() {
                     self.mesh_yaw += response.drag_delta().x * 0.01;
                     self.mesh_pitch = (self.mesh_pitch + response.drag_delta().y * 0.01).clamp(0.1, 1.4);
+                }
+                if response.hovered() {
+                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                    if scroll.abs() > 0.0 {
+                        let factor = 1.0 + scroll * 0.002;
+                        self.mesh_zoom = (self.mesh_zoom * factor).clamp(0.45, 2.2);
+                    }
                 }
 
                 if !self.xdf.tables.is_empty() {
@@ -826,63 +941,15 @@ impl WidebandApp {
                         table,
                         self.mesh_yaw,
                         self.mesh_pitch,
+                        self.mesh_zoom,
                         self.active_cell,
                     );
                 } else {
                     painter.rect_filled(response.rect, 4.0, theme::BG_FILL);
                 }
 
-                ui.add_space(8.0);
-
-                // Telemetry card styling: #11151C background, 1px #30363D border, bright cyan #00E5FF numbers
-                egui::Frame::none()
-                    .fill(CARD_FILL)
-                    .stroke(Stroke::new(1.0, STROKE))
-                    .rounding(egui::Rounding::same(4.0))
-                    .inner_margin(egui::Margin::symmetric(12.0, 10.0))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new("LIVE CELL TELEMETRY TRACKING")
-                                    .small()
-                                    .strong()
-                                    .color(MUTED),
-                            );
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(egui::RichText::new("● LIVE").small().strong().color(EMERALD));
-                            });
-                        });
-                        ui.add_space(6.0);
-
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Engine RPM:").color(MUTED));
-                            ui.label(
-                                egui::RichText::new(format!("{:.0}", self.trace_rpm))
-                                    .monospace()
-                                    .strong()
-                                    .color(ACCENT_CYAN),
-                            );
-                            ui.add_space(10.0);
-                            ui.label(egui::RichText::new("MAP:").color(MUTED));
-                            ui.label(
-                                egui::RichText::new(format!("{:.1} kPa", self.trace_map))
-                                    .monospace()
-                                    .strong()
-                                    .color(ACCENT_CYAN),
-                            );
-                        });
-                        ui.add_space(4.0);
-
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Active Tracked Cell:").color(MUTED));
-                            ui.label(
-                                egui::RichText::new(format!("Row {}, Col {}", self.active_cell.0, self.active_cell.1))
-                                    .monospace()
-                                    .strong()
-                                    .color(ACCENT_CYAN),
-                            );
-                        });
-                    });
+                ui.add_space(6.0);
+                self.paint_live_telemetry_card(ui);
             });
 
         // Center Heatmap Table Grid
@@ -948,22 +1015,20 @@ impl WidebandApp {
                 let table_desc = self.xdf.tables[self.selected_table_idx].description.clone();
                 let z_units = self.xdf.tables[self.selected_table_idx].z_units.clone();
 
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.heading(egui::RichText::new(&table_title).size(16.0).color(TEXT));
                     ui.label(egui::RichText::new(format!("({})", z_units)).color(ACCENT_CYAN));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let ck_color = if self.checksum_status == CHECKSUM_VALID {
-                            EMERALD
-                        } else {
-                            Color32::from_rgb(0xF5, 0x88, 0x36)
-                        };
-                        ui.label(
-                            egui::RichText::new(&self.checksum_status)
-                                .size(11.0)
-                                .color(ck_color)
-                                .strong(),
-                        );
-                    });
+                    let ck_color = if self.checksum_status == CHECKSUM_VALID {
+                        EMERALD
+                    } else {
+                        Color32::from_rgb(0xF5, 0x88, 0x36)
+                    };
+                    ui.label(
+                        egui::RichText::new(&self.checksum_status)
+                            .size(11.0)
+                            .color(ck_color)
+                            .strong(),
+                    );
                 });
                 ui.label(egui::RichText::new(&table_desc).small().color(MUTED));
                 ui.add_space(4.0);
@@ -995,15 +1060,13 @@ impl WidebandApp {
                 });
                 ui.add_space(8.0);
 
+                let grid_avail = ui.available_size();
                 egui::ScrollArea::both()
+                    .id_salt("tune_grid")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        egui::ScrollArea::both()
-                            .id_salt("tune_grid_inner")
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                self.render_table_grid(ui);
-                            });
+                        ui.set_min_size(Vec2::new(grid_avail.x.max(200.0), grid_avail.y.max(120.0)));
+                        self.render_table_grid(ui);
                     });
             });
     }
@@ -1144,20 +1207,9 @@ impl WidebandApp {
         };
 
         egui::TopBottomPanel::top("gauge_strip").min_height(72.0).show(ctx, |ui| {
-            ui.horizontal_centered(|ui| {
-                ui.add_space(8.0);
-                for (label, text, unit, rgb) in &gauge_channels {
-                    self.render_gauge_card(
-                        ui,
-                        label,
-                        text.clone(),
-                        unit,
-                        Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
-                    );
-                }
-
+            ui.horizontal_wrapped(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Export CSV Log").clicked() {
+                    if ui.button("Export CSV").clicked() {
                         let exported = self.telemetry.lock().unwrap().export_csv("datalog.csv").is_ok();
                         if exported {
                             self.log("Datalog exported successfully to datalog.csv");
@@ -1165,7 +1217,7 @@ impl WidebandApp {
                             self.log("Export failed — start live polling or record first.");
                         }
                     }
-                    let rec_label = if recording { "■ Stop Record" } else { "● Record" };
+                    let rec_label = if recording { "■ Stop" } else { "● Record" };
                     if ui.button(rec_label).clicked() {
                         let on = {
                             let mut buf = self.telemetry.lock().unwrap();
@@ -1179,16 +1231,25 @@ impl WidebandApp {
                             "Telemetry recording stopped."
                         });
                     }
-                    if ui.button("Clear Log").clicked() {
+                    if ui.button("Clear").clicked() {
                         self.telemetry.lock().unwrap().clear();
                         self.log("Telemetry history cleared.");
                     }
                 });
+                for (label, text, unit, rgb) in &gauge_channels {
+                    self.render_gauge_card(
+                        ui,
+                        label,
+                        text.clone(),
+                        unit,
+                        Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
+                    );
+                }
             });
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.heading(
                     egui::RichText::new("Definition-Driven Live Strip Chart")
                         .size(15.0)
@@ -1202,6 +1263,7 @@ impl WidebandApp {
             });
             ui.add_space(4.0);
 
+            let plot_h = ui.available_size().y.max(160.0);
             let buffer = self.telemetry.lock().unwrap();
             let mut plot_lines: Vec<Line> = Vec::new();
             for (ch_idx, ch) in buffer.channels.iter().enumerate() {
@@ -1229,7 +1291,9 @@ impl WidebandApp {
             }
 
             Plot::new("telemetry_oscilloscope")
-                .view_aspect(2.2)
+                .height(plot_h)
+                .width(ui.available_width())
+                .view_aspect(ui.available_width() / plot_h.max(1.0))
                 .show_axes([true, true])
                 .legend(egui_plot::Legend::default())
                 .show(ui, |plot_ui| {
@@ -1278,7 +1342,7 @@ impl WidebandApp {
             ui.label("Direct J2534 ISO 14229 / ISO 14230 flashing with seed-key handshake and checksum stamping.");
             ui.separator();
 
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button(egui::RichText::new("🔍 Identify ECU").strong()).clicked() {
                     if let Some(dev) = &mut self.active_device {
                         let prof = &self.profiles[self.selected_profile_idx];
