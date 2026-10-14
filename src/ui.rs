@@ -89,6 +89,8 @@ pub struct WidebandApp {
     /// True while a drag-select started in the grid is in progress.
     grid_drag_select: bool,
     pub table_undo: UndoStack,
+    /// Typed value being entered for the selection (None = not typing).
+    pub cell_entry: Option<String>,
     /// Log-based VE correction state (panel above the grid).
     pub ve_corr: VeCorrectionUi,
     /// Live operating point on the selected table (separate from the edit selection).
@@ -216,6 +218,7 @@ impl WidebandApp {
             selection_anchor: None,
             grid_drag_select: false,
             table_undo: UndoStack::default(),
+            cell_entry: None,
             ve_corr: VeCorrectionUi::default(),
             live_trace: live_trace::LiveTrace::default(),
             math_amount: 5.0,
@@ -429,6 +432,7 @@ impl WidebandApp {
                     self.active_cell = (0, 0);
                     self.selection_anchor = None;
                     self.table_undo.clear();
+                    self.cell_entry = None;
                     self.live_trace.clear();
                     let label = path.file_name().unwrap_or_default().to_string_lossy().to_string();
                     self.xdf_path = Some(path);
@@ -1760,35 +1764,23 @@ impl WidebandApp {
                         .small()
                         .color(MUTED),
                     );
+                    if let Some(buf) = &self.cell_entry {
+                        ui.label(
+                            egui::RichText::new(format!("Set to: {}\u{258F}  (Enter = apply, Esc = cancel)", buf))
+                                .monospace()
+                                .strong()
+                                .color(ACCENT_CYAN),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new("Type a value + Enter \u{00B7} + - * / step \u{00B7} arrows \u{00B7} Ctrl+C/V")
+                                .small()
+                                .color(MUTED),
+                        );
+                    }
                 });
 
-                // Keyboard: undo/redo, select all, Esc to collapse the selection.
-                if !ui.ctx().wants_keyboard_input() {
-                    let (undo, redo, all, esc) = ui.input(|i| {
-                        let cmd = i.modifiers.command;
-                        (
-                            cmd && !i.modifiers.shift && i.key_pressed(egui::Key::Z),
-                            cmd && (i.key_pressed(egui::Key::Y) || (i.modifiers.shift && i.key_pressed(egui::Key::Z))),
-                            cmd && i.key_pressed(egui::Key::A),
-                            i.key_pressed(egui::Key::Escape),
-                        )
-                    });
-                    if undo {
-                        self.undo_table_edit();
-                    }
-                    if redo {
-                        self.redo_table_edit();
-                    }
-                    if all {
-                        let t = &self.xdf.tables[self.selected_table_idx];
-                        let (rows, cols) = (t.values.len(), t.values.first().map_or(0, |r| r.len()));
-                        self.selection_anchor = Some((0, 0));
-                        self.active_cell = (rows.saturating_sub(1), cols.saturating_sub(1));
-                    }
-                    if esc {
-                        self.selection_anchor = None;
-                    }
-                }
+                self.handle_grid_keyboard(ui);
                 if !beginner_mode {
                     self.render_ve_correction_panel(ui);
                 }
@@ -1964,6 +1956,11 @@ impl WidebandApp {
                                     self.active_cell = (r, c);
                                 } else if self.grid_drag_select && ui.rect_contains_pointer(response.rect) {
                                     self.active_cell = (r, c);
+                                }
+                                if response.double_clicked() {
+                                    self.selection_anchor = None;
+                                    self.active_cell = (r, c);
+                                    self.cell_entry = Some(format!("{}", val));
                                 }
                                 if response.clicked() {
                                     if ui.input(|i| i.modifiers.shift) {
@@ -3677,5 +3674,118 @@ impl WidebandApp {
             changed
         );
         self.log(&format!("Log fuel correction applied to {} cells of {}", changed, self.xdf.tables[idx].title));
+    }
+}
+
+impl WidebandApp {
+    /// HP Tuners-style grid keyboard: type a value + Enter, + - * / step ops, arrows /
+    /// Shift+arrows, Ctrl+C / Ctrl+V (Excel TSV), Ctrl+A, Ctrl+Z / Ctrl+Y, Esc.
+    fn handle_grid_keyboard(&mut self, ui: &mut egui::Ui) {
+        if self.xdf.tables.is_empty() || ui.ctx().wants_keyboard_input() {
+            return;
+        }
+        let (rows, cols) = {
+            let t = &self.xdf.tables[self.selected_table_idx];
+            (t.values.len(), t.values.first().map_or(0, |r| r.len()))
+        };
+        let events = ui.input(|i| i.events.clone());
+        let mut changed_entry = false;
+        for ev in events {
+            match ev {
+                egui::Event::Copy | egui::Event::Cut => {
+                    let tsv = table_edit::to_tsv(&self.xdf.tables[self.selected_table_idx].values, &self.selection());
+                    if !tsv.is_empty() {
+                        let n = self.selection().count();
+                        ui.ctx().copy_text(tsv);
+                        self.log(&format!("Copied {} cell(s)", n));
+                    }
+                }
+                egui::Event::Paste(text) => match table_edit::parse_block(&text) {
+                    Ok(block) => {
+                        let mut wrote = None;
+                        self.edit_selected_table("paste", |v, sel| wrote = table_edit::paste_block(v, sel, &block));
+                        if let Some(w) = wrote {
+                            self.selection_anchor = Some(w.anchor);
+                            self.active_cell = w.cursor;
+                        }
+                    }
+                    Err(e) => self.log(&format!("Paste refused: {}", e)),
+                },
+                egui::Event::Text(t) => {
+                    for ch in t.chars() {
+                        match (&mut self.cell_entry, ch) {
+                            (Some(buf), c) if c.is_ascii_digit() || c == '.' || ((c == '-' || c == 'e') && !buf.contains(c)) => {
+                                buf.push(c);
+                                changed_entry = true;
+                            }
+                            (None, c) if c.is_ascii_digit() || c == '.' => {
+                                self.cell_entry = Some(c.to_string());
+                                changed_entry = true;
+                            }
+                            (None, '=') => {
+                                self.cell_entry = Some(String::new());
+                                changed_entry = true;
+                            }
+                            (None, '+') => self.run_table_math(MathOp::Add(self.math_amount)),
+                            (None, '-') => self.run_table_math(MathOp::Sub(self.math_amount)),
+                            (None, '*') => self.run_table_math(MathOp::Percent(self.math_amount)),
+                            (None, '/') => self.run_table_math(MathOp::Percent(-self.math_amount)),
+                            _ => {}
+                        }
+                    }
+                }
+                egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                    let cmd = modifiers.command;
+                    match key {
+                        egui::Key::Z if cmd && !modifiers.shift => self.undo_table_edit(),
+                        egui::Key::Z if cmd && modifiers.shift => self.redo_table_edit(),
+                        egui::Key::Y if cmd => self.redo_table_edit(),
+                        egui::Key::A if cmd => {
+                            self.selection_anchor = Some((0, 0));
+                            self.active_cell = (rows.saturating_sub(1), cols.saturating_sub(1));
+                        }
+                        egui::Key::Enter => {
+                            if let Some(buf) = self.cell_entry.take() {
+                                match buf.trim().parse::<f64>() {
+                                    Ok(v) => self.run_table_math(MathOp::Set(v)),
+                                    Err(_) if buf.trim().is_empty() => {}
+                                    Err(_) => self.log(&format!("\"{}\" is not a number", buf)),
+                                }
+                                changed_entry = true;
+                            }
+                        }
+                        egui::Key::Escape => {
+                            if self.cell_entry.take().is_none() {
+                                self.selection_anchor = None;
+                            }
+                            changed_entry = true;
+                        }
+                        egui::Key::Backspace => {
+                            if let Some(buf) = &mut self.cell_entry {
+                                buf.pop();
+                                changed_entry = true;
+                            }
+                        }
+                        egui::Key::ArrowUp | egui::Key::ArrowDown | egui::Key::ArrowLeft | egui::Key::ArrowRight if !cmd => {
+                            let (dr, dc) = match key {
+                                egui::Key::ArrowUp => (-1, 0),
+                                egui::Key::ArrowDown => (1, 0),
+                                egui::Key::ArrowLeft => (0, -1),
+                                _ => (0, 1),
+                            };
+                            let moved = table_edit::move_cursor(&self.selection(), dr, dc, modifiers.shift, rows, cols);
+                            self.selection_anchor = if moved.is_single() { None } else { Some(moved.anchor) };
+                            self.active_cell = moved.cursor;
+                            self.cell_entry = None;
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        if changed_entry {
+            ui.ctx().request_repaint();
+        }
     }
 }

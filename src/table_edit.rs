@@ -170,6 +170,112 @@ pub fn smooth(values: &mut [Vec<f64>], sel: &CellSelection) {
     }
 }
 
+/// Selection as tab-separated rows (pastes straight into Excel / Sheets / HPT-style editors).
+pub fn to_tsv(values: &[Vec<f64>], sel: &CellSelection) -> String {
+    if !in_table(values, sel) {
+        return String::new();
+    }
+    let (r0, r1, c0, c1) = sel.bounds();
+    values[r0..=r1]
+        .iter()
+        .map(|row| {
+            row[c0..=c1]
+                .iter()
+                .map(|v| {
+                    let s = format!("{:.4}", v);
+                    s.trim_end_matches('0').trim_end_matches('.').to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\t")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Parse clipboard text (tabs, commas, or runs of spaces between cells; one row per line).
+/// Errors name the first cell that isn't a number, so a bad paste changes nothing.
+pub fn parse_block(text: &str) -> Result<Vec<Vec<f64>>, String> {
+    let mut out = Vec::new();
+    for (ri, line) in text.lines().enumerate() {
+        let line = line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            continue;
+        }
+        let cells: Vec<&str> = if line.contains('\t') {
+            line.split('\t').collect()
+        } else if line.contains(',') {
+            line.split(',').collect()
+        } else {
+            line.split_whitespace().collect()
+        };
+        let mut row = Vec::with_capacity(cells.len());
+        for (ci, cell) in cells.iter().enumerate() {
+            let t = cell.trim();
+            let v: f64 = t
+                .parse()
+                .map_err(|_| format!("row {}, column {}: \"{}\" is not a number", ri + 1, ci + 1, t))?;
+            row.push(v);
+        }
+        out.push(row);
+    }
+    if out.is_empty() {
+        return Err("clipboard has no numbers".to_string());
+    }
+    Ok(out)
+}
+
+/// Paste `block` into `values`. A single value fills the whole selection; a block lands with
+/// its top-left at the selection's top-left and is clipped at the table edge.
+/// Returns the rectangle actually written.
+pub fn paste_block(
+    values: &mut [Vec<f64>],
+    sel: &CellSelection,
+    block: &[Vec<f64>],
+) -> Option<CellSelection> {
+    let rows = values.len();
+    let cols = values.first().map_or(0, |r| r.len());
+    if rows == 0 || cols == 0 || block.is_empty() {
+        return None;
+    }
+    let (r0, r1, c0, c1) = sel.clamped(rows, cols).bounds();
+    if block.len() == 1 && block[0].len() == 1 {
+        apply_math(values, &CellSelection { anchor: (r0, c0), cursor: (r1, c1) }, MathOp::Set(block[0][0]));
+        return Some(CellSelection { anchor: (r0, c0), cursor: (r1, c1) });
+    }
+    let mut last = (r0, c0);
+    for (dr, brow) in block.iter().enumerate() {
+        for (dc, v) in brow.iter().enumerate() {
+            let (r, c) = (r0 + dr, c0 + dc);
+            if r < rows && c < cols {
+                values[r][c] = round2(*v);
+                last = (last.0.max(r), last.1.max(c));
+            }
+        }
+    }
+    Some(CellSelection { anchor: (r0, c0), cursor: last })
+}
+
+/// Arrow-key move. With `extend` the anchor stays put (Shift+arrow grows the block).
+pub fn move_cursor(
+    sel: &CellSelection,
+    dr: isize,
+    dc: isize,
+    extend: bool,
+    rows: usize,
+    cols: usize,
+) -> CellSelection {
+    if rows == 0 || cols == 0 {
+        return *sel;
+    }
+    let step = |v: usize, d: isize, n: usize| (v as isize + d).clamp(0, n as isize - 1) as usize;
+    let cursor = (step(sel.cursor.0, dr, rows), step(sel.cursor.1, dc, cols));
+    if extend {
+        CellSelection { anchor: sel.anchor, cursor }
+    } else {
+        CellSelection::single(cursor)
+    }
+}
+
 /// Per-table snapshot history. A snapshot is the table's values *before* an edit.
 #[derive(Default)]
 pub struct UndoStack {
@@ -301,6 +407,45 @@ mod tests {
         let mut v = grid();
         apply_math(&mut v, &CellSelection { anchor: (0, 0), cursor: (5, 5) }, MathOp::Set(0.0));
         assert_eq!(v, grid());
+    }
+
+    #[test]
+    fn tsv_roundtrip_through_excel_format() {
+        let v = grid();
+        let sel = CellSelection { anchor: (0, 1), cursor: (1, 2) };
+        let tsv = to_tsv(&v, &sel);
+        assert_eq!(tsv, "20\t30\n99\t99");
+        assert_eq!(parse_block(&tsv).unwrap(), vec![vec![20.0, 30.0], vec![99.0, 99.0]]);
+    }
+
+    #[test]
+    fn parse_accepts_excel_csv_and_spaces_and_reports_bad_cell() {
+        assert_eq!(parse_block("1\t2\r\n3\t4\r\n").unwrap(), vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
+        assert_eq!(parse_block("1, 2.5\n").unwrap(), vec![vec![1.0, 2.5]]);
+        assert_eq!(parse_block(" -1   2 ").unwrap(), vec![vec![-1.0, 2.0]]);
+        let err = parse_block("1\t2\n3\tabc").unwrap_err();
+        assert!(err.contains("row 2, column 2"), "{}", err);
+    }
+
+    #[test]
+    fn paste_block_clips_at_edge_and_single_value_fills() {
+        let mut v = grid();
+        let wrote = paste_block(&mut v, &CellSelection::single((2, 2)), &[vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]]).unwrap();
+        assert_eq!(v[2], vec![50.0, 60.0, 1.0, 2.0]);
+        assert_eq!(wrote.bounds(), (2, 2, 2, 3), "clipped to table");
+
+        let mut v = grid();
+        paste_block(&mut v, &CellSelection { anchor: (0, 0), cursor: (1, 1) }, &[vec![7.0]]);
+        assert_eq!((v[0][0], v[0][1], v[1][0], v[1][1], v[0][2]), (7.0, 7.0, 7.0, 7.0, 30.0));
+    }
+
+    #[test]
+    fn arrows_move_and_shift_extends() {
+        let s = CellSelection::single((1, 1));
+        assert_eq!(move_cursor(&s, 0, 1, false, 3, 4), CellSelection::single((1, 2)));
+        assert_eq!(move_cursor(&s, -5, 0, false, 3, 4), CellSelection::single((0, 1)), "clamped");
+        let e = move_cursor(&s, 1, 1, true, 3, 4);
+        assert_eq!(e.bounds(), (1, 2, 1, 2));
     }
 
     #[test]
