@@ -268,8 +268,16 @@ mod imp {
             Ok(1)
         }
 
-        fn ioctl(&mut self, _channel: u32, _ioctl_id: u32, _input: &[u8]) -> Result<Vec<u8>, String> {
-            Ok(vec![])
+        fn ioctl(&mut self, _channel: u32, ioctl_id: u32, input: &[u8]) -> Result<Vec<u8>, String> {
+            let line = if input.is_empty() {
+                format!("IOCTL {:X}", ioctl_id)
+            } else {
+                format!("IOCTL {:X} {}", ioctl_id, bytes_to_hex(input))
+            };
+            let resp = self.command(&line, 15_000)?;
+            Self::require_ok(&resp)?;
+            let data_hex = resp.get("data").and_then(|v| v.as_str()).unwrap_or("");
+            Ok(hex_to_bytes(data_hex))
         }
 
         fn kline_fast_init(&mut self, _channel: u32, frame: &[u8]) -> Result<Vec<u8>, String> {
