@@ -25,6 +25,7 @@ pub mod strategy_ui;
 pub mod telemetry;
 pub mod telemetry_playback;
 pub mod surface_mesh;
+pub mod table_edit;
 pub mod simple_ux;
 pub mod tcm;
 pub mod tester_present;
@@ -32,6 +33,7 @@ pub mod theme;
 pub mod transport;
 pub mod ui;
 pub mod uds;
+pub mod ve_correction;
 
 use eframe::egui;
 use ui::WidebandApp;

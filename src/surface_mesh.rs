@@ -408,6 +408,7 @@ pub fn paint_surface_mesh(
     active_cell: (usize, usize),
     hover_cell: Option<(usize, usize)>,
     live_trail: &[((f32, f32), f32)],
+    live_off_table: bool,
 ) {
     painter.rect_filled(rect, 4.0, BG_FILL);
     painter.rect_stroke(rect, 4.0, Stroke::new(1.0, STROKE));
@@ -481,7 +482,8 @@ pub fn paint_surface_mesh(
         }
     }
 
-    // 3. Overlays.
+    // 3. Overlays. The trail goes first so axis labels and the cursor stay readable on top.
+    paint_live_trail(&scene, &clip, live_trail, live_off_table);
     let mut placed = Vec::new();
     for (anchor, label, color) in &axis_labels {
         paint_axis_label_avoiding(&clip, *anchor, label, *color, &mut placed);
@@ -492,7 +494,6 @@ pub fn paint_surface_mesh(
         }
     }
     paint_cell_marker(&scene, &clip, active_cell, ACCENT_CYAN, true);
-    paint_live_trail(&scene, &clip, live_trail);
     paint_readout(&scene, &clip, rect, hover_cell.unwrap_or(active_cell), hover_cell.is_some());
 
     let mut badge = format!("{:.0}%", zoom * 100.0);
@@ -660,7 +661,7 @@ fn paint_cell_marker(
 
 /// Live operating point: fading green trail riding the surface, bright head = now.
 /// Drawn over the mesh (an overlay like the cursor), lifted slightly so it never z-fights.
-fn paint_live_trail(scene: &MeshScene, painter: &Painter, trail: &[((f32, f32), f32)]) {
+fn paint_live_trail(scene: &MeshScene, painter: &Painter, trail: &[((f32, f32), f32)], off_table: bool) {
     if trail.is_empty() {
         return;
     }
@@ -684,8 +685,13 @@ fn paint_live_trail(scene: &MeshScene, painter: &Painter, trail: &[((f32, f32), 
     let (r, c) = trail.last().unwrap().0;
     let (base, _) = scene.proj.project(scene.floor_point(c, r));
     painter.line_segment([base, head], Stroke::new(1.0, EMERALD.gamma_multiply(0.4)));
-    painter.circle_filled(head, 5.0, EMERALD);
-    painter.circle_stroke(head, 8.5, Stroke::new(1.5, EMERALD.gamma_multiply(0.5)));
+    // Amber head + warning ring when the engine is past the table edge (value clamped).
+    let head_col = if off_table { Color32::from_rgb(255, 152, 0) } else { EMERALD };
+    painter.circle_filled(head, 5.0, head_col);
+    painter.circle_stroke(head, 8.5, Stroke::new(1.5, head_col.gamma_multiply(0.5)));
+    if off_table {
+        painter.circle_stroke(head, 13.0, Stroke::new(1.5, head_col));
+    }
 }
 
 /// Bottom-left readout: `X × Y → value` for the hovered (or selected) cell.
