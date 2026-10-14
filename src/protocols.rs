@@ -462,6 +462,11 @@ impl EcuIdentifier {
                 "ECU did not respond to identification (ignition ON, Tacoma 2009+ CAN profile, and bus traffic required)."
                     .to_string(),
             );
+        } else if id.vin.contains("VIRT") || id.cal_id.contains("VIRT") {
+            return Err(
+                "Identification looks like Virtual ECU bench data (VIRT markers). Select your Mini-VCI/VXDIAG device, not Virtual ECU."
+                    .to_string(),
+            );
         }
 
         id.details = format!(
