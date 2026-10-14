@@ -4,7 +4,6 @@
 #[cfg(windows)]
 mod imp {
     use super::super::j2534::{PassThruDevice, PassThruMsg};
-    use crate::protocols::EcuProfile;
     use serde_json::Value;
     use std::io::{BufRead, BufReader, Write};
     use std::path::{Path, PathBuf};
@@ -31,7 +30,7 @@ mod imp {
         pub fn new(dll_path: &str) -> Self {
             Self {
                 lib_path: dll_path.to_string(),
-                host_path: locate_host_exe(),
+                host_path: Self::locate_host_exe(),
                 child: None,
                 stdin: None,
                 reader: Mutex::new(None),
@@ -47,7 +46,7 @@ mod imp {
         }
 
         pub fn host_available() -> bool {
-            locate_host_exe().exists()
+            Self::locate_host_exe().exists()
         }
 
         fn locate_host_exe() -> PathBuf {
@@ -99,7 +98,7 @@ mod imp {
 
         fn open(&mut self) -> Result<(), String> {
             if !self.host_path.exists() {
-                return Err(format!("J2534Host.exe not found (expected {})", self.host_path));
+                return Err(format!("J2534Host.exe not found (expected {})", self.host_path.display()));
             }
             if !Path::new(&self.lib_path).exists() {
                 return Err(format!("J2534 DLL not found: {}", self.lib_path));
@@ -122,7 +121,7 @@ mod imp {
                 self.lib_path.clone()
             };
             let resp = self.command(&format!("OPEN {}", quoted), 15_000)?;
-            require_ok(&resp)?;
+            Self::require_ok(&resp)?;
             self.device_id = resp.get("device_id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             self.connected = true;
             self.version_str = format!("J2534Host → {}", self.lib_path);
@@ -154,7 +153,7 @@ mod imp {
                 flags
             );
             let resp = self.command(&line, 15_000)?;
-            require_ok(&resp)?;
+            Self::require_ok(&resp)?;
             self.channel_id = resp.get("channel_id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             self.extended = self.connect_extended && protocol == 5;
             if protocol == 5 {
@@ -164,10 +163,10 @@ mod imp {
                     self.connect_filter_mask
                 );
                 let f = self.command(&filter_line, 15_000)?;
-                require_ok(&f)?;
+                Self::require_ok(&f)?;
             } else {
                 let f = self.command("FILTER 00 00", 15_000)?;
-                require_ok(&f)?;
+                Self::require_ok(&f)?;
             }
             Ok(self.channel_id)
         }
@@ -178,7 +177,7 @@ mod imp {
 
         fn read_msgs(&mut self, _channel: u32, timeout_ms: u32) -> Result<Vec<PassThruMsg>, String> {
             let resp = self.command("READ", timeout_ms.max(50))?;
-            require_ok(&resp)?;
+            Self::require_ok(&resp)?;
             if resp.get("empty").and_then(|v| v.as_bool()) == Some(true) {
                 return Ok(Vec::new());
             }
@@ -201,7 +200,7 @@ mod imp {
                 let payload = msg.payload();
                 let line = format!("WRITE {:X} {}", id, bytes_to_hex(payload));
                 let resp = self.command(&line, timeout_ms.max(1000))?;
-                require_ok(&resp)?;
+                Self::require_ok(&resp)?;
                 count += 1;
             }
             Ok(count)
