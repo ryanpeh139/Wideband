@@ -1,0 +1,60 @@
+{
+  "_comment": "Copy to security-config.json beside wideband.exe. Replace YOUR_* placeholders with values you are authorized to use. Never commit real OEM masks.",
+  "profiles": {
+    "tacoma-can": {
+      "algorithm": "denso32",
+      "generation": "denso32-your-os",
+      "endian": "big",
+      "configured": false
+    },
+    "tacoma-kline": {
+      "algorithm": "denso32",
+      "mask": "0x00000000",
+      "generation": "",
+      "endian": "big",
+      "configured": false
+    },
+    "silverado-can": {
+      "algorithm": "gm",
+      "keyId": "",
+      "configured": false
+    },
+    "silverado-vpw": {
+      "algorithm": "gm",
+      "keyId": "",
+      "configured": false
+    }
+  },
+  "densoGenerations": [
+    {
+      "id": "denso32-your-os",
+      "mask": "0xYOUR_DENSO32_MASK",
+      "endian": "big",
+      "configured": false
+    }
+  ],
+  "gmKeys": [
+    {
+      "id": "example",
+      "bits": 16,
+      "rotate": 1,
+      "direction": "left",
+      "xor": "0x0000",
+      "add": 0,
+      "endian": "big",
+      "configured": false
+    }
+  ],
+  "checksums": [
+    {
+      "id": "tacoma-cal-sum32",
+      "profile": "tacoma-can",
+      "algorithm": "sum32",
+      "start": "0xYOUR_RANGE_START",
+      "end": "0xYOUR_RANGE_END",
+      "store": "0xYOUR_CHECKSUM_STORE",
+      "endian": "big",
+      "configured": false
+    }
+  ]
+}

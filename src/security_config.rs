@@ -6,8 +6,59 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(test)]
+fn test_serial_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 pub const CHECKSUM_VALID: &str = "Checksum Valid";
 pub const CHECKSUM_UPDATED: &str = "Checksum Updated";
+
+/// How programming keys were registered (JSON file vs Virtual ECU bench override).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyRegistration {
+    None,
+    Json,
+    Bench,
+}
+
+/// High-level security posture for the active cable + config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecurityMode {
+    FailClosed,
+    Bench,
+    Production,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProfileSecurityLine {
+    pub profile_id: String,
+    pub algorithm: String,
+    pub configured_in_json: bool,
+    pub key_registration: KeyRegistration,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChecksumSecurityLine {
+    pub id: String,
+    pub profile: String,
+    pub algorithm: String,
+    pub configured_in_json: bool,
+    pub active: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SecurityReport {
+    pub mode: SecurityMode,
+    pub config_path: String,
+    pub load_note: String,
+    pub profiles: Vec<ProfileSecurityLine>,
+    pub checksums: Vec<ChecksumSecurityLine>,
+    pub flash_blockers: Vec<String>,
+}
 
 const BUILT_IN_PROFILES: [&str; 4] = [
     "tacoma-can",
@@ -42,12 +93,29 @@ struct ChecksumEntry {
     big_endian: bool,
 }
 
+struct ProfileDeclaration {
+    algorithm: String,
+    configured_in_json: bool,
+}
+
+struct ChecksumDeclaration {
+    id: String,
+    profile: String,
+    algorithm: String,
+    configured_in_json: bool,
+    active: bool,
+}
+
 struct PlatformState {
     profile_keys: HashMap<String, ProfileKeyKind>,
     /// Profiles whose seed-key mapping was loaded from `security-config.json` (`configured: true`).
     file_configured_profiles: HashSet<String>,
     checksums: Vec<ChecksumEntry>,
     load_note: String,
+    key_registration: HashMap<String, KeyRegistration>,
+    profile_declarations: HashMap<String, ProfileDeclaration>,
+    checksum_declarations: Vec<ChecksumDeclaration>,
+    last_config_path: PathBuf,
 }
 
 impl PlatformState {
@@ -57,6 +125,10 @@ impl PlatformState {
             file_configured_profiles: HashSet::new(),
             checksums: Vec::new(),
             load_note: String::new(),
+            key_registration: HashMap::new(),
+            profile_declarations: HashMap::new(),
+            checksum_declarations: Vec::new(),
+            last_config_path: PathBuf::new(),
         }
     }
 }
@@ -69,6 +141,12 @@ fn state() -> &'static Mutex<PlatformState> {
 pub struct PlatformSecurity;
 
 impl PlatformSecurity {
+    /// Hold for the full body of any test that reads or writes global security state (parallel-safe).
+    #[cfg(test)]
+    pub fn test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
+        test_serial_lock()
+    }
+
     pub fn default_config_path() -> PathBuf {
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
@@ -87,14 +165,18 @@ impl PlatformSecurity {
         guard.file_configured_profiles.clear();
         guard.checksums.clear();
         guard.load_note.clear();
+        guard.key_registration.clear();
+        guard.profile_declarations.clear();
+        guard.checksum_declarations.clear();
+        guard.last_config_path = path.to_path_buf();
         let result = (|| {
             if path.as_os_str().is_empty() {
                 return Err("The security config path is empty.".to_string());
             }
             if !path.exists() {
-                fs::write(path, template_json()).map_err(|e| e.to_string())?;
+                fs::write(path, template_json()).map_err(|e| format!("Could not create {}: {}", path.display(), e))?;
             }
-            let text = fs::read_to_string(path).map_err(|e| e.to_string())?;
+            let text = fs::read_to_string(path).map_err(|e| format!("Could not read {}: {}", path.display(), e))?;
             parse_into(&text, &mut guard)
         })();
 
@@ -102,11 +184,16 @@ impl PlatformSecurity {
             guard.profile_keys.clear();
             guard.file_configured_profiles.clear();
             guard.checksums.clear();
+            guard.key_registration.clear();
+            guard.profile_declarations.clear();
+            guard.checksum_declarations.clear();
             guard.load_note = if e.is_empty() {
                 "The security config could not be read.".to_string()
             } else {
                 e
             };
+        } else {
+            refresh_key_registration(&mut guard);
         }
     }
 
@@ -131,6 +218,9 @@ impl PlatformSecurity {
                     big_endian: true,
                 },
             );
+            guard
+                .key_registration
+                .insert(id.to_string(), KeyRegistration::Bench);
         }
         guard.profile_keys.insert(
             "silverado-can".to_string(),
@@ -143,6 +233,9 @@ impl PlatformSecurity {
                 big_endian: true,
             },
         );
+        guard
+            .key_registration
+            .insert("silverado-can".to_string(), KeyRegistration::Bench);
         guard.profile_keys.insert(
             "silverado-vpw".to_string(),
             ProfileKeyKind::Gm {
@@ -154,6 +247,152 @@ impl PlatformSecurity {
                 big_endian: true,
             },
         );
+        guard
+            .key_registration
+            .insert("silverado-vpw".to_string(), KeyRegistration::Bench);
+    }
+
+    pub fn security_mode(profile_id: &str, virtual_ecu: bool) -> SecurityMode {
+        let id = canonical_profile(profile_id);
+        let guard = state().lock().unwrap();
+        if !guard.load_note.is_empty() && guard.profile_keys.is_empty() {
+            return SecurityMode::FailClosed;
+        }
+        if virtual_ecu {
+            if guard.key_registration.get(&id).is_some() {
+                return SecurityMode::Bench;
+            }
+            return SecurityMode::FailClosed;
+        }
+        match guard.key_registration.get(&id) {
+            Some(KeyRegistration::Json) => SecurityMode::Production,
+            _ => SecurityMode::FailClosed,
+        }
+    }
+
+    pub fn flash_blockers(profile_id: &str, virtual_ecu: bool) -> Vec<String> {
+        let id = canonical_profile(profile_id);
+        let guard = state().lock().unwrap();
+        let mut reasons = Vec::new();
+        let bench_virtual = virtual_ecu
+            && guard.key_registration.get(&id) == Some(&KeyRegistration::Bench);
+
+        if !guard.load_note.is_empty() && !bench_virtual {
+            reasons.push(format!("Security config: {}", guard.load_note));
+        }
+
+        match guard.key_registration.get(&id) {
+            Some(KeyRegistration::Json) => {}
+            Some(KeyRegistration::Bench) if virtual_ecu => {}
+            Some(KeyRegistration::Bench) => {
+                reasons.push(
+                    "Production flash blocked: only Virtual ECU bench keys (zero mask) are active. \
+Configure security-config.json with your authorized Denso mask or generation before flashing real hardware."
+                        .to_string(),
+                );
+            }
+            Some(KeyRegistration::None) | None => {
+                let decl = guard.profile_declarations.get(&id);
+                if let Some(d) = decl {
+                    if d.configured_in_json {
+                        reasons.push(format!(
+                            "Profile \"{}\" is marked configured in security-config.json but the key did not load (missing mask, generation, or keyId reference).",
+                            id
+                        ));
+                    } else {
+                        reasons.push(format!(
+                            "No security key for {}. Set profiles.{}.configured to true with a valid denso32 mask or generation (see tests/security-config-tacoma-can.sample.json).",
+                            id, id
+                        ));
+                    }
+                } else {
+                    reasons.push(format!(
+                        "No security key function is configured for {}.",
+                        id
+                    ));
+                }
+            }
+        }
+
+        let has_active_checksum = guard
+            .checksums
+            .iter()
+            .any(|e| applies_checksum(e, &id));
+        if !has_active_checksum && !bench_virtual {
+            let pending = guard
+                .checksum_declarations
+                .iter()
+                .any(|c| c.configured_in_json && profile_matches_checksum(&c.profile, &id));
+            if pending {
+                reasons.push(format!(
+                    "Checksum for \"{}\" is marked configured in JSON but did not load (check start/end/store addresses and algorithm).",
+                    id
+                ));
+            } else {
+                reasons.push(format!(
+                    "No checksum range is configured for {}. Add a checksums[] row with profile \"{}\" and configured true.",
+                    id, id
+                ));
+            }
+        }
+
+        reasons
+    }
+
+    pub fn assert_flash_allowed(profile_id: &str, virtual_ecu: bool) -> Result<(), String> {
+        let blockers = Self::flash_blockers(profile_id, virtual_ecu);
+        if blockers.is_empty() {
+            Ok(())
+        } else {
+            Err(blockers.join(" "))
+        }
+    }
+
+    pub fn security_report(profile_id: &str, virtual_ecu: bool) -> SecurityReport {
+        let mode = Self::security_mode(profile_id, virtual_ecu);
+        let flash_blockers = Self::flash_blockers(profile_id, virtual_ecu);
+        let guard = state().lock().unwrap();
+
+        let profiles: Vec<ProfileSecurityLine> = BUILT_IN_PROFILES
+            .iter()
+            .map(|built| {
+                let built = built.to_string();
+                let decl = guard.profile_declarations.get(&built);
+                ProfileSecurityLine {
+                    profile_id: built.clone(),
+                    algorithm: decl
+                        .map(|d| d.algorithm.clone())
+                        .unwrap_or_else(|| "—".to_string()),
+                    configured_in_json: decl.map(|d| d.configured_in_json).unwrap_or(false),
+                    key_registration: guard
+                        .key_registration
+                        .get(&built)
+                        .copied()
+                        .unwrap_or(KeyRegistration::None),
+                }
+            })
+            .collect();
+
+        let checksums: Vec<ChecksumSecurityLine> = guard
+            .checksum_declarations
+            .iter()
+            .map(|c| ChecksumSecurityLine {
+                id: c.id.clone(),
+                profile: c.profile.clone(),
+                algorithm: c.algorithm.clone(),
+                configured_in_json: c.configured_in_json,
+                active: c.active,
+            })
+            .collect();
+
+        SecurityReport {
+            mode,
+            config_path: guard.last_config_path.display().to_string(),
+            load_note: guard.load_note.clone(),
+            profiles,
+            checksums,
+            flash_blockers,
+        }
     }
 
     pub fn compute_key(seed: &[u8], profile: &EcuProfile) -> Result<Vec<u8>, String> {
@@ -500,6 +739,7 @@ struct GmDoc {
 
 #[derive(Deserialize)]
 struct ChecksumDoc {
+    id: Option<String>,
     profile: Option<String>,
     algorithm: Option<String>,
     start: Option<serde_json::Value>,
@@ -513,13 +753,102 @@ fn parse_into(text: &str, state: &mut PlatformState) -> Result<(), String> {
     if text.trim().is_empty() {
         return Err("The security config is empty.".to_string());
     }
-    let root: RootDoc = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let root: RootDoc = serde_json::from_str(text).map_err(|e| format!("security-config.json parse error: {}", e))?;
+    validate_root(&root)?;
+    record_profile_declarations(&root, state)?;
     let generations = read_generations(&root)?;
     let gm_keys = read_gm_keys(&root)?;
-    let checksums = read_checksums(&root)?;
+    let (checksums, checksum_declarations) = read_checksums(&root)?;
     read_profiles(&root, &generations, &gm_keys, state)?;
     state.checksums = checksums;
+    state.checksum_declarations = checksum_declarations;
     Ok(())
+}
+
+fn validate_root(root: &RootDoc) -> Result<(), String> {
+    if root.profiles.is_none() {
+        return Err("security-config.json must contain a \"profiles\" object.".to_string());
+    }
+    let profiles = root.profiles.as_ref().unwrap();
+    if profiles.is_empty() {
+        return Err("security-config.json \"profiles\" must not be empty.".to_string());
+    }
+    let mut seen_denso = std::collections::HashSet::new();
+    if let Some(rows) = &root.denso_generations {
+        for item in rows {
+            let id = optional_str(&item.id);
+            if id.is_empty() {
+                continue;
+            }
+            if !seen_denso.insert(id.to_lowercase()) {
+                return Err(format!("Duplicate densoGenerations id \"{}\".", id));
+            }
+        }
+    }
+    let mut seen_gm = std::collections::HashSet::new();
+    if let Some(rows) = &root.gm_keys {
+        for item in rows {
+            let id = optional_str(&item.id);
+            if id.is_empty() {
+                continue;
+            }
+            if !seen_gm.insert(id.to_lowercase()) {
+                return Err(format!("Duplicate gmKeys id \"{}\".", id));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn record_profile_declarations(root: &RootDoc, state: &mut PlatformState) -> Result<(), String> {
+    state.profile_declarations.clear();
+    let profiles = root.profiles.as_ref().unwrap();
+    for (key, item) in profiles {
+        let id = canonical_profile(key);
+        if id.is_empty() {
+            return Err("A profile id is required.".to_string());
+        }
+        let algorithm = optional_str(&item.algorithm);
+        if !algorithm.is_empty() {
+            let alg = algorithm.to_lowercase();
+            if alg != "denso32" && alg != "gm" {
+                return Err(format!(
+                    "profiles.{} algorithm must be denso32 or gm (got \"{}\").",
+                    id,
+                    algorithm
+                ));
+            }
+        }
+        let configured = flag(&item.configured)?;
+        state.profile_declarations.insert(
+            id,
+            ProfileDeclaration {
+                algorithm: if algorithm.is_empty() {
+                    "—".to_string()
+                } else {
+                    algorithm.to_lowercase()
+                },
+                configured_in_json: configured,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn refresh_key_registration(state: &mut PlatformState) {
+    state.key_registration.clear();
+    for id in state.profile_keys.keys() {
+        state
+            .key_registration
+            .insert(id.clone(), KeyRegistration::Json);
+    }
+}
+
+fn profile_matches_checksum(checksum_profile: &str, profile_id: &str) -> bool {
+    if checksum_profile.is_empty() {
+        return true;
+    }
+    canonical_profile(checksum_profile).eq_ignore_ascii_case(&canonical_profile(profile_id))
 }
 
 struct DensoGen {
@@ -623,33 +952,68 @@ fn read_gm_keys(root: &RootDoc) -> Result<Vec<GmKeyRow>, String> {
     Ok(list)
 }
 
-fn read_checksums(root: &RootDoc) -> Result<Vec<ChecksumEntry>, String> {
+fn read_checksums(root: &RootDoc) -> Result<(Vec<ChecksumEntry>, Vec<ChecksumDeclaration>), String> {
     let mut list = Vec::new();
+    let mut declarations = Vec::new();
     let rows = root.checksums.as_ref();
     if rows.is_none() {
-        return Ok(list);
+        return Ok((list, declarations));
     }
-    for item in rows.unwrap() {
-        if !flag(&item.configured)? {
-            continue;
-        }
+    for (index, item) in rows.unwrap().iter().enumerate() {
+        let configured = flag(&item.configured)?;
+        let id = optional_str(&item.id);
+        let row_label = if id.is_empty() {
+            format!("checksums[{}]", index)
+        } else {
+            id.clone()
+        };
         let algorithm = optional_str(&item.algorithm).to_lowercase();
-        if algorithm != "sum16" && algorithm != "sum32" && algorithm != "crc32" {
-            return Err("A checksum algorithm must be sum16, sum32, or crc32.".to_string());
+        if configured {
+            if algorithm != "sum16" && algorithm != "sum32" && algorithm != "crc32" {
+                return Err(format!(
+                    "{}: algorithm must be sum16, sum32, or crc32.",
+                    row_label
+                ));
+            }
+            let start = integer_from_opt(item.start.as_ref()).map_err(|e| {
+                format!("{} start: {}", row_label, e)
+            })?;
+            let end = integer_from_opt(item.end.as_ref()).map_err(|e| {
+                format!("{} end: {}", row_label, e)
+            })?;
+            let store = integer_from_opt(item.store.as_ref()).map_err(|e| {
+                format!("{} store: {}", row_label, e)
+            })?;
+            list.push(ChecksumEntry {
+                profile: canonical_profile(&optional_str(&item.profile)),
+                algorithm: algorithm.clone(),
+                start,
+                end,
+                store,
+                big_endian: big_endian_of(&item.endian)?,
+            });
+            declarations.push(ChecksumDeclaration {
+                id: row_label,
+                profile: optional_str(&item.profile),
+                algorithm,
+                configured_in_json: true,
+                active: true,
+            });
+        } else {
+            declarations.push(ChecksumDeclaration {
+                id: row_label,
+                profile: optional_str(&item.profile),
+                algorithm: if algorithm.is_empty() {
+                    "—".to_string()
+                } else {
+                    algorithm
+                },
+                configured_in_json: false,
+                active: false,
+            });
         }
-        let start = integer_from_opt(item.start.as_ref())?;
-        let end = integer_from_opt(item.end.as_ref())?;
-        let store = integer_from_opt(item.store.as_ref())?;
-        list.push(ChecksumEntry {
-            profile: canonical_profile(&optional_str(&item.profile)),
-            algorithm,
-            start,
-            end,
-            store,
-            big_endian: big_endian_of(&item.endian)?,
-        });
     }
-    Ok(list)
+    Ok((list, declarations))
 }
 
 fn read_profiles(
@@ -814,4 +1178,74 @@ fn mask_from_hex_str(s: &str, bits: usize) -> Result<u32, String> {
     }
     let mask = (1u32 << bits) - 1;
     Ok((parsed as u32) & mask)
+}
+
+pub fn key_registration_label(reg: KeyRegistration) -> &'static str {
+    match reg {
+        KeyRegistration::None => "not loaded",
+        KeyRegistration::Json => "loaded (JSON)",
+        KeyRegistration::Bench => "bench (Virtual ECU)",
+    }
+}
+
+pub fn security_mode_label(mode: SecurityMode) -> &'static str {
+    match mode {
+        SecurityMode::FailClosed => "Fail-closed",
+        SecurityMode::Bench => "Bench",
+        SecurityMode::Production => "Production",
+    }
+}
+
+#[cfg(test)]
+mod security_config_tests {
+    use super::*;
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    fn write_temp_config(name: &str, body: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(name);
+        let mut f = std::fs::File::create(&path).expect("temp config");
+        f.write_all(body.as_bytes()).expect("write config");
+        path
+    }
+
+    #[test]
+    fn rejects_missing_profiles_object() {
+        let _guard = PlatformSecurity::test_serial_guard();
+        let path = write_temp_config(
+            "wideband-sec-no-profiles.json",
+            r#"{ "checksums": [] }"#,
+        );
+        PlatformSecurity::install(&path);
+        let note = PlatformSecurity::load_note();
+        assert!(note.contains("profiles"), "{}", note);
+    }
+
+    #[test]
+    fn production_flash_blocked_with_bench_keys_only() {
+        let _guard = PlatformSecurity::test_serial_guard();
+        PlatformSecurity::install(&PathBuf::from("tests/security-config-test.json"));
+        PlatformSecurity::register_bench_keys_for_virtual();
+        let blockers = PlatformSecurity::flash_blockers("tacoma-can", false);
+        assert!(
+            blockers.iter().any(|b| b.contains("Production flash blocked")),
+            "{:?}",
+            blockers
+        );
+        let virtual_blockers = PlatformSecurity::flash_blockers("tacoma-can", true);
+        assert!(
+            virtual_blockers.is_empty(),
+            "virtual bench flash should be allowed: {:?}",
+            virtual_blockers
+        );
+    }
+
+    #[test]
+    fn fail_closed_when_profile_not_configured() {
+        let _guard = PlatformSecurity::test_serial_guard();
+        PlatformSecurity::install(&PathBuf::from("security-config.json"));
+        let blockers = PlatformSecurity::flash_blockers("tacoma-can", false);
+        assert!(!blockers.is_empty());
+        assert!(blockers.iter().any(|b| b.contains("checksum") || b.contains("key")));
+    }
 }

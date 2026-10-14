@@ -69,6 +69,7 @@ mod tests {
 
     #[test]
     fn test_checksum_badge_reflects_rom_state() {
+        let _guard = PlatformSecurity::test_serial_guard();
         install_test_security_config();
         let mut rom = vec![0x10, 0x20, 0x30, 0x40, 0x00, 0x00, 0x00, 0x00];
         let _ = ChecksumEngine::update_and_verify(&mut rom, "tacoma-can", 0);
@@ -202,6 +203,7 @@ mod tests {
 
     #[test]
     fn test_checksum_calculations() {
+        let _guard = PlatformSecurity::test_serial_guard();
         install_test_security_config();
 
         let test_bytes = vec![0x01, 0x02, 0x03, 0x04, 0x05];
@@ -264,6 +266,7 @@ mod tests {
         use crate::flash_layout::FlashLayoutMap;
         use std::fs;
 
+        let _guard = PlatformSecurity::test_serial_guard();
         install_test_security_config();
         PlatformSecurity::register_bench_keys_for_virtual();
 
@@ -311,6 +314,7 @@ mod tests {
 
     #[test]
     fn test_virtual_ecu_loopback_flash() {
+        let _guard = PlatformSecurity::test_serial_guard();
         install_test_security_config();
         PlatformSecurity::register_bench_keys_for_virtual();
 
