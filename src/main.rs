@@ -26,6 +26,7 @@ pub mod telemetry_playback;
 pub mod surface_mesh;
 pub mod simple_ux;
 pub mod tcm;
+pub mod tester_present;
 pub mod theme;
 pub mod transport;
 pub mod ui;
