@@ -436,6 +436,9 @@ impl WidebandApp {
                     self.refresh_stock_baseline();
                     self.refresh_checksum_badge();
                     self.log(&format!("Loaded XDF {} ({} tables)", label, self.xdf.tables.len()));
+                    for w in self.xdf.warnings.clone() {
+                        self.log(&format!("XDF: {}", w));
+                    }
                 }
                 Err(e) => self.log(&format!("XDF parse failed: {}", e)),
             },
@@ -895,6 +898,11 @@ impl WidebandApp {
             return;
         }
         let idx = self.selected_table_idx;
+        if let Err(e) = self.xdf.tables[idx].format.check() {
+            // Never edit a table we can't encode back faithfully.
+            self.log(&format!("\"{}\" is read-only: {}", self.xdf.tables[idx].title, e));
+            return;
+        }
         let sel = self.selection();
         let before = self.xdf.tables[idx].values.clone();
         edit(&mut self.xdf.tables[idx].values, &sel);
@@ -1650,6 +1658,14 @@ impl WidebandApp {
                 ui.horizontal_wrapped(|ui| {
                     ui.heading(egui::RichText::new(&table_title).size(16.0).color(TEXT));
                     ui.label(egui::RichText::new(format!("({})", z_units)).color(ACCENT_CYAN));
+                    if let Err(e) = self.xdf.tables[self.selected_table_idx].format.check() {
+                        ui.label(
+                            egui::RichText::new(format!("READ-ONLY: {}", e))
+                                .small()
+                                .strong()
+                                .color(Color32::from_rgb(0xF8, 0x51, 0x49)),
+                        );
+                    }
                     let ck_color = if self.checksum_status == CHECKSUM_NOT_CONFIGURED {
                         Color32::from_rgb(255, 152, 0)
                     } else if self.checksum_status == CHECKSUM_VALID {
