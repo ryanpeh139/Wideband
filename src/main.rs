@@ -1,11 +1,17 @@
+pub mod audit_log;
 pub mod definitions;
+pub mod flash_job;
+pub mod flash_layout;
+pub mod isotp;
 pub mod j2534;
+pub mod j2534_host;
 pub mod protocols;
 pub mod security_config;
 pub mod telemetry;
 pub mod surface_mesh;
 pub mod theme;
 pub mod ui;
+pub mod uds;
 
 use eframe::egui;
 use ui::WidebandApp;
@@ -176,6 +182,57 @@ mod tests {
 
         let unconfigured = PlatformSecurity::compute_key(&seed, &EcuProfile::tacoma_kline());
         assert!(unconfigured.is_err());
+    }
+
+    #[test]
+    fn test_flash_layout_and_audit_log() {
+        use crate::audit_log::FlashAuditLog;
+        use crate::flash_job::FlashJob;
+        use crate::flash_layout::FlashLayoutMap;
+        use std::fs;
+
+        install_test_security_config();
+        PlatformSecurity::register_bench_keys_for_virtual();
+
+        let layout = FlashLayoutMap::load("tests/flash-layout-test.json").expect("layout");
+        let audit_path = std::env::temp_dir().join("wideband-audit-test.jsonl");
+        let _ = fs::remove_file(&audit_path);
+        let audit = FlashAuditLog::new(&audit_path);
+
+        let mut sim = VirtualEcuSimulator::new();
+        sim.open().unwrap();
+        let channel = sim.connect(ISO15765, 0, 500000).unwrap();
+        let prof = EcuProfile::tacoma_can();
+
+        let stock = FlashJob::read_stock(
+            &mut sim,
+            channel,
+            &prof,
+            &layout,
+            "virtual-ecu",
+            &audit,
+            |_d, _t| {},
+        )
+        .expect("stock read");
+        assert_eq!(stock.bytes.len(), 256);
+        assert_eq!(stock.origin, 65536);
+
+        let rom = vec![0xCCu8; 65536];
+        let flash = FlashJob::flash_cal_segments(
+            &mut sim,
+            channel,
+            &prof,
+            &layout,
+            &rom,
+            65536,
+            "virtual-ecu",
+            &audit,
+            |_f, _d| {},
+        );
+        assert!(flash.is_ok());
+        let text = fs::read_to_string(&audit_path).expect("audit file");
+        assert!(text.contains("\"operation\":\"stock_read\""));
+        assert!(text.contains("\"operation\":\"cal_flash\""));
     }
 
     #[test]

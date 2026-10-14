@@ -1,0 +1,68 @@
+{
+  "profiles": {
+    "tacoma-can": {
+      "rom_origin": 65536,
+      "image_bytes": 1048576,
+      "stock_read": {
+        "address": 65536,
+        "size": 1048576
+      },
+      "cal_flash_segments": [
+        {
+          "id": "cal-primary",
+          "label": "Calibration region",
+          "address": 65536,
+          "size": 65536
+        }
+      ]
+    },
+    "tacoma-kline": {
+      "rom_origin": 65536,
+      "image_bytes": 524288,
+      "stock_read": {
+        "address": 65536,
+        "size": 524288
+      },
+      "cal_flash_segments": [
+        {
+          "id": "cal-primary",
+          "label": "Calibration region",
+          "address": 65536,
+          "size": 32768
+        }
+      ]
+    },
+    "silverado-can": {
+      "rom_origin": 0,
+      "image_bytes": 2097152,
+      "stock_read": {
+        "address": 0,
+        "size": 2097152
+      },
+      "cal_flash_segments": [
+        {
+          "id": "cal-primary",
+          "label": "Calibration region",
+          "address": 262144,
+          "size": 131072
+        }
+      ]
+    },
+    "silverado-vpw": {
+      "rom_origin": 0,
+      "image_bytes": 1048576,
+      "stock_read": {
+        "address": 0,
+        "size": 1048576
+      },
+      "cal_flash_segments": [
+        {
+          "id": "cal-primary",
+          "label": "Calibration region",
+          "address": 262144,
+          "size": 65536
+        }
+      ]
+    }
+  }
+}

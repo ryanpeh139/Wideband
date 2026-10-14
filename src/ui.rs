@@ -1,6 +1,9 @@
+use crate::audit_log::FlashAuditLog;
 use crate::definitions::{CuwFile, XdfDocument};
-use crate::j2534::{create_device, J2534DeviceInfo, J2534RegistryScanner, PassThruDevice};
-use crate::protocols::{EcuIdentification, EcuIdentifier, EcuProfile, FlashDownload};
+use crate::flash_job::FlashJob;
+use crate::flash_layout::FlashLayoutMap;
+use crate::j2534::{connect_for_profile, create_device, J2534DeviceInfo, J2534RegistryScanner, PassThruDevice};
+use crate::protocols::{EcuIdentification, EcuIdentifier, EcuProfile};
 use crate::security_config::{PlatformSecurity, CHECKSUM_UPDATED, CHECKSUM_VALID};
 use std::fs;
 use std::path::PathBuf;
@@ -62,6 +65,9 @@ pub struct WidebandApp {
     pub comm_log: Vec<String>,
     pub transfer_progress: f32,
     pub is_flashing: bool,
+    pub flash_layout: FlashLayoutMap,
+    pub flash_audit: FlashAuditLog,
+    pub flash_status_detail: String,
 
     // UI Workspace
     pub active_tab: WorkspaceTab,
@@ -79,6 +85,12 @@ impl WidebandApp {
         xdf.write_all_tables_to_rom(&mut rom, 0);
 
         PlatformSecurity::install(&PlatformSecurity::default_config_path());
+        let flash_layout = FlashLayoutMap::load(FlashLayoutMap::default_path())
+            .unwrap_or_else(|e| {
+                eprintln!("flash-layout.json: {}", e);
+                FlashLayoutMap::load("tests/flash-layout-test.json").expect("flash layout fallback")
+            });
+        let flash_audit = FlashAuditLog::new(FlashAuditLog::default_path());
 
         let mut app = Self {
             devices,
@@ -109,6 +121,9 @@ impl WidebandApp {
             comm_log: vec!["Wideband Motorsport Studio 2.4 (Rust Native) Initialized.".to_string()],
             transfer_progress: 0.0,
             is_flashing: false,
+            flash_layout,
+            flash_audit,
+            flash_status_detail: String::new(),
             active_tab: WorkspaceTab::Calibration,
         };
 
@@ -254,7 +269,13 @@ impl WidebandApp {
                     self.log("Virtual bench: explicit zero-mask security keys registered for loopback only.");
                 }
                 let prof = &self.profiles[self.selected_profile_idx];
-                let _ = dev.connect(prof.protocol_id, prof.connect_flags, prof.bitrate);
+                match connect_for_profile(dev.as_mut(), prof) {
+                    Ok(ch) => self.log(&format!("PassThru channel {} open ({})", ch, prof.id)),
+                    Err(e) => {
+                        self.log(&format!("Channel setup failed: {}", e));
+                        return;
+                    }
+                }
                 let ver = dev.firmware_version();
                 self.log(&format!("Connected to {}: {}", dev_name, ver));
                 self.active_device = Some(dev);
@@ -1066,9 +1087,8 @@ impl WidebandApp {
                     }
                 }
 
-                if ui.button("Virtual Read (Match Stock ROM)").clicked() {
-                    self.log(&format!("Matched local stock calibration: {}.bin", self.ecu_id.cal_id));
-                    self.checksum_status = "Checksum Valid".to_string();
+                if ui.button("Read Stock ROM (0x23)").clicked() {
+                    self.execute_stock_read();
                 }
 
                 if ui.button(egui::RichText::new("⚡ Flash Active Calibration").strong().color(Color32::from_rgb(255, 23, 68))).clicked() {
@@ -1086,6 +1106,9 @@ impl WidebandApp {
 
             ui.add_space(8.0);
             ui.label(format!("Flash Transfer Progress: {:.0}%", self.transfer_progress * 100.0));
+            if !self.flash_status_detail.is_empty() {
+                ui.label(egui::RichText::new(&self.flash_status_detail).small().color(MUTED));
+            }
             ui.add(egui::ProgressBar::new(self.transfer_progress).animate(self.is_flashing));
 
             ui.add_space(8.0);
@@ -1098,19 +1121,71 @@ impl WidebandApp {
         });
     }
 
+    fn execute_stock_read(&mut self) {
+        if self.active_device.is_none() {
+            self.log("Stock read blocked: Connect cable first.");
+            return;
+        }
+        let prof = self.profiles[self.selected_profile_idx].clone();
+        self.log(&format!("Starting multi-block stock read for {}...", prof.name));
+        self.is_flashing = true;
+        self.transfer_progress = 0.0;
+        if let Some(dev) = &mut self.active_device {
+            let channel = dev.channel_id();
+            let label = dev.device_label();
+            let read_res = FlashJob::read_stock(
+                dev.as_mut(),
+                channel,
+                &prof,
+                &self.flash_layout,
+                &label,
+                &self.flash_audit,
+                |_done, _total| {},
+            );
+            match read_res {
+                Ok(stock) => {
+                    self.active_rom = stock.bytes;
+                    self.rom_origin = stock.origin;
+                    self.xdf.bind_from_rom(&self.active_rom, self.rom_origin);
+                    self.stock_tables = self.xdf.tables.iter().map(|t| t.values.clone()).collect();
+                    self.transfer_progress = 1.0;
+                    self.log(&format!(
+                        "Stock read complete: {} bytes @ origin 0x{:X} (audit JSONL appended)",
+                        self.active_rom.len(),
+                        self.rom_origin
+                    ));
+                }
+                Err(e) => {
+                    let _ = self.flash_audit.record_write(
+                        "stock_read",
+                        &prof.id,
+                        &label,
+                        0,
+                        0,
+                        None,
+                        "error",
+                        &e,
+                    );
+                    self.log(&format!("Stock read failed: {}", e));
+                }
+            }
+        }
+        self.is_flashing = false;
+    }
+
     fn execute_flash_active(&mut self) {
         if self.active_device.is_none() {
             self.log("Flashing blocked: Connect cable first.");
             return;
         }
 
-        self.log("Stamping and verifying checksum before flash...");
+        self.log("Stamping and verifying checksum before cal-only flash...");
         let prof = self.profiles[self.selected_profile_idx].clone();
         self.xdf.write_all_tables_to_rom(&mut self.active_rom, self.rom_origin);
         let prepared = match PlatformSecurity::prepare_for_flash(
             &prof.id,
             &prof.name,
-            &self.active_rom[..64 * 1024],
+            &self.active_rom,
             self.rom_origin,
         ) {
             Ok(img) => img,
@@ -1120,31 +1195,51 @@ impl WidebandApp {
             }
         };
 
-        self.log(&format!("Starting flash sequence for {}...", prof.name));
+        self.log(&format!("Starting layout-driven cal flash for {}...", prof.name));
         self.is_flashing = true;
         self.transfer_progress = 0.0;
+        self.flash_status_detail.clear();
 
         if let Some(dev) = &mut self.active_device {
-            let rom_slice = prepared;
-            let flash_res = FlashDownload::execute(
+            let channel = dev.channel_id();
+            let label = dev.device_label();
+            let mut last_frac = 0.0f32;
+            let mut last_detail = String::new();
+            let flash_res = FlashJob::flash_cal_segments(
                 dev.as_mut(),
-                1,
+                channel,
                 &prof,
-                0x10000,
-                &rom_slice,
-                |_sent, _total| {
-                    // Update progress
+                &self.flash_layout,
+                &prepared,
+                self.rom_origin,
+                &label,
+                &self.flash_audit,
+                |frac, detail| {
+                    last_frac = frac;
+                    last_detail = detail.to_string();
                 },
             );
+            self.transfer_progress = last_frac;
+            self.flash_status_detail = last_detail;
 
             match flash_res {
                 Ok(()) => {
                     self.transfer_progress = 1.0;
                     self.is_flashing = false;
-                    self.log("Flash completed successfully! Checksum verified and ECU reset (0x11).");
+                    self.log("Cal segment flash completed (audit JSONL appended).");
                 }
                 Err(e) => {
                     self.is_flashing = false;
+                    let _ = self.flash_audit.record_write(
+                        "cal_flash",
+                        &prof.id,
+                        &label,
+                        0,
+                        0,
+                        None,
+                        "error",
+                        &e,
+                    );
                     self.log(&format!("Flash failed: {}", e));
                 }
             }

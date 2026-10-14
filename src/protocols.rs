@@ -1,4 +1,6 @@
-use crate::j2534::{PassThruDevice, PassThruMsg, ISO14230, ISO15765, J1850VPW};
+use crate::isotp::{IsoTpConfig, IsoTpLink as IsoTpSession};
+use crate::j2534::{PassThruDevice, ISO14230, ISO15765, J1850VPW};
+use crate::uds::{ProgrammingSession, UdsClient};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DiagnosticProtocol {
@@ -283,85 +285,28 @@ impl ChecksumEngine {
 }
 
 // ---------------------------------------------------------------------------
-// ISO-TP Link Framing & Multi-Frame Segmentation
+// ISO-TP (delegates to `isotp` module; legacy static helpers for telemetry)
 // ---------------------------------------------------------------------------
 
 pub struct IsoTpLink;
 
 impl IsoTpLink {
     pub fn send(device: &mut dyn PassThruDevice, channel: u32, can_id: u32, payload: &[u8]) -> Result<(), String> {
-        if payload.len() <= 7 {
-            // Single Frame: [0x00 | len, payload...]
-            let mut buf = vec![payload.len() as u8];
-            buf.extend_from_slice(payload);
-            while buf.len() < 8 {
-                buf.push(0xAA); // CAN padding
-            }
-            let msg = PassThruMsg::new_can(can_id, &buf);
-            device.write_msgs(channel, &[msg], 1000)?;
-            Ok(())
-        } else {
-            // First Frame: [0x10 | (len >> 8), len & 0xFF, payload[0..6]...]
-            let len = payload.len();
-            let mut ff = vec![0x10 | ((len >> 8) as u8 & 0x0F), (len & 0xFF) as u8];
-            ff.extend_from_slice(&payload[..6]);
-            let ff_msg = PassThruMsg::new_can(can_id, &ff);
-            device.write_msgs(channel, &[ff_msg], 1000)?;
-
-            // Consecutive Frames: [0x20 | (seq & 0x0F), payload[next..next+7]...]
-            let mut offset = 6;
-            let mut seq = 1u8;
-            while offset < len {
-                let chunk_size = (len - offset).min(7);
-                let mut cf = vec![0x20 | (seq & 0x0F)];
-                cf.extend_from_slice(&payload[offset..offset + chunk_size]);
-                while cf.len() < 8 {
-                    cf.push(0xAA);
-                }
-                let cf_msg = PassThruMsg::new_can(can_id, &cf);
-                device.write_msgs(channel, &[cf_msg], 1000)?;
-                offset += chunk_size;
-                seq = (seq + 1) & 0x0F;
-            }
-            Ok(())
-        }
+        let link = IsoTpSession::new(channel, IsoTpConfig {
+            tx_id: can_id,
+            rx_id: can_id + 8,
+            ..IsoTpConfig::default()
+        });
+        link.send(device, payload)
     }
 
     pub fn receive(device: &mut dyn PassThruDevice, channel: u32, timeout_ms: u32) -> Result<Vec<u8>, String> {
-        let msgs = device.read_msgs(channel, timeout_ms)?;
-        if msgs.is_empty() {
-            return Err("No response received within timeout".to_string());
-        }
-
-        for msg in msgs {
-            let p = msg.payload();
-            if p.is_empty() {
-                continue;
-            }
-
-            let pci = p[0] >> 4;
-            if pci == 0x00 {
-                // Single Frame
-                let len = (p[0] & 0x0F) as usize;
-                if p.len() >= 1 + len {
-                    return Ok(p[1..1 + len].to_vec());
-                } else if p.len() > 1 {
-                    return Ok(p[1..].to_vec());
-                }
-            } else if pci == 0x01 {
-                // First Frame
-                let len = (((p[0] & 0x0F) as usize) << 8) | (p[1] as usize);
-                let mut assembled = Vec::with_capacity(len);
-                if p.len() > 2 {
-                    assembled.extend_from_slice(&p[2..]);
-                }
-                return Ok(assembled);
-            } else {
-                // Plain frame
-                return Ok(p.to_vec());
-            }
-        }
-        Err("Incomplete ISO-TP frame".to_string())
+        let mut link = IsoTpSession::new(channel, IsoTpConfig {
+            rx_id: 0x7E8,
+            timeout_ms,
+            ..IsoTpConfig::default()
+        });
+        link.receive(device)
     }
 }
 
@@ -391,8 +336,9 @@ impl EcuIdentifier {
         };
 
         if profile.bus == VehicleBus::CanIsoTp {
-            IsoTpLink::send(device, channel, profile.request_id, &vin_req)?;
-            if let Ok(resp) = IsoTpLink::receive(device, channel, 1500) {
+            let mut link = IsoTpSession::new(channel, iso_config(profile));
+            link.send(device, &vin_req)?;
+            if let Ok(resp) = link.receive(device) {
                 if resp.len() >= 3 && (resp[0] == 0x49 || resp[0] == 0x62) {
                     let vin_bytes = &resp[3..];
                     id.vin = String::from_utf8_lossy(vin_bytes).trim().to_string();
@@ -410,8 +356,9 @@ impl EcuIdentifier {
         };
 
         if profile.bus == VehicleBus::CanIsoTp {
-            IsoTpLink::send(device, channel, profile.request_id, &cal_req)?;
-            if let Ok(resp) = IsoTpLink::receive(device, channel, 1500) {
+            let mut link = IsoTpSession::new(channel, iso_config(profile));
+            link.send(device, &cal_req)?;
+            if let Ok(resp) = link.receive(device) {
                 if resp.len() >= 3 && (resp[0] == 0x49 || resp[0] == 0x62) {
                     let cal_bytes = &resp[3..];
                     id.cal_id = String::from_utf8_lossy(cal_bytes).trim().to_string();
@@ -422,8 +369,9 @@ impl EcuIdentifier {
         // 3. Query CVN: OBD-II Mode 09 06
         let cvn_req = vec![0x09, 0x06];
         if profile.bus == VehicleBus::CanIsoTp {
-            IsoTpLink::send(device, channel, profile.request_id, &cvn_req)?;
-            if let Ok(resp) = IsoTpLink::receive(device, channel, 1500) {
+            let mut link = IsoTpSession::new(channel, iso_config(profile));
+            link.send(device, &cvn_req)?;
+            if let Ok(resp) = link.receive(device) {
                 if resp.len() >= 3 && resp[0] == 0x49 {
                     let cvn_bytes = &resp[3..];
                     id.cvn = cvn_bytes.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join("");
@@ -456,6 +404,18 @@ impl EcuIdentifier {
 
 pub struct FlashDownload;
 
+fn iso_config(profile: &EcuProfile) -> IsoTpConfig {
+    IsoTpConfig {
+        tx_id: profile.request_id,
+        rx_id: profile.response_id,
+        pad_byte: 0xAA,
+        timeout_ms: 2000,
+        block_size: 0,
+        stmin_ms: 0,
+        max_flow_waits: 5,
+    }
+}
+
 impl FlashDownload {
     pub fn execute(
         device: &mut dyn PassThruDevice,
@@ -463,38 +423,27 @@ impl FlashDownload {
         profile: &EcuProfile,
         address: u32,
         image: &[u8],
-        progress: impl Fn(usize, usize),
+        mut progress: impl FnMut(usize, usize),
     ) -> Result<(), String> {
         if image.is_empty() {
             return Err("Download image is empty".to_string());
         }
+        let mut client = UdsClient::for_profile(device, channel, profile);
+        ProgrammingSession::unlock(&mut client, device, profile)?;
+        Self::execute_with_client(&mut client, device, channel, profile, address, image, progress)
+    }
 
-        // Step 1: Security Handshake 0x27 0x01
-        let seed_req = vec![0x27, 0x01];
-        IsoTpLink::send(device, channel, profile.request_id, &seed_req)?;
-        let seed_resp = IsoTpLink::receive(device, channel, 2000)?;
-        if seed_resp.len() < 2 || seed_resp[0] != 0x67 || seed_resp[1] != 0x01 {
-            return Err(format!("Security seed request failed: {:?}", seed_resp));
-        }
-
-        let seed = &seed_resp[2..];
-        if !seed.iter().all(|&b| b == 0) {
-            let key = crate::security_config::PlatformSecurity::compute_key(seed, profile)?;
-
-            // Send Key 0x27 0x02
-            let mut key_req = vec![0x27, 0x02];
-            key_req.extend_from_slice(&key);
-            IsoTpLink::send(device, channel, profile.request_id, &key_req)?;
-            let key_resp = IsoTpLink::receive(device, channel, 2000)?;
-            if key_resp.is_empty() || key_resp[0] != 0x67 || key_resp[1] != 0x02 {
-                return Err(format!("Security key validation failed: {:?}", key_resp));
-            }
-        }
-
-        // Step 2: Request Download (0x34)
+    pub fn execute_with_client(
+        client: &mut UdsClient,
+        device: &mut dyn PassThruDevice,
+        _channel: u32,
+        profile: &EcuProfile,
+        address: u32,
+        image: &[u8],
+        mut progress: impl FnMut(usize, usize),
+    ) -> Result<(), String> {
         let mut dl_req = vec![0x34];
         if profile.diagnostic == DiagnosticProtocol::Kwp {
-            // KWP2000: 0x34, addr[0..3], 0x00, size[0..3]
             dl_req.push(((address >> 16) & 0xFF) as u8);
             dl_req.push(((address >> 8) & 0xFF) as u8);
             dl_req.push((address & 0xFF) as u8);
@@ -504,20 +453,14 @@ impl FlashDownload {
             dl_req.push(((size >> 8) & 0xFF) as u8);
             dl_req.push((size & 0xFF) as u8);
         } else {
-            // UDS: 0x34, dataFormatIdentifier (0x00), addressAndLengthFormatIdentifier (0x44)
             dl_req.push(0x00);
-            dl_req.push(0x44); // 4 bytes address, 4 bytes size
+            dl_req.push(0x44);
             dl_req.extend_from_slice(&address.to_be_bytes());
             dl_req.extend_from_slice(&(image.len() as u32).to_be_bytes());
         }
 
-        IsoTpLink::send(device, channel, profile.request_id, &dl_req)?;
-        let dl_resp = IsoTpLink::receive(device, channel, 5000)?;
-        if dl_resp.is_empty() || dl_resp[0] != 0x74 {
-            return Err(format!("RequestDownload (0x34) failed: {:?}", dl_resp));
-        }
+        let _dl_resp = client.request(device, &dl_req, 0x74)?;
 
-        // Step 3: Transfer Data (0x36) in chunks
         let chunk_size = profile.max_chunk.min(1024);
         let total = image.len();
         let mut offset = 0;
@@ -528,10 +471,9 @@ impl FlashDownload {
             let mut tr_req = vec![0x36, block_seq];
             tr_req.extend_from_slice(&image[offset..offset + this_chunk]);
 
-            IsoTpLink::send(device, channel, profile.request_id, &tr_req)?;
-            let tr_resp = IsoTpLink::receive(device, channel, 5000)?;
-            if tr_resp.is_empty() || tr_resp[0] != 0x76 {
-                return Err(format!("TransferData (0x36) block {} failed: {:?}", block_seq, tr_resp));
+            let tr_resp = client.request(device, &tr_req, 0x76)?;
+            if tr_resp.len() < 2 || tr_resp[1] != block_seq {
+                return Err(format!("TransferData block {} sequence mismatch", block_seq));
             }
 
             offset += this_chunk;
@@ -539,19 +481,8 @@ impl FlashDownload {
             progress(offset, total);
         }
 
-        // Step 4: Request Transfer Exit (0x37)
-        let exit_req = vec![0x37];
-        IsoTpLink::send(device, channel, profile.request_id, &exit_req)?;
-        let exit_resp = IsoTpLink::receive(device, channel, 5000)?;
-        if exit_resp.is_empty() || exit_resp[0] != 0x77 {
-            return Err(format!("RequestTransferExit (0x37) failed: {:?}", exit_resp));
-        }
-
-        // Step 5: ECU Reset (0x11 0x01)
-        let reset_req = vec![0x11, 0x01];
-        IsoTpLink::send(device, channel, profile.request_id, &reset_req)?;
-        let _ = IsoTpLink::receive(device, channel, 2000);
-
+        client.request(device, &[0x37], 0x77)?;
+        let _ = client.request(device, &[0x11, 0x01], 0x51);
         Ok(())
     }
 }
