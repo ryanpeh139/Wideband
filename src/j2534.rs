@@ -420,6 +420,19 @@ impl VirtualEcuSimulator {
                             resp.extend_from_slice(b"12619623");
                             resp
                         }
+                        0xF010 => {
+                            // Bench battery voltage (mV) — ~13.8 V with mild ripple
+                            let elapsed = self.start_time.elapsed().as_secs_f32();
+                            let vbatt = 13.2 + (elapsed * 0.2).sin().abs() * 0.8;
+                            let mv = (vbatt * 1000.0) as u16;
+                            vec![0x62, 0xF0, 0x10, (mv >> 8) as u8, (mv & 0xFF) as u8]
+                        }
+                        0xF011 => {
+                            // Bench oil temp °C (A - 40)
+                            let elapsed = self.start_time.elapsed().as_secs_f32();
+                            let oil = 85.0 + (elapsed * 0.15).sin() * 8.0;
+                            vec![0x62, 0xF0, 0x11, (oil + 40.0) as u8]
+                        }
                         _ => vec![0x7F, 0x22, 0x31], // Request out of range
                     }
                 } else {

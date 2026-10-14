@@ -1,0 +1,116 @@
+{
+  "version": 1,
+  "title": "Wideband default live log channels",
+  "channels": [
+    {
+      "id": "rpm",
+      "label": "ENGINE RPM",
+      "unit": "RPM",
+      "priority": 1,
+      "interval_ms": 50,
+      "request": { "service": "mode01", "pid": 12 },
+      "decode": "pid_0c_rpm",
+      "gauge": true,
+      "plot": { "scale": 1.0, "color": [0, 229, 255] }
+    },
+    {
+      "id": "map",
+      "label": "MANIFOLD MAP",
+      "unit": "kPa",
+      "priority": 1,
+      "interval_ms": 50,
+      "request": { "service": "mode01", "pid": 11 },
+      "decode": "pid_0b_map_kpa",
+      "gauge": true,
+      "plot": { "scale": 30.0, "color": [255, 193, 7] }
+    },
+    {
+      "id": "lambda",
+      "label": "LAMBDA (AFR)",
+      "unit": "λ",
+      "priority": 2,
+      "interval_ms": 100,
+      "request": { "service": "mode01", "pid": 36 },
+      "decode": "pid_24_lambda",
+      "gauge": true,
+      "plot": { "scale": 3000.0, "color": [0, 230, 118] }
+    },
+    {
+      "id": "timing",
+      "label": "SPARK ADVANCE",
+      "unit": "deg",
+      "priority": 2,
+      "interval_ms": 100,
+      "request": { "service": "mode01", "pid": 14 },
+      "decode": "pid_0e_timing",
+      "gauge": true,
+      "plot": { "scale": 100.0, "color": [244, 67, 54] }
+    },
+    {
+      "id": "ect",
+      "label": "COOLANT ECT",
+      "unit": "°C",
+      "priority": 3,
+      "interval_ms": 500,
+      "request": { "service": "mode01", "pid": 5 },
+      "decode": "pid_05_ect",
+      "gauge": true,
+      "plot": { "scale": 10.0, "color": [30, 136, 229] }
+    },
+    {
+      "id": "load",
+      "label": "CALC LOAD",
+      "unit": "%",
+      "priority": 3,
+      "interval_ms": 200,
+      "request": { "service": "mode01", "pid": 4 },
+      "decode": "pid_04_load",
+      "gauge": true,
+      "plot": { "scale": 50.0, "color": [255, 152, 0] }
+    },
+    {
+      "id": "iat",
+      "label": "INTAKE IAT",
+      "unit": "°C",
+      "priority": 4,
+      "interval_ms": 1000,
+      "request": { "service": "mode01", "pid": 15 },
+      "decode": "pid_0f_iat",
+      "gauge": false,
+      "plot": { "scale": 10.0, "color": [156, 39, 176] }
+    },
+    {
+      "id": "tps",
+      "label": "THROTTLE TPS",
+      "unit": "%",
+      "priority": 3,
+      "interval_ms": 200,
+      "request": { "service": "mode01", "pid": 17 },
+      "decode": "pid_11_tps",
+      "gauge": false,
+      "plot": { "scale": 50.0, "color": [121, 85, 72] }
+    },
+    {
+      "id": "vbatt",
+      "label": "BATTERY",
+      "unit": "V",
+      "priority": 4,
+      "interval_ms": 1000,
+      "request": { "service": "uds22", "did": 6160 },
+      "decode": "did_f010_vbatt",
+      "gauge": false,
+      "plot": { "scale": 100.0, "color": [255, 235, 59] }
+    },
+    {
+      "id": "oil_temp",
+      "label": "OIL TEMP",
+      "unit": "°C",
+      "priority": 4,
+      "interval_ms": 1000,
+      "request": { "service": "uds22", "did": 6161 },
+      "decode": "did_f011_oil_temp",
+      "gauge": false,
+      "plot": { "scale": 10.0, "color": [255, 87, 34] }
+    }
+  ]
+}

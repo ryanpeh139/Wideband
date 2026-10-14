@@ -180,7 +180,28 @@ mod tests {
         let silverado_key = PlatformSecurity::compute_key(&seed, &silverado).expect("Silverado key must succeed");
         assert_eq!(silverado_key.len(), 4);
 
-        let unconfigured = PlatformSecurity::compute_key(&seed, &EcuProfile::tacoma_kline());
+        let unconfigured_profile = EcuProfile {
+            id: "unconfigured-test-profile".to_string(),
+            name: "Unconfigured Test".to_string(),
+            platform: "Test".to_string(),
+            bus: protocols::VehicleBus::CanIsoTp,
+            diagnostic: protocols::DiagnosticProtocol::Uds,
+            bitrate: 500000,
+            protocol_id: ISO15765,
+            connect_flags: 0,
+            extended_id: false,
+            request_id: 0x7E0,
+            response_id: 0x7E8,
+            filter_mask: 0x7FF,
+            tester: 0xF1,
+            ecu: 0x10,
+            max_chunk: 1024,
+            address_bytes: 4,
+            size_bytes: 4,
+            programming_session: 0x02,
+            read_session: 0x03,
+        };
+        let unconfigured = PlatformSecurity::compute_key(&seed, &unconfigured_profile);
         assert!(unconfigured.is_err());
     }
 
