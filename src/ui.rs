@@ -522,7 +522,11 @@ impl WidebandApp {
             && crate::j2534::requires_j2534_host_bridge()
             && !crate::j2534::j2534_host_exe_present()
         {
+<<<<<<< HEAD
             let msg = crate::j2534::missing_j2534_host_message();
+=======
+            let msg = HostPassThruDevice::missing_host_user_message();
+>>>>>>> d71c8f1 (Fix borrow in connect_cable J2534Host missing-host log)
             self.connection_last_error = msg.clone();
             self.log(&msg);
             return;
