@@ -82,6 +82,20 @@ mod tests {
     }
 
     #[test]
+    fn test_known_cable_dll_catalog_includes_mvci_and_vxdiag() {
+        let paths = j2534::known_passthru_dll_paths();
+        let joined = paths
+            .iter()
+            .map(|(_, _, p)| p.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("mvci") && joined.contains("vxdiag"),
+            "discovery fallbacks should list Mini-VCI and VXDIAG install paths"
+        );
+    }
+
+    #[test]
     fn test_j2534_big_endian_frame_packing() {
         let mut msg = PassThruMsg::default();
         msg.protocol_id = ISO15765;
@@ -301,7 +315,7 @@ mod tests {
         let prof = EcuProfile::tacoma_can();
 
         // 1. Test ECU Identification
-        let id = EcuIdentifier::query(&mut sim, channel, &prof).expect("ECU identify must succeed");
+        let id = EcuIdentifier::query(&mut sim, channel, &prof, true).expect("ECU identify must succeed");
         assert_eq!(id.vin, "5TFRX54N56Z123456");
         assert_eq!(id.cal_id, "89663-04B04");
         assert_eq!(id.cvn, "A1B2C3D4");

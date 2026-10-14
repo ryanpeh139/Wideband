@@ -8,7 +8,12 @@ use crate::diagnostics::{
 };
 use crate::flash_job::FlashJob;
 use crate::flash_layout::FlashLayoutMap;
-use crate::j2534::{connect_for_profile, create_device, J2534DeviceInfo, J2534RegistryScanner, PassThruDevice};
+use crate::j2534::{
+    connect_for_profile, create_device, transport_hint_for_device, J2534DeviceInfo, J2534RegistryScanner,
+    PassThruDevice, READ_VBATT,
+};
+#[cfg(windows)]
+use crate::j2534_host::HostPassThruDevice;
 use crate::protocols::{EcuIdentification, EcuIdentifier, EcuProfile};
 use crate::security_config::{PlatformSecurity, CHECKSUM_VALID};
 use std::fs;
@@ -83,6 +88,7 @@ pub struct WidebandApp {
     pub diag_snapshot: DiagnosticsSnapshot,
     pub diag_selected_dtc: usize,
     pub diag_last_error: String,
+    pub header_vbatt: Option<f32>,
 
     // UI Workspace
     pub active_tab: WorkspaceTab,
@@ -154,6 +160,7 @@ impl WidebandApp {
             diag_snapshot: DiagnosticsSnapshot::default(),
             diag_selected_dtc: 0,
             diag_last_error: String::new(),
+            header_vbatt: None,
             active_tab: WorkspaceTab::Calibration,
         };
 
@@ -308,38 +315,78 @@ impl WidebandApp {
     }
 
     pub fn connect_cable(&mut self) {
-        if self.selected_device_idx < self.devices.len() {
-            let dev_info = &self.devices[self.selected_device_idx];
-            let dev_name = dev_info.name.clone();
-            let is_virtual = dev_info.is_virtual;
-            let mut dev = create_device(dev_info);
-            if let Ok(()) = dev.open() {
-                if is_virtual {
-                    PlatformSecurity::register_bench_keys_for_virtual();
-                    self.log("Virtual bench: explicit zero-mask security keys registered for loopback only.");
-                }
-                let prof = &self.profiles[self.selected_profile_idx];
-                match connect_for_profile(dev.as_mut(), prof) {
-                    Ok(ch) => self.log(&format!("PassThru channel {} open ({})", ch, prof.id)),
-                    Err(e) => {
-                        self.log(&format!("Channel setup failed: {}", e));
-                        return;
-                    }
-                }
-                let ver = dev.firmware_version();
-                self.log(&format!("Connected to {}: {}", dev_name, ver));
-                self.active_device = Some(dev);
-                self.is_connected = true;
-            } else {
-                self.log(&format!("Failed to open device: {}", dev_info.name));
+        if self.selected_device_idx >= self.devices.len() {
+            return;
+        }
+        let dev_info = self.devices[self.selected_device_idx].clone();
+        let dev_name = dev_info.name.clone();
+        let is_virtual = dev_info.is_virtual;
+        let transport = transport_hint_for_device(&dev_info);
+
+        if !is_virtual && !dev_info.exists {
+            self.log(&format!(
+                "PassThru DLL not found: {}. Install the Mini-VCI or VXDIAG (Toyota) J2534 driver, then rescan devices.",
+                dev_info.library_path
+            ));
+            return;
+        }
+
+        #[cfg(windows)]
+        if !is_virtual && !HostPassThruDevice::host_available() {
+            self.log(
+                "J2534Host.exe is missing beside wideband.exe. Build it from J2534Host.cs (x86) — required for most 32-bit cable DLLs.",
+            );
+        }
+
+        self.log(&format!("Opening {} via {}", dev_name, transport));
+
+        let mut dev = create_device(&dev_info);
+        match dev.open() {
+            Err(e) => {
+                self.log(&format!(
+                    "Failed to open {}: {} (check USB, driver, and VX Manager / MVCI license if applicable)",
+                    dev_name, e
+                ));
+                return;
+            }
+            Ok(()) => {}
+        }
+
+        if is_virtual {
+            PlatformSecurity::register_bench_keys_for_virtual();
+            self.log("Virtual bench: explicit zero-mask security keys registered for loopback only.");
+        }
+
+        let prof = &self.profiles[self.selected_profile_idx];
+        match connect_for_profile(dev.as_mut(), prof) {
+            Ok(ch) => self.log(&format!(
+                "PassThru channel {} open — profile {} ({} @ {} bit/s, RX filter 0x{:X})",
+                ch,
+                prof.id,
+                prof.name,
+                prof.bitrate,
+                prof.response_id
+            )),
+            Err(e) => {
+                self.log(&format!("Channel setup failed: {}", e));
+                let _ = dev.close();
+                return;
             }
         }
+
+        let ver = dev.firmware_version();
+        self.log(&format!("Connected to {}: {}", dev_name, ver));
+        let ch = dev.channel_id();
+        self.header_vbatt = read_pass_thru_vbatt(dev.as_mut(), ch);
+        self.active_device = Some(dev);
+        self.is_connected = true;
     }
 
     pub fn disconnect_cable(&mut self) {
         if let Some(mut dev) = self.active_device.take() {
             let _ = dev.close();
             self.is_connected = false;
+            self.header_vbatt = None;
             self.log("Cable disconnected.");
         }
     }
@@ -377,11 +424,12 @@ impl WidebandApp {
                     .collect()
             };
 
+            let channel = dev.channel_id();
             for (idx, req, decode_id) in due {
                 if let Ok(()) =
-                    crate::protocols::IsoTpLink::send(dev.as_mut(), 1, prof.request_id, &req)
+                    crate::protocols::IsoTpLink::send(dev.as_mut(), channel, prof.request_id, &req)
                 {
-                    if let Ok(resp) = crate::protocols::IsoTpLink::receive(dev.as_mut(), 1, 10) {
+                    if let Ok(resp) = crate::protocols::IsoTpLink::receive(dev.as_mut(), channel, 10) {
                         if let Some(value) = decode_channel_value(&decode_id, &resp) {
                             let mut buf = self.telemetry.lock().unwrap();
                             buf.set_channel_value(idx, value);
@@ -676,10 +724,17 @@ impl WidebandApp {
 
         ui.add_space(6.0);
 
-        let batt_label = if self.is_connected {
-            format!("{:.1}V", 13.4)
-        } else {
+        let batt_label = if !self.is_connected {
             "—".to_string()
+        } else {
+            let tel_v = self.telemetry.lock().unwrap().value("vbatt");
+            if tel_v > 1.0 {
+                format!("{:.1}V", tel_v)
+            } else if let Some(v) = self.header_vbatt {
+                format!("{:.1}V", v)
+            } else {
+                "—".to_string()
+            }
         };
         egui::Frame::none()
             .fill(theme::WIDGET_BG)
@@ -1331,6 +1386,18 @@ fn yes_no(v: bool) -> &'static str {
     if v { "Yes" } else { "No" }
 }
 
+fn read_pass_thru_vbatt(dev: &mut dyn PassThruDevice, channel: u32) -> Option<f32> {
+    if let Ok(out) = dev.ioctl(channel, READ_VBATT, &[]) {
+        if out.len() >= 4 {
+            let mv = u32::from_le_bytes([out[0], out[1], out[2], out[3]]);
+            if mv > 8000 && mv < 20000 {
+                return Some(mv as f32 / 1000.0);
+            }
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Tab 3: Diagnostics & ECU Flashing
 // ---------------------------------------------------------------------------
@@ -1346,7 +1413,9 @@ impl WidebandApp {
                 if ui.button(egui::RichText::new("🔍 Identify ECU").strong()).clicked() {
                     if let Some(dev) = &mut self.active_device {
                         let prof = &self.profiles[self.selected_profile_idx];
-                        match EcuIdentifier::query(dev.as_mut(), 1, prof) {
+                        let allow_demo = self.devices.get(self.selected_device_idx).map(|d| d.is_virtual).unwrap_or(false);
+                        let channel = dev.channel_id();
+                        match EcuIdentifier::query(dev.as_mut(), channel, prof, allow_demo) {
                             Ok(id) => {
                                 self.ecu_id = id;
                                 self.log(&format!("ECU Identified: VIN={}, Cal ID={}, CVN={}", self.ecu_id.vin, self.ecu_id.cal_id, self.ecu_id.cvn));

@@ -165,45 +165,158 @@ impl J2534RegistryScanner {
             }
         }
 
-        // Standard well-known fallbacks
-        let fallbacks = [
-            (
-                "Tactrix OpenPort 2.0",
-                "Tactrix Inc.",
-                r"C:\Windows\System32\op20pt32.dll",
-            ),
-            (
-                "Tactrix OpenPort 2.0 (SysWOW64)",
-                "Tactrix Inc.",
-                r"C:\Windows\SysWOW64\op20pt32.dll",
-            ),
-            (
-                "VF Tuner ESP32 Pass-Thru",
-                "VF Tuner",
-                r"C:\Program Files (x86)\VF Tuner\esp32.dll",
-            ),
-            (
-                "Scanmatik SM2 Pass-Thru",
-                "Scanmatik",
-                r"C:\Program Files (x86)\Scanmatik\sm2pt32.dll",
-            ),
-        ];
-
+        let fallbacks = known_passthru_dll_paths();
         for (name, vendor, path) in &fallbacks {
-            if std::path::Path::new(path).exists() && !devices.iter().any(|d| d.library_path.eq_ignore_ascii_case(path)) {
-                devices.push(J2534DeviceInfo {
-                    name: name.to_string(),
-                    vendor: vendor.to_string(),
-                    library_path: path.to_string(),
-                    is_virtual: false,
-                    exists: true,
-                });
-            }
+            push_dll_device(&mut devices, name, vendor, path);
         }
+
+        #[cfg(target_os = "windows")]
+        scan_install_folder_dlls(&mut devices, r"C:\Program Files (x86)\VXDIAG", "VXDIAG");
+        #[cfg(target_os = "windows")]
+        scan_install_folder_dlls(&mut devices, r"C:\Program Files (x86)\MVCI", "Mini-VCI / MVCI");
+        #[cfg(target_os = "windows")]
+        scan_install_folder_dlls(&mut devices, r"C:\Program Files (x86)\Mini VCI", "Mini-VCI");
+        #[cfg(target_os = "windows")]
+        scan_install_folder_dlls(&mut devices, r"C:\Program Files (x86)\XHorse", "XHorse MVCI");
 
         devices
     }
 }
+
+fn push_dll_device(devices: &mut Vec<J2534DeviceInfo>, name: &str, vendor: &str, path: &str) {
+    if std::path::Path::new(path).exists()
+        && !devices.iter().any(|d| d.library_path.eq_ignore_ascii_case(path))
+    {
+        devices.push(J2534DeviceInfo {
+            name: name.to_string(),
+            vendor: vendor.to_string(),
+            library_path: path.to_string(),
+            is_virtual: false,
+            exists: true,
+        });
+    }
+}
+
+/// Well-known PassThru DLL paths when registry keys are missing or mis-pointed.
+pub(crate) fn known_passthru_dll_paths() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
+        (
+            "Tactrix OpenPort 2.0",
+            "Tactrix Inc.",
+            r"C:\Windows\System32\op20pt32.dll",
+        ),
+        (
+            "Tactrix OpenPort 2.0 (SysWOW64)",
+            "Tactrix Inc.",
+            r"C:\Windows\SysWOW64\op20pt32.dll",
+        ),
+        (
+            "VF Tuner ESP32 Pass-Thru",
+            "VF Tuner",
+            r"C:\Program Files (x86)\VF Tuner\esp32.dll",
+        ),
+        (
+            "Scanmatik SM2 Pass-Thru",
+            "Scanmatik",
+            r"C:\Program Files (x86)\Scanmatik\sm2pt32.dll",
+        ),
+        (
+            "Mini-VCI J2534 (MVCI PassThruPro)",
+            "MVCI / XHorse",
+            r"C:\Program Files (x86)\MVCI\J2534\PassThruPro.dll",
+        ),
+        (
+            "Mini-VCI J2534 (alternate)",
+            "MVCI",
+            r"C:\Program Files (x86)\MVCI\PassThruPro.dll",
+        ),
+        (
+            "VXDIAG VCX Nano Toyota J2534",
+            "VXDIAG",
+            r"C:\Program Files (x86)\VXDIAG\VcxNv_Toyota\VCIToyota32.dll",
+        ),
+        (
+            "VXDIAG VCX Toyota PassThru (Pt32)",
+            "VXDIAG",
+            r"C:\Program Files (x86)\VXDIAG\VcxNv_Toyota\Pt32Toyota.dll",
+        ),
+        (
+            "VXDIAG VCX Nano (generic)",
+            "VXDIAG",
+            r"C:\Program Files (x86)\VXDIAG\VCXNANO\VCXNANO32.dll",
+        ),
+        (
+            "VXDIAG VCX Manager Toyota J2534",
+            "VXDIAG",
+            r"C:\Program Files\VXDIAG\VcxNv_Toyota_J2534\Pt32Toyota.dll",
+        ),
+    ]
+}
+
+#[cfg(target_os = "windows")]
+fn scan_install_folder_dlls(devices: &mut Vec<J2534DeviceInfo>, root: &str, vendor_label: &str) {
+    let root_path = std::path::Path::new(root);
+    if root_path.is_dir() {
+        scan_install_folder_dlls_inner(devices, root_path, vendor_label, 0);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn scan_install_folder_dlls_inner(
+    devices: &mut Vec<J2534DeviceInfo>,
+    dir: &std::path::Path,
+    vendor_label: &str,
+    depth: usize,
+) {
+    if depth > 4 {
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            scan_install_folder_dlls_inner(devices, &path, vendor_label, depth + 1);
+            continue;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !file_name.ends_with(".dll") {
+            continue;
+        }
+        let looks_j2534 = file_name.contains("passthru")
+            || file_name.contains("j2534")
+            || file_name.contains("pt32")
+            || file_name.contains("vci")
+            || file_name.contains("vcx");
+        if !looks_j2534 {
+            continue;
+        }
+        let path_str = path.to_string_lossy().to_string();
+        if devices.iter().any(|d| d.library_path.eq_ignore_ascii_case(&path_str)) {
+            continue;
+        }
+        let display = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("J2534 Pass-Thru");
+        devices.push(J2534DeviceInfo {
+            name: format!("{} ({})", vendor_label, display),
+            vendor: vendor_label.to_string(),
+            library_path: path_str,
+            is_virtual: false,
+            exists: true,
+        });
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn scan_install_folder_dlls(_devices: &mut Vec<J2534DeviceInfo>, _root: &str, _vendor_label: &str) {}
 
 pub trait PassThruDevice: Send + Sync {
     fn open(&mut self) -> Result<(), String>;
@@ -932,8 +1045,11 @@ impl PassThruDevice for NativePassThruDevice {
             let mut msg = PassThruMsg::default();
             let mut count: u32 = 1;
             let status = api.read_msgs(channel, &mut msg, &mut count, timeout_ms);
-            if status != STATUS_NOERROR {
+            if status == 0x09 || status == 0x10 {
                 return Ok(Vec::new());
+            }
+            if status != STATUS_NOERROR {
+                return Err(format!("PassThruReadMsgs failed: status 0x{:X}", status as u32));
             }
             if count == 0 {
                 return Ok(Vec::new());
@@ -1081,4 +1197,18 @@ pub fn create_device(info: &J2534DeviceInfo) -> Box<dyn PassThruDevice> {
         }
         Box::new(NativePassThruDevice::new(&info.library_path))
     }
+}
+
+/// Human-readable transport hint for logs (host vs in-process DLL).
+pub fn transport_hint_for_device(info: &J2534DeviceInfo) -> &'static str {
+    if info.is_virtual {
+        return "virtual loopback";
+    }
+    #[cfg(windows)]
+    {
+        if crate::j2534_host::HostPassThruDevice::host_available() {
+            return "J2534Host.exe (32-bit DLL bridge)";
+        }
+    }
+    "in-process PassThru (requires matching DLL bitness)"
 }
