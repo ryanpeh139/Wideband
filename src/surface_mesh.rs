@@ -54,12 +54,23 @@ struct MeshProjector {
 }
 
 impl MeshProjector {
-    fn new(rect: Rect, rows: usize, cols: usize, yaw: f32, pitch: f32, zoom: f32) -> Self {
+    fn new(
+        rect: Rect,
+        rows: usize,
+        cols: usize,
+        yaw: f32,
+        pitch: f32,
+        zoom: f32,
+        z_soften: bool,
+    ) -> Self {
         let inner = rect.shrink(8.0);
         let grid_span = (rows.max(cols) as f32).max(1.0);
-        let fit_base = inner.width().min(inner.height()) * 0.78 / grid_span;
-        let scale_xy = fit_base * zoom.clamp(0.4, 2.4);
-        let scale_z = scale_xy * 0.48;
+        let zoom = zoom.clamp(0.4, 2.4);
+        let fit = inner.width().min(inner.height()) * 0.78 * zoom;
+        let scale_xy = fit / grid_span;
+        // Z amplitude ~55% of table footprint (Haltech/MoTeC style). Do not tie scale_z to a
+        // single cell — that crushed relief after bbox auto-fit (PR #9).
+        let scale_z = fit * 0.55;
 
         let cos_p = pitch.cos();
         let sin_p = pitch.sin();
@@ -80,19 +91,23 @@ impl MeshProjector {
             fit_scale: 1.0,
             fit_offset: Vec2::ZERO,
         };
-        proj.fit_to_rect(inner, rows, cols);
+        proj.fit_to_rect(inner, rows, cols, z_soften);
         proj
     }
 
-    fn fit_to_rect(&mut self, inner: Rect, rows: usize, cols: usize) {
+    fn fit_to_rect(&mut self, inner: Rect, rows: usize, cols: usize, z_soften: bool) {
         let mut min_x = f32::MAX;
         let mut min_y = f32::MAX;
         let mut max_x = f32::MIN;
         let mut max_y = f32::MIN;
 
+        let z_lo = display_z_norm(0.0, z_soften);
+        let z_hi = display_z_norm(1.0, z_soften);
+        let z_samples = [z_lo, 0.5, z_hi];
+
         for r in 0..rows {
             for c in 0..cols {
-                for &zn in &[0.0_f32, 0.5, 1.0] {
+                for &zn in &z_samples {
                     let p = self.model_point(c as f32, r as f32, zn, cols, rows);
                     let (s, _) = self.project_raw(p);
                     min_x = min_x.min(s.x);
@@ -182,10 +197,49 @@ struct FillTriangleCmd {
     stroke: Stroke,
 }
 
-/// Display-only Z compression so sharp table cliffs read as slopes, not trenches.
-fn display_z_norm(raw: f32) -> f32 {
+/// Display-only Z compression for sharp MAP shelves / cliffs (Spark, etc.). Linear for normal VE maps.
+fn display_z_norm(raw: f32, soften: bool) -> f32 {
+    if !soften {
+        return raw;
+    }
     let d = raw - 0.5;
-    0.5 + d.signum() * d.abs().sqrt() * 0.62
+    0.5 + d.signum() * d.abs().powf(0.65) * 0.72
+}
+
+/// True when any neighbor step exceeds ~35% of the table value span (outlier shelf/cliff).
+fn table_needs_z_softening(values: &[Vec<f64>]) -> bool {
+    let rows = values.len();
+    let cols = values.first().map(|r| r.len()).unwrap_or(0);
+    if rows < 2 || cols < 2 {
+        return false;
+    }
+
+    let mut min_v = f64::MAX;
+    let mut max_v = f64::MIN;
+    for row in values {
+        for &v in row {
+            min_v = min_v.min(v);
+            max_v = max_v.max(v);
+        }
+    }
+    let span = max_v - min_v;
+    if span < 1e-9 {
+        return false;
+    }
+    let threshold = span * 0.35;
+
+    for r in 0..rows {
+        for c in 0..cols {
+            let v = values[r][c];
+            if c + 1 < cols && (values[r][c + 1] - v).abs() > threshold {
+                return true;
+            }
+            if r + 1 < rows && (values[r + 1][c] - v).abs() > threshold {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Paint the 3D surface mesh into `rect` using the full available canvas size.
@@ -224,7 +278,8 @@ pub fn paint_surface_mesh(
         }
     }
 
-    let proj = MeshProjector::new(rect, rows, cols, yaw, pitch, zoom);
+    let z_soften = table_needs_z_softening(&table.values);
+    let proj = MeshProjector::new(rect, rows, cols, yaw, pitch, zoom, z_soften);
     let clip = painter.with_clip_rect(rect.expand(-1.0));
     let mut cmds: Vec<FillTriangleCmd> = Vec::new();
 
@@ -235,7 +290,7 @@ pub fn paint_surface_mesh(
         } else {
             0.5
         };
-        display_z_norm(raw)
+        display_z_norm(raw, z_soften)
     };
 
     let mut push_tri = |r0: usize, c0: usize, r1: usize, c1: usize, r2: usize, c2: usize| {
@@ -307,9 +362,9 @@ pub fn paint_surface_mesh(
         }
     }
 
-    paint_floor_grid(&proj, &clip, cols, rows);
-    paint_axes(&proj, &clip, cols, rows);
-    paint_active_marker(&proj, &clip, active_cell, cols, rows, z_norm);
+    paint_floor_grid(&proj, &clip, cols, rows, z_soften);
+    paint_axes(&proj, &clip, cols, rows, z_soften);
+    paint_active_marker(&proj, &clip, active_cell, cols, rows, z_norm, z_soften);
 
     clip.text(
         rect.right_top() + Vec2::new(-6.0, 4.0),
@@ -320,8 +375,14 @@ pub fn paint_surface_mesh(
     );
 }
 
-fn paint_floor_grid(proj: &MeshProjector, painter: &Painter, cols: usize, rows: usize) {
-    let floor_z = display_z_norm(0.0);
+fn paint_floor_grid(
+    proj: &MeshProjector,
+    painter: &Painter,
+    cols: usize,
+    rows: usize,
+    z_soften: bool,
+) {
+    let floor_z = display_z_norm(0.0, z_soften);
     let stroke = Stroke::new(0.6, STROKE.gamma_multiply(0.55));
     for r in 0..rows {
         for c in 0..cols - 1 {
@@ -353,8 +414,14 @@ fn paint_axis_label(painter: &Painter, anchor: Pos2, label: &str, color: Color32
     painter.galley(anchor, galley, color);
 }
 
-fn paint_axes(proj: &MeshProjector, painter: &Painter, cols: usize, rows: usize) {
-    let origin = proj.model_point(0.0, 0.0, display_z_norm(0.0), cols, rows);
+fn paint_axes(
+    proj: &MeshProjector,
+    painter: &Painter,
+    cols: usize,
+    rows: usize,
+    z_soften: bool,
+) {
+    let origin = proj.model_point(0.0, 0.0, display_z_norm(0.0, z_soften), cols, rows);
     let x_len = cols as f32 * proj.scale_xy * 0.5;
     let y_len = rows as f32 * proj.scale_xy * 0.5;
     let z_len = proj.scale_z * 0.85;
@@ -386,13 +453,14 @@ fn paint_active_marker(
     cols: usize,
     rows: usize,
     z_norm: impl Fn(usize, usize) -> f32,
+    z_soften: bool,
 ) {
     let (r, c) = active_cell;
     if r >= rows || c >= cols {
         return;
     }
     let p = proj.model_point(c as f32, r as f32, z_norm(r, c), cols, rows);
-    let p_base = proj.model_point(c as f32, r as f32, display_z_norm(0.0), cols, rows);
+    let p_base = proj.model_point(c as f32, r as f32, display_z_norm(0.0, z_soften), cols, rows);
     let (pos, _) = proj.project(p);
     let (base, _) = proj.project(p_base);
     painter.line_segment(
@@ -409,11 +477,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn z_amplitude_matches_table_footprint() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(200.0, 200.0));
+        let proj = MeshProjector::new(rect, 16, 16, 0.8, 0.5, 1.0, false);
+        let xy_span = 16.0 * proj.scale_xy;
+        let z_span = proj.scale_z;
+        let ratio = z_span / xy_span;
+        assert!(
+            ratio > 0.45 && ratio < 0.65,
+            "Z height should be ~55% of table span, got ratio {}",
+            ratio
+        );
+    }
+
+    #[test]
     fn projector_depth_orders_near_before_far() {
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(200.0, 200.0));
-        let proj = MeshProjector::new(rect, 4, 4, 0.8, 0.5, 1.0);
-        let near = proj.model_point(2.0, 2.0, display_z_norm(0.9), 4, 4);
-        let far = proj.model_point(2.0, 2.0, display_z_norm(0.1), 4, 4);
+        let proj = MeshProjector::new(rect, 4, 4, 0.8, 0.5, 1.0, false);
+        let near = proj.model_point(2.0, 2.0, display_z_norm(0.9, false), 4, 4);
+        let far = proj.model_point(2.0, 2.0, display_z_norm(0.1, false), 4, 4);
         let (_, d_near) = proj.project(near);
         let (_, d_far) = proj.project(far);
         assert!(d_near < d_far, "higher Z norm should be closer to camera");
@@ -422,7 +504,7 @@ mod tests {
     #[test]
     fn backface_culled_when_facing_away() {
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(160.0, 160.0));
-        let proj = MeshProjector::new(rect, 3, 3, 0.0, 1.2, 1.0);
+        let proj = MeshProjector::new(rect, 3, 3, 0.0, 1.2, 1.0, false);
         let p0 = proj.model_point(0.0, 0.0, 0.5, 3, 3);
         let p1 = proj.model_point(1.0, 0.0, 0.5, 3, 3);
         let p2 = proj.model_point(0.0, 1.0, 0.5, 3, 3);
@@ -431,8 +513,33 @@ mod tests {
     }
 
     #[test]
-    fn display_z_norm_softens_extremes() {
-        assert!(display_z_norm(1.0) < 1.0);
-        assert!(display_z_norm(0.0) > 0.0);
+    fn display_z_norm_linear_when_not_softening() {
+        assert_eq!(display_z_norm(0.25, false), 0.25);
+        assert_eq!(display_z_norm(0.75, false), 0.75);
+    }
+
+    #[test]
+    fn display_z_norm_softens_extremes_when_enabled() {
+        assert!(display_z_norm(1.0, true) < 1.0);
+        assert!(display_z_norm(0.0, true) > 0.0);
+    }
+
+    #[test]
+    fn gradual_ve_table_does_not_soften() {
+        let rows = 8usize;
+        let cols = 8usize;
+        let mut values = vec![vec![0.0; cols]; rows];
+        for r in 0..rows {
+            for c in 0..cols {
+                values[r][c] = 55.0 + (r + c) as f64 * 2.5;
+            }
+        }
+        assert!(!table_needs_z_softening(&values));
+    }
+
+    #[test]
+    fn sharp_shelf_triggers_softening() {
+        let mut values = vec![vec![50.0, 50.0, 95.0, 95.0], vec![50.0, 50.0, 95.0, 95.0]];
+        assert!(table_needs_z_softening(&values));
     }
 }
