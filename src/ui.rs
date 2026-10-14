@@ -3,6 +3,9 @@ use crate::cal_editor::{
     cell_changed, format_cell_display, param_matches_query, table_has_edits, FavoriteTables,
 };
 use crate::definitions::{CuwFile, XdfDocument};
+use crate::diagnostics::{
+    self, DiagnosticsSnapshot, DtcStatus, status_label,
+};
 use crate::flash_job::FlashJob;
 use crate::flash_layout::FlashLayoutMap;
 use crate::j2534::{connect_for_profile, create_device, J2534DeviceInfo, J2534RegistryScanner, PassThruDevice};
@@ -76,6 +79,9 @@ pub struct WidebandApp {
     pub flash_layout: FlashLayoutMap,
     pub flash_audit: FlashAuditLog,
     pub flash_status_detail: String,
+    pub diag_snapshot: DiagnosticsSnapshot,
+    pub diag_selected_dtc: usize,
+    pub diag_last_error: String,
 
     // UI Workspace
     pub active_tab: WorkspaceTab,
@@ -143,6 +149,9 @@ impl WidebandApp {
             flash_layout,
             flash_audit,
             flash_status_detail: String::new(),
+            diag_snapshot: DiagnosticsSnapshot::default(),
+            diag_selected_dtc: 0,
+            diag_last_error: String::new(),
             active_tab: WorkspaceTab::Calibration,
         };
 
@@ -1254,6 +1263,10 @@ impl WidebandApp {
     }
 }
 
+fn yes_no(v: bool) -> &'static str {
+    if v { "Yes" } else { "No" }
+}
+
 // ---------------------------------------------------------------------------
 // Tab 3: Diagnostics & ECU Flashing
 // ---------------------------------------------------------------------------
@@ -1305,14 +1318,234 @@ impl WidebandApp {
             }
             ui.add(egui::ProgressBar::new(self.transfer_progress).animate(self.is_flashing));
 
+            ui.add_space(12.0);
+            self.render_diagnostics_panel(ui);
+
             ui.add_space(8.0);
             ui.heading("Communication & Flash Event Log");
-            egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+            egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
                 for line in &self.comm_log {
                     ui.label(egui::RichText::new(line).monospace().small());
                 }
             });
         });
+    }
+
+    fn render_diagnostics_panel(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::none()
+            .fill(CARD_FILL)
+            .stroke(Stroke::new(1.0, STROKE))
+            .rounding(egui::Rounding::same(6.0))
+            .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading(
+                        egui::RichText::new("Emissions Diagnostics")
+                            .size(15.0)
+                            .color(ACCENT_CYAN),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new("READ-ONLY")
+                                .small()
+                                .strong()
+                                .color(Color32::from_rgb(140, 155, 175)),
+                        );
+                    });
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "View stored/pending DTCs, freeze frames, and OBD readiness. Clear-DTC and MIL-defeat paths are not exposed.",
+                    )
+                    .small()
+                    .color(MUTED),
+                );
+                ui.add_space(6.0);
+
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(egui::RichText::new("↻ Refresh DTCs & Readiness").strong())
+                        .clicked()
+                    {
+                        self.refresh_diagnostics();
+                    }
+                    let mil_color = if self.diag_snapshot.mil_on {
+                        Color32::from_rgb(255, 82, 82)
+                    } else {
+                        EMERALD
+                    };
+                    let mil_text = if self.diag_snapshot.mil_on {
+                        "MIL: ON"
+                    } else {
+                        "MIL: OFF"
+                    };
+                    ui.label(egui::RichText::new(mil_text).strong().color(mil_color));
+                });
+
+                if !self.diag_last_error.is_empty() {
+                    ui.label(
+                        egui::RichText::new(&self.diag_last_error)
+                            .small()
+                            .color(Color32::from_rgb(255, 152, 0)),
+                    );
+                }
+
+                ui.add_space(8.0);
+                ui.columns(2, |columns| {
+                    columns[0].heading(egui::RichText::new("Stored DTCs").size(13.0).color(MUTED));
+                    columns[1].heading(egui::RichText::new("Pending DTCs").size(13.0).color(MUTED));
+
+                    Self::render_dtc_table(&mut columns[0], &self.diag_snapshot.stored_dtcs, &mut self.diag_selected_dtc);
+                    Self::render_dtc_table_pending(&mut columns[1], &self.diag_snapshot.pending_dtcs);
+                });
+
+                ui.add_space(10.0);
+                ui.heading(egui::RichText::new("OBD Readiness Monitors").size(13.0).color(MUTED));
+                egui::Grid::new("readiness_grid")
+                    .num_columns(3)
+                    .spacing([12.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Monitor").small().strong());
+                        ui.label(egui::RichText::new("Supported").small().strong());
+                        ui.label(egui::RichText::new("Complete").small().strong());
+                        ui.end_row();
+                        for mon in &self.diag_snapshot.readiness.monitors {
+                            ui.label(&mon.name);
+                            ui.label(yes_no(mon.supported));
+                            let complete_color = if mon.complete { EMERALD } else { Color32::from_rgb(255, 193, 7) };
+                            ui.label(egui::RichText::new(yes_no(mon.complete)).color(complete_color));
+                            ui.end_row();
+                        }
+                    });
+
+                ui.add_space(10.0);
+                ui.heading(egui::RichText::new("Freeze Frame").size(13.0).color(MUTED));
+                let ff = self.selected_freeze_frame();
+                if let Some(frame) = ff {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "DTC {} — record 0x{:02X}",
+                            frame.dtc_code,
+                            frame.record_number
+                        ))
+                        .monospace()
+                        .color(TEXT),
+                    );
+                    for pid in &frame.pid_values {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(format!("PID 0x{:02X}", pid.pid)).small().color(MUTED));
+                            ui.label(egui::RichText::new(&pid.label).color(TEXT));
+                            ui.label(egui::RichText::new(&pid.value).monospace().strong().color(ACCENT_CYAN));
+                        });
+                    }
+                } else {
+                    ui.label(egui::RichText::new("No freeze frame loaded — refresh diagnostics or select a stored DTC.").small().color(MUTED));
+                }
+            });
+    }
+
+    fn render_dtc_table(ui: &mut egui::Ui, dtcs: &[diagnostics::DiagnosticTroubleCode], selected: &mut usize) {
+        if dtcs.is_empty() {
+            ui.label(egui::RichText::new("None").small().color(MUTED));
+            return;
+        }
+        TableBuilder::new(ui)
+            .striped(true)
+            .column(Column::auto().at_least(72.0))
+            .column(Column::remainder())
+            .column(Column::auto().at_least(72.0))
+            .header(20.0, |mut row| {
+                row.col(|ui| {
+                    ui.label(egui::RichText::new("Code").small().strong());
+                });
+                row.col(|ui| {
+                    ui.label(egui::RichText::new("Description").small().strong());
+                });
+                row.col(|ui| {
+                    ui.label(egui::RichText::new("Status").small().strong());
+                });
+            })
+            .body(|mut body| {
+                for (idx, dtc) in dtcs.iter().enumerate() {
+                    body.row(22.0, |mut row| {
+                        row.col(|ui| {
+                            let sel = *selected == idx;
+                            if ui.selectable_label(sel, egui::RichText::new(&dtc.code).monospace().strong()).clicked() {
+                                *selected = idx;
+                            }
+                        });
+                        row.col(|ui| {
+                            ui.label(egui::RichText::new(&dtc.description).small());
+                        });
+                        row.col(|ui| {
+                            let c = if dtc.status == DtcStatus::Pending {
+                                Color32::from_rgb(255, 193, 7)
+                            } else {
+                                ACCENT_CYAN
+                            };
+                            ui.label(egui::RichText::new(status_label(dtc.status)).small().color(c));
+                        });
+                    });
+                }
+            });
+    }
+
+    fn render_dtc_table_pending(ui: &mut egui::Ui, dtcs: &[diagnostics::DiagnosticTroubleCode]) {
+        if dtcs.is_empty() {
+            ui.label(egui::RichText::new("None").small().color(MUTED));
+            return;
+        }
+        for dtc in dtcs {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(&dtc.code).monospace().strong().color(ACCENT_CYAN));
+                ui.label(egui::RichText::new(&dtc.description).small());
+            });
+        }
+    }
+
+    fn selected_freeze_frame(&self) -> Option<&diagnostics::FreezeFrame> {
+        if self.diag_snapshot.freeze_frames.is_empty() {
+            return None;
+        }
+        if let Some(dtc) = self.diag_snapshot.stored_dtcs.get(self.diag_selected_dtc) {
+            return self
+                .diag_snapshot
+                .freeze_frames
+                .iter()
+                .find(|f| f.dtc_code == dtc.code);
+        }
+        self.diag_snapshot.freeze_frames.first()
+    }
+
+    fn refresh_diagnostics(&mut self) {
+        self.diag_last_error.clear();
+        if self.active_device.is_none() {
+            self.diag_last_error = "Connect cable first.".to_string();
+            return;
+        }
+        let prof = self.profiles[self.selected_profile_idx].clone();
+        if let Some(dev) = &mut self.active_device {
+            let channel = dev.channel_id();
+            match diagnostics::DiagnosticsReader::read(dev.as_mut(), channel, &prof) {
+                Ok(snap) => {
+                    self.diag_snapshot = snap;
+                    self.diag_selected_dtc = 0;
+                    let n = self.diag_snapshot.stored_dtcs.len();
+                    let p = self.diag_snapshot.pending_dtcs.len();
+                    self.log(&format!(
+                        "Diagnostics: {} stored, {} pending DTC(s); MIL {}",
+                        n,
+                        p,
+                        if self.diag_snapshot.mil_on { "ON" } else { "OFF" }
+                    ));
+                }
+                Err(e) => {
+                    self.log(&format!("Diagnostics read failed: {}", e));
+                    self.diag_last_error = e;
+                }
+            }
+        }
     }
 
     fn execute_stock_read(&mut self) {
