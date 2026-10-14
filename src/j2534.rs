@@ -1,5 +1,8 @@
 use std::time::Instant;
 
+#[cfg(windows)]
+use std::ffi::c_void;
+
 pub const STATUS_NOERROR: i32 = 0;
 pub const J1850VPW: u32 = 2;
 pub const ISO9141: u32 = 3;
@@ -712,11 +715,74 @@ mod native_passthru {
 
         pub fn open_device(&self) -> Result<u32, String> {
             let mut device_id = 0u32;
-            let status = unsafe { self.open(ptr::null(), &mut device_id) };
+            let status = unsafe { (self.open)(ptr::null(), &mut device_id) };
             if status != STATUS_NOERROR {
                 return Err(format!("PassThruOpen failed: {}", status));
             }
             Ok(device_id)
+        }
+
+        pub fn close_device(&self, device_id: u32) -> i32 {
+            unsafe { (self.close)(device_id) }
+        }
+
+        pub fn disconnect_channel(&self, channel: u32) -> i32 {
+            unsafe { (self.disconnect)(channel) }
+        }
+
+        pub fn connect_channel(
+            &self,
+            device_id: u32,
+            protocol: u32,
+            flags: u32,
+            baud: u32,
+            channel_id: &mut u32,
+        ) -> i32 {
+            unsafe { (self.connect)(device_id, protocol, flags, baud, channel_id) }
+        }
+
+        pub fn read_msgs(
+            &self,
+            channel: u32,
+            msg: &mut PassThruMsg,
+            count: &mut u32,
+            timeout_ms: u32,
+        ) -> i32 {
+            unsafe { (self.read)(channel, msg, count, timeout_ms) }
+        }
+
+        pub fn write_msgs(
+            &self,
+            channel: u32,
+            msg: &mut PassThruMsg,
+            count: &mut u32,
+            timeout_ms: u32,
+        ) -> i32 {
+            unsafe { (self.write)(channel, msg, count, timeout_ms) }
+        }
+
+        pub fn start_msg_filter(
+            &self,
+            channel: u32,
+            filter_type: u32,
+            mask: &mut PassThruMsg,
+            pattern: &mut PassThruMsg,
+            flow_control: *mut PassThruMsg,
+            filter_id: &mut u32,
+        ) -> i32 {
+            unsafe {
+                (self.start_filter)(channel, filter_type, mask, pattern, flow_control, filter_id)
+            }
+        }
+
+        pub fn ioctl_raw(
+            &self,
+            channel: u32,
+            ioctl_id: u32,
+            input: *mut c_void,
+            output: *mut c_void,
+        ) -> i32 {
+            unsafe { (self.ioctl)(channel, ioctl_id, input, output) }
         }
     }
 }
@@ -769,11 +835,11 @@ impl PassThruDevice for NativePassThruDevice {
         #[cfg(windows)]
         if let Some(api) = &self.api {
             if self.channel_id != 0 {
-                let _ = unsafe { api.disconnect(self.channel_id) };
+                let _ = api.disconnect_channel(self.channel_id);
                 self.channel_id = 0;
             }
             if self.device_id != 0 {
-                let _ = unsafe { api.close(self.device_id) };
+                let _ = api.close_device(self.device_id);
                 self.device_id = 0;
             }
         }
@@ -790,7 +856,7 @@ impl PassThruDevice for NativePassThruDevice {
         {
             let api = self.api.as_ref().ok_or("PassThru not open")?;
             let mut channel_id = 0u32;
-            let status = unsafe { api.connect(self.device_id, protocol, flags, baud, &mut channel_id) };
+            let status = api.connect_channel(self.device_id, protocol, flags, baud, &mut channel_id);
             if status != STATUS_NOERROR {
                 return Err(format!("PassThruConnect failed: {}", status));
             }
@@ -807,7 +873,7 @@ impl PassThruDevice for NativePassThruDevice {
     fn disconnect(&mut self, channel: u32) -> Result<(), String> {
         #[cfg(windows)]
         if let Some(api) = &self.api {
-            let _ = unsafe { api.disconnect(channel) };
+            let _ = api.disconnect_channel(channel);
         }
         if self.channel_id == channel {
             self.channel_id = 0;
@@ -821,7 +887,7 @@ impl PassThruDevice for NativePassThruDevice {
             let api = self.api.as_ref().ok_or("PassThru not open")?;
             let mut msg = PassThruMsg::default();
             let mut count: u32 = 1;
-            let status = unsafe { api.read(channel, &mut msg, &mut count, timeout_ms) };
+            let status = api.read_msgs(channel, &mut msg, &mut count, timeout_ms);
             if status != STATUS_NOERROR {
                 return Ok(Vec::new());
             }
@@ -844,7 +910,7 @@ impl PassThruDevice for NativePassThruDevice {
             for msg in msgs {
                 let mut one = *msg;
                 let mut count = 1u32;
-                let status = unsafe { api.write(channel, &mut one, &mut count, timeout_ms) };
+                let status = api.write_msgs(channel, &mut one, &mut count, timeout_ms);
                 if status != STATUS_NOERROR {
                     return Err(format!("PassThruWriteMsgs failed: {}", status));
                 }
@@ -878,9 +944,14 @@ impl PassThruDevice for NativePassThruDevice {
                 std::ptr::null_mut()
             };
             let mut filter_id = 0u32;
-            let status = unsafe {
-                api.start_filter(channel, filter_type, &mut mask_msg, &mut pattern_msg, flow_ptr, &mut filter_id)
-            };
+            let status = api.start_msg_filter(
+                channel,
+                filter_type,
+                &mut mask_msg,
+                &mut pattern_msg,
+                flow_ptr,
+                &mut filter_id,
+            );
             if status != STATUS_NOERROR {
                 return Err(format!("PassThruStartMsgFilter failed: {}", status));
             }
@@ -898,14 +969,12 @@ impl PassThruDevice for NativePassThruDevice {
             let api = self.api.as_ref().ok_or("PassThru not open")?;
             let mut in_buf = input.to_vec();
             let mut out_buf = vec![0u8; 256];
-            let status = unsafe {
-                api.ioctl(
-                    channel,
-                    ioctl_id,
-                    in_buf.as_mut_ptr() as *mut c_void,
-                    out_buf.as_mut_ptr() as *mut c_void,
-                )
-            };
+            let status = api.ioctl_raw(
+                channel,
+                ioctl_id,
+                in_buf.as_mut_ptr() as *mut c_void,
+                out_buf.as_mut_ptr() as *mut c_void,
+            );
             if status != STATUS_NOERROR {
                 return Ok(vec![]);
             }
