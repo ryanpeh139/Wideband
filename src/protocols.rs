@@ -1,6 +1,7 @@
 use crate::isotp::{IsoTpConfig, IsoTpLink as IsoTpSession};
 use crate::j2534::{PassThruDevice, ISO14230, ISO15765, J1850VPW};
-use crate::uds::{ProgrammingSession, UdsClient};
+use crate::security_session::ProgrammingSession;
+use crate::uds::UdsClient;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DiagnosticProtocol {
@@ -452,6 +453,7 @@ impl FlashDownload {
         Self::execute_with_client(&mut client, device, channel, profile, address, image, progress)
     }
 
+    /// Caller must complete security unlock (`ProgrammingSession::unlock`) before download on real ECUs.
     pub fn execute_with_client(
         client: &mut UdsClient,
         device: &mut dyn PassThruDevice,

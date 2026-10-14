@@ -2,7 +2,8 @@ use crate::audit_log::FlashAuditLog;
 use crate::flash_layout::{FlashLayoutMap, FlashSegment};
 use crate::j2534::PassThruDevice;
 use crate::protocols::EcuProfile;
-use crate::uds::{ProgrammingSession, UdsClient};
+use crate::security_session::ProgrammingSession;
+use crate::uds::UdsClient;
 
 pub struct StockReadResult {
     pub bytes: Vec<u8>,
@@ -23,9 +24,7 @@ impl FlashJob {
     ) -> Result<StockReadResult, String> {
         let spec = &layout.profile(&profile.id)?.stock_read;
         let mut client = UdsClient::for_profile(device, channel, profile);
-        client.tester_present(device, profile.diagnostic)?;
-        let (p2, p2_star) = client.diagnostic_session_control(device, profile.read_session)?;
-        client.set_timers(p2, p2_star);
+        ProgrammingSession::enter_read_session(&mut client, device, profile)?;
         let bytes = client.read_range(
             device,
             profile,

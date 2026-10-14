@@ -397,6 +397,7 @@ pub struct VirtualEcuSimulator {
     rx_queue: Vec<PassThruMsg>,
     start_time: Instant,
     unlocked_level1: bool,
+    pending_security_seed: [u8; 4],
     download_active: bool,
     transfer_offset: u32,
     received_bytes: Vec<u8>,
@@ -413,6 +414,7 @@ impl VirtualEcuSimulator {
             rx_queue: Vec::new(),
             start_time: Instant::now(),
             unlocked_level1: false,
+            pending_security_seed: [0x48, 0x54, 0x69, 0x76],
             download_active: false,
             transfer_offset: 0,
             received_bytes: Vec::new(),
@@ -511,6 +513,38 @@ impl VirtualEcuSimulator {
             self.rx_queue.push(cf_msg);
             offset += chunk;
             seq = (seq + 1) & 0x0F;
+        }
+    }
+
+    fn handle_security_access(&mut self, req: &[u8]) -> Vec<u8> {
+        if req.len() < 2 {
+            return vec![0x7F, 0x27, 0x13];
+        }
+        let sub = req[1];
+        if sub == 0x01 {
+            if self.unlocked_level1 {
+                return vec![0x67, 0x01, 0x00, 0x00, 0x00, 0x00];
+            }
+            let seed = self.pending_security_seed;
+            vec![0x67, 0x01, seed[0], seed[1], seed[2], seed[3]]
+        } else if sub == 0x02 {
+            if req.len() < 6 {
+                return vec![0x7F, 0x27, 0x13];
+            }
+            let key = &req[2..6];
+            match crate::protocols::SecurityKeys::compute_denso32(
+                &self.pending_security_seed,
+                0,
+                true,
+            ) {
+                Ok(expected) if key == expected.as_slice() => {
+                    self.unlocked_level1 = true;
+                    vec![0x67, 0x02]
+                }
+                _ => vec![0x7F, 0x27, 0x35],
+            }
+        } else {
+            vec![0x7F, 0x27, 0x12]
         }
     }
 
@@ -620,25 +654,12 @@ impl VirtualEcuSimulator {
                 }
             }
             // 0x27: SecurityAccess
-            0x27 => {
-                if req.len() >= 2 {
-                    let sub = req[1];
-                    if sub == 0x01 {
-                        // Request seed -> return standard 4-byte seed
-                        vec![0x67, 0x01, 0x48, 0x54, 0x69, 0x76]
-                    } else if sub == 0x02 {
-                        // Send key -> validate
-                        self.unlocked_level1 = true;
-                        vec![0x67, 0x02]
-                    } else {
-                        vec![0x7F, 0x27, 0x12]
-                    }
-                } else {
-                    vec![0x7F, 0x27, 0x13]
-                }
-            }
+            0x27 => self.handle_security_access(req),
             // 0x34: RequestDownload
             0x34 => {
+                if !self.unlocked_level1 {
+                    return vec![0x7F, 0x34, 0x33];
+                }
                 self.download_active = true;
                 self.transfer_offset = 0;
                 self.received_bytes.clear();
@@ -647,6 +668,9 @@ impl VirtualEcuSimulator {
             }
             // 0x36: TransferData
             0x36 => {
+                if !self.unlocked_level1 {
+                    return vec![0x7F, 0x36, 0x33];
+                }
                 if !self.download_active {
                     return vec![0x7F, 0x36, 0x24]; // Request Sequence Error
                 }
