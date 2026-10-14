@@ -4,6 +4,7 @@ pub mod checksum_routine;
 pub mod definitions;
 pub mod rom_image;
 pub mod diagnostics;
+pub mod ecu_bus;
 pub mod flash_job;
 pub mod flash_layout;
 pub mod isotp;
@@ -424,6 +425,39 @@ mod tests {
         assert!(snap.pending_dtcs.iter().any(|d| d.code == "P0300"));
         assert!(!snap.readiness.monitors.is_empty());
         assert!(!snap.freeze_frames.is_empty());
+        sim.close().unwrap();
+    }
+
+    #[test]
+    fn test_virtual_kline_diagnostics_and_connect() {
+        use diagnostics::DiagnosticsReader;
+        use j2534::connect_for_profile;
+
+        let mut sim = VirtualEcuSimulator::new();
+        sim.open().unwrap();
+        let prof = EcuProfile::tacoma_kline();
+        let channel = connect_for_profile(&mut sim, &prof).expect("kline connect");
+        assert_eq!(channel, 1);
+
+        let snap = DiagnosticsReader::read(&mut sim, channel, &prof).expect("kline diagnostics");
+        assert!(snap.stored_dtcs.iter().any(|d| d.code == "P0171"));
+        sim.close().unwrap();
+    }
+
+    #[test]
+    fn test_virtual_vpw_diagnostics() {
+        use diagnostics::DiagnosticsReader;
+        use j2534::connect_for_profile;
+
+        let mut sim = VirtualEcuSimulator::new();
+        sim.open().unwrap();
+        let prof = EcuProfile::silverado_vpw();
+        let channel = connect_for_profile(&mut sim, &prof).expect("vpw connect");
+        assert_eq!(channel, 1);
+
+        let snap = DiagnosticsReader::read(&mut sim, channel, &prof).expect("vpw diagnostics");
+        assert!(snap.stored_dtcs.iter().any(|d| d.code == "P0171"));
+        assert!(snap.transport_note.contains("VPW"));
         sim.close().unwrap();
     }
 }

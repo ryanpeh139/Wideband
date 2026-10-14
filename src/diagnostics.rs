@@ -1,4 +1,4 @@
-use crate::isotp::{IsoTpConfig, IsoTpLink};
+use crate::ecu_bus;
 use crate::j2534::PassThruDevice;
 use crate::protocols::{DiagnosticProtocol, EcuProfile, VehicleBus};
 
@@ -216,18 +216,7 @@ impl DiagnosticsReader {
         profile: &EcuProfile,
         request: &[u8],
     ) -> Result<Vec<u8>, String> {
-        let config = IsoTpConfig {
-            tx_id: profile.request_id,
-            rx_id: profile.response_id,
-            pad_byte: 0xAA,
-            timeout_ms: 2500,
-            block_size: 0,
-            stmin_ms: 0,
-            max_flow_waits: 5,
-        };
-        let link = IsoTpLink::new(channel, config);
-        link.send(device, request)?;
-        link.receive(device)
+        ecu_bus::exchange(device, channel, profile, request)
     }
 }
 

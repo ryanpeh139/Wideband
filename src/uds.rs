@@ -1,4 +1,4 @@
-use crate::isotp::{IsoTpConfig, IsoTpLink};
+use crate::ecu_bus::DiagnosticTransport;
 use crate::j2534::PassThruDevice;
 use crate::protocols::{DiagnosticProtocol, EcuProfile};
 
@@ -6,25 +6,16 @@ const NEGATIVE: u8 = 0x7F;
 const RESPONSE_PENDING: u8 = 0x78;
 
 pub struct UdsClient {
-    link: IsoTpLink,
+    link: DiagnosticTransport,
     max_pending: u32,
     p2_ms: u32,
     p2_star_ms: u32,
 }
 
 impl UdsClient {
-    pub fn for_profile(device: &mut dyn PassThruDevice, channel: u32, profile: &EcuProfile) -> Self {
-        let config = IsoTpConfig {
-            tx_id: profile.request_id,
-            rx_id: profile.response_id,
-            pad_byte: 0xAA,
-            timeout_ms: 2000,
-            block_size: 0,
-            stmin_ms: 0,
-            max_flow_waits: 5,
-        };
+    pub fn for_profile(_device: &mut dyn PassThruDevice, channel: u32, profile: &EcuProfile) -> Self {
         Self {
-            link: IsoTpLink::new(channel, config),
+            link: DiagnosticTransport::for_profile(channel, profile),
             max_pending: 10,
             p2_ms: 2000,
             p2_star_ms: 5000,

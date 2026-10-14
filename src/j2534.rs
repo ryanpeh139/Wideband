@@ -4,7 +4,8 @@ use std::time::Instant;
 use std::ffi::c_void;
 
 pub const STATUS_NOERROR: i32 = 0;
-pub const J1850VPW: u32 = 2;
+pub const J1850VPW: u32 = 1;
+pub const J1850PWM: u32 = 2;
 pub const ISO9141: u32 = 3;
 pub const ISO14230: u32 = 4;
 pub const CAN: u32 = 6;
@@ -397,6 +398,11 @@ pub trait PassThruDevice: Send + Sync {
     }
     /// Host bridge uses FILTER during CONNECT; native uses this before filters.
     fn set_connect_hints(&mut self, _extended: bool, _filter_id: u32, _filter_mask: u32) {}
+
+    /// ISO 14230 fast init after connect (K-Line). Default uses `FAST_INIT` ioctl.
+    fn kline_fast_init(&mut self, channel: u32, frame: &[u8]) -> Result<Vec<u8>, String> {
+        self.ioctl(channel, FAST_INIT, frame)
+    }
 
     /// Battery voltage from PassThru READ_VBATT ioctl (mV). None if unavailable.
     fn read_vbatt_volts(&mut self) -> Option<f32> {
@@ -842,6 +848,23 @@ impl PassThruDevice for VirtualEcuSimulator {
             if req_payload.is_empty() {
                 continue;
             }
+            if self.active_protocol == ISO14230 {
+                if let Some(inner) = crate::ecu_bus::kwp::try_unpack_to_ecu(req_payload, 0x10) {
+                    let resp_payload = self.handle_uds_request(&inner);
+                    if let Ok(frame) = crate::ecu_bus::kwp::pack(0xF1, 0x10, &resp_payload) {
+                        self.rx_queue.push(PassThruMsg::new(ISO14230, &frame));
+                    }
+                    continue;
+                }
+            } else if self.active_protocol == J1850VPW {
+                if let Some(inner) = crate::ecu_bus::vpw::try_unpack_to_ecu(req_payload, 0x10) {
+                    let resp_payload = self.handle_uds_request(&inner);
+                    if let Ok(frame) = crate::ecu_bus::vpw::pack(0x6C, 0xF1, 0x10, &resp_payload) {
+                        self.rx_queue.push(PassThruMsg::new(J1850VPW, &frame));
+                    }
+                    continue;
+                }
+            }
             let pci = req_payload[0] >> 4;
             let complete_req = if pci == 0x00 {
                 let len = (req_payload[0] & 0x0F) as usize;
@@ -886,13 +909,13 @@ impl PassThruDevice for VirtualEcuSimulator {
             if self.active_protocol == ISO15765 || self.active_protocol == CAN {
                 self.enqueue_iso_tp_response(rx_id, &resp_payload);
             } else if self.active_protocol == ISO14230 {
-                // KWP2000 framing
-                let mut resp_msg = PassThruMsg::default();
-                resp_msg.protocol_id = ISO14230;
-                let len = resp_payload.len().min(4128);
-                resp_msg.data_size = len as u32;
-                resp_msg.data[..len].copy_from_slice(&resp_payload[..len]);
-                self.rx_queue.push(resp_msg);
+                if let Ok(frame) = crate::ecu_bus::kwp::pack(0xF1, 0x10, &resp_payload) {
+                    self.rx_queue.push(PassThruMsg::new(ISO14230, &frame));
+                }
+            } else if self.active_protocol == J1850VPW {
+                if let Ok(frame) = crate::ecu_bus::vpw::pack(0x6C, 0xF1, 0x10, &resp_payload) {
+                    self.rx_queue.push(PassThruMsg::new(J1850VPW, &frame));
+                }
             } else {
                 let mut resp_msg = PassThruMsg::default();
                 resp_msg.protocol_id = self.active_protocol;
@@ -1301,6 +1324,9 @@ pub fn connect_for_profile(
         let mut pass_pat = PassThruMsg::new_can(profile.response_id, &[]);
         pass_pat.write_id(profile.response_id);
         device.start_filter(channel, PASS_FILTER, &pass_mask, &pass_pat, None)?;
+    } else if profile.bus == VehicleBus::KLine {
+        let wake = crate::ecu_bus::kwp::pack(profile.ecu, profile.tester, &[0x81])?;
+        device.kline_fast_init(channel, &wake)?;
     }
     Ok(channel)
 }
