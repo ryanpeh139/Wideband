@@ -45,6 +45,7 @@ pub struct WidebandApp {
     pub profiles: Vec<EcuProfile>,
     pub selected_profile_idx: usize,
     pub active_device: Option<Box<dyn PassThruDevice>>,
+    pub active_device_virtual: bool,
     pub is_connected: bool,
 
     // Calibration & XDF
@@ -85,6 +86,7 @@ pub struct WidebandApp {
     pub flash_layout: FlashLayoutMap,
     pub flash_audit: FlashAuditLog,
     pub flash_status_detail: String,
+    pub flash_confirm_open: bool,
     pub diag_snapshot: DiagnosticsSnapshot,
     pub diag_selected_dtc: usize,
     pub diag_last_error: String,
@@ -123,6 +125,7 @@ impl WidebandApp {
             profiles,
             selected_profile_idx: 0,
             active_device: None,
+            active_device_virtual: false,
             is_connected: false,
             xdf,
             selected_table_idx: 0,
@@ -157,6 +160,7 @@ impl WidebandApp {
             flash_layout,
             flash_audit,
             flash_status_detail: String::new(),
+            flash_confirm_open: false,
             diag_snapshot: DiagnosticsSnapshot::default(),
             diag_selected_dtc: 0,
             diag_last_error: String::new(),
@@ -378,6 +382,7 @@ impl WidebandApp {
         self.log(&format!("Connected to {}: {}", dev_name, ver));
         let ch = dev.channel_id();
         self.header_vbatt = read_pass_thru_vbatt(dev.as_mut(), ch);
+        self.active_device_virtual = is_virtual;
         self.active_device = Some(dev);
         self.is_connected = true;
     }
@@ -1413,7 +1418,7 @@ impl WidebandApp {
                 if ui.button(egui::RichText::new("🔍 Identify ECU").strong()).clicked() {
                     if let Some(dev) = &mut self.active_device {
                         let prof = &self.profiles[self.selected_profile_idx];
-                        let allow_demo = self.devices.get(self.selected_device_idx).map(|d| d.is_virtual).unwrap_or(false);
+                        let allow_demo = self.active_device_virtual;
                         let channel = dev.channel_id();
                         match EcuIdentifier::query(dev.as_mut(), channel, prof, allow_demo) {
                             Ok(id) => {
@@ -1432,9 +1437,70 @@ impl WidebandApp {
                 }
 
                 if ui.button(egui::RichText::new("⚡ Flash Active Calibration").strong().color(Color32::from_rgb(255, 23, 68))).clicked() {
-                    self.execute_flash_active();
+                    self.flash_confirm_open = true;
                 }
             });
+
+            if self.flash_confirm_open {
+                let prof = self.profiles[self.selected_profile_idx].clone();
+                let segments = self
+                    .flash_layout
+                    .cal_segments(&prof.id)
+                    .unwrap_or_default();
+                let mut confirm = false;
+                let mut cancel = false;
+                egui::Window::new("Confirm calibration flash")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.label(
+                            "This writes calibration segments to the connected ECU. Verify vehicle, profile, and security-config before continuing.",
+                        );
+                        ui.separator();
+                        ui.label(format!("Profile: {}", prof.name));
+                        for seg in &segments {
+                            ui.label(format!(
+                                "  • {} — {} bytes @ 0x{:X}",
+                                seg.label,
+                                seg.size,
+                                seg.address
+                            ));
+                        }
+                        if !self.active_device_virtual
+                            && !PlatformSecurity::security_key_configured_for_profile(&prof.id)
+                        {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Production security-config seed-key is not configured for this profile.",
+                                )
+                                .color(Color32::from_rgb(255, 152, 0)),
+                            );
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button(egui::RichText::new("Cancel").strong()).clicked() {
+                                cancel = true;
+                            }
+                            if ui
+                                .button(
+                                    egui::RichText::new("Write calibration to ECU")
+                                        .strong()
+                                        .color(Color32::from_rgb(255, 23, 68)),
+                                )
+                                .clicked()
+                            {
+                                confirm = true;
+                            }
+                        });
+                    });
+                if cancel {
+                    self.flash_confirm_open = false;
+                }
+                if confirm {
+                    self.flash_confirm_open = false;
+                    self.execute_flash_active();
+                }
+            }
 
             ui.add_space(8.0);
             ui.group(|ui| {
@@ -1693,6 +1759,8 @@ impl WidebandApp {
         if let Some(dev) = &mut self.active_device {
             let channel = dev.channel_id();
             let label = dev.device_label();
+            let mut read_progress = 0.0f32;
+            let mut read_detail = String::new();
             let read_res = FlashJob::read_stock(
                 dev.as_mut(),
                 channel,
@@ -1700,8 +1768,13 @@ impl WidebandApp {
                 &self.flash_layout,
                 &label,
                 &self.flash_audit,
-                |_done, _total| {},
+                |done, total| {
+                    read_progress = done as f32 / total.max(1) as f32;
+                    read_detail = format!("Stock read: {} / {} bytes", done, total);
+                },
             );
+            self.transfer_progress = read_progress;
+            self.flash_status_detail = read_detail;
             match read_res {
                 Ok(stock) => {
                     self.active_rom = stock.bytes;
@@ -1766,6 +1839,7 @@ impl WidebandApp {
             let label = dev.device_label();
             let mut last_frac = 0.0f32;
             let mut last_detail = String::new();
+            let require_production_security = !self.active_device_virtual;
             let flash_res = FlashJob::flash_cal_segments(
                 dev.as_mut(),
                 channel,
@@ -1779,6 +1853,7 @@ impl WidebandApp {
                     last_frac = frac;
                     last_detail = detail.to_string();
                 },
+                require_production_security,
             );
             self.transfer_progress = last_frac;
             self.flash_status_detail = last_detail;
