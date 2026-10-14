@@ -41,6 +41,7 @@ use std::time::Instant;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceTab {
     Calibration,
+    Strategy,
     Telemetry,
     Transmission,
     FlashDiagnostics,
@@ -120,6 +121,13 @@ pub struct WidebandApp {
     pub tcm_identify_error: String,
     pub tcm_param_view: TcmParameterView,
     pub tcm_flash_confirm_open: bool,
+
+    // Strategy / patches
+    pub strategy_manager_idx: usize,
+    pub loaded_patch: Option<crate::patch_recipe::PatchRecipe>,
+    pub patch_recipe_path: Option<PathBuf>,
+    pub patch_preview: Option<crate::patch_recipe::PatchPreview>,
+    pub patch_status: String,
 
     // UI Workspace
     pub active_tab: WorkspaceTab,
@@ -223,6 +231,11 @@ impl WidebandApp {
             tcm_identify_error: String::new(),
             tcm_param_view,
             tcm_flash_confirm_open: false,
+            strategy_manager_idx: 0,
+            loaded_patch: None,
+            patch_recipe_path: None,
+            patch_preview: None,
+            patch_status: String::new(),
             active_tab: WorkspaceTab::Calibration,
             simple_ux: SimpleUxState::load(),
         };
@@ -301,7 +314,7 @@ impl WidebandApp {
         self.stock_flags = self.xdf.flags.iter().map(|f| f.is_set).collect();
     }
 
-    fn refresh_checksum_badge(&mut self) {
+    pub(crate) fn refresh_checksum_badge(&mut self) {
         let prof = &self.profiles[self.selected_profile_idx];
         self.checksum_status =
             PlatformSecurity::checksum_badge(&prof.checksum_profile_id, &self.active_rom, self.rom_origin);
@@ -984,6 +997,7 @@ impl WidebandApp {
             (WorkspaceTab::Switchboard, "Switchboard"),
             (WorkspaceTab::FlashDiagnostics, "Flash & Diag"),
             (WorkspaceTab::Transmission, "Transmission"),
+            (WorkspaceTab::Strategy, "Strategy"),
             (WorkspaceTab::Telemetry, "Telemetry"),
             (WorkspaceTab::Calibration, "Calibration"),
         ];
@@ -1145,6 +1159,7 @@ impl eframe::App for WidebandApp {
             } else {
                 match self.active_tab {
                     WorkspaceTab::Calibration => self.render_calibration_tab(ctx, false),
+                    WorkspaceTab::Strategy => self.render_strategy_tab(ctx),
                     WorkspaceTab::Telemetry => self.render_telemetry_tab(ctx, false),
                     WorkspaceTab::Transmission => self.render_transmission_tab(ctx),
                     WorkspaceTab::FlashDiagnostics => self.render_flash_tab(ctx),

@@ -1,5 +1,6 @@
 pub use crate::rom_image::CuwFile;
 use crate::security_config::locate;
+use crate::strategy_meta::{enrich_document_strategy_meta, parse_wideband_meta, WidebandMeta};
 use roxmltree::Document;
 
 pub use crate::rom_image::{RomImage, MAX_CUW_SPAN};
@@ -210,6 +211,7 @@ pub struct XdfTable {
     pub id: String,
     pub title: String,
     pub description: String,
+    pub wideband_meta: WidebandMeta,
     pub address: u32,
     pub x_axis: XdfAxis,
     pub y_axis: XdfAxis,
@@ -223,6 +225,7 @@ pub struct XdfTable {
 pub struct XdfConstant {
     pub id: String,
     pub title: String,
+    pub wideband_meta: WidebandMeta,
     pub address: u32,
     pub units: String,
     pub equation: ScaleEquation,
@@ -234,6 +237,7 @@ pub struct XdfFlag {
     pub id: String,
     pub title: String,
     pub description: String,
+    pub wideband_meta: WidebandMeta,
     pub address: u32,
     pub mask: u8,
     pub is_set: bool,
@@ -276,6 +280,7 @@ impl XdfDocument {
             }
         }
 
+        enrich_document_strategy_meta(&mut xdf);
         Ok(xdf)
     }
 
@@ -403,11 +408,14 @@ impl XdfDocument {
         }
 
         let values = vec![vec![0.0; x_axis.dim]; y_axis.dim];
+        let combined = format!("{} {}", title, description);
+        let wideband_meta = parse_wideband_meta(&combined);
 
         Some(XdfTable {
             id,
             title,
             description,
+            wideband_meta,
             address: table_addr,
             x_axis,
             y_axis,
@@ -440,9 +448,12 @@ impl XdfDocument {
             .and_then(|a| u32::from_str_radix(a.trim_start_matches("0x"), 16).ok())
             .unwrap_or(0);
 
+        let wideband_meta = parse_wideband_meta(&title);
+
         Some(XdfConstant {
             id,
             title,
+            wideband_meta,
             address,
             units,
             equation: ScaleEquation::parse(eq_str),
@@ -467,10 +478,14 @@ impl XdfDocument {
             .and_then(|a| u32::from_str_radix(a.trim_start_matches("0x"), 16).ok())
             .unwrap_or(0);
 
+        let combined = format!("{} {}", title, description);
+        let wideband_meta = parse_wideband_meta(&combined);
+
         Some(XdfFlag {
             id,
             title,
             description,
+            wideband_meta,
             address,
             mask,
             is_set: false,
@@ -499,7 +514,8 @@ impl XdfDocument {
         xdf.tables.push(XdfTable {
             id: "ve_main".to_string(),
             title: "Volumetric Efficiency Table (Main)".to_string(),
-            description: "Primary Speed-Density VE fuel delivery table vs RPM and MAP kPa.".to_string(),
+            description: "Primary Speed-Density VE fuel delivery table vs RPM and MAP kPa. wb-meta: manager=load; role=table".to_string(),
+            wideband_meta: WidebandMeta::default(),
             address: 0x10000,
             x_axis: XdfAxis {
                 id: 'x',
@@ -537,7 +553,8 @@ impl XdfDocument {
         xdf.tables.push(XdfTable {
             id: "spark_base".to_string(),
             title: "Base Spark Advance Table".to_string(),
-            description: "Target ignition advance in degrees BTDC.".to_string(),
+            description: "Target ignition advance in degrees BTDC. wb-meta: manager=load; role=target; depends=ve_main".to_string(),
+            wideband_meta: WidebandMeta::default(),
             address: 0x10800,
             x_axis: XdfAxis {
                 id: 'x',
@@ -580,7 +597,8 @@ impl XdfDocument {
         xdf.tables.push(XdfTable {
             id: "target_lambda".to_string(),
             title: "Target Lambda (Power Enrichment)".to_string(),
-            description: "Target equivalence ratio (Lambda). 1.0 = Stoichiometric.".to_string(),
+            description: "Target equivalence ratio (Lambda). 1.0 = Stoichiometric. wb-meta: manager=load; role=target; depends=ve_main".to_string(),
+            wideband_meta: WidebandMeta::default(),
             address: 0x11000,
             x_axis: XdfAxis {
                 id: 'x',
@@ -608,6 +626,7 @@ impl XdfDocument {
         xdf.constants.push(XdfConstant {
             id: "rev_limit".to_string(),
             title: "Hard Rev Limiter".to_string(),
+            wideband_meta: WidebandMeta::default(),
             address: 0x12000,
             units: "RPM".to_string(),
             equation: ScaleEquation::parse("X"),
@@ -616,6 +635,7 @@ impl XdfDocument {
         xdf.constants.push(XdfConstant {
             id: "speed_limiter".to_string(),
             title: "Vehicle Top Speed Limiter".to_string(),
+            wideband_meta: WidebandMeta::default(),
             address: 0x12004,
             units: "MPH".to_string(),
             equation: ScaleEquation::parse("X"),
@@ -626,7 +646,8 @@ impl XdfDocument {
         xdf.flags.push(XdfFlag {
             id: "flag_vvt_enable".to_string(),
             title: "Variable Valve Timing (VVT-i) Active".to_string(),
-            description: "Enables intake and exhaust camshaft phaser closed loop positioning.".to_string(),
+            description: "Enables intake and exhaust camshaft phaser closed loop positioning. wb-meta: manager=vvt; role=logic".to_string(),
+            wideband_meta: WidebandMeta::default(),
             address: 0x13000,
             mask: 0x01,
             is_set: true,
@@ -635,6 +656,7 @@ impl XdfDocument {
             id: "flag_cat_overheat".to_string(),
             title: "Catalytic Converter Overtemp Protection (COT)".to_string(),
             description: "Enables fuel enrichment dumping when catalytic bed temp model exceeds 890 C.".to_string(),
+            wideband_meta: WidebandMeta::default(),
             address: 0x13000,
             mask: 0x02,
             is_set: false,
@@ -642,12 +664,71 @@ impl XdfDocument {
         xdf.flags.push(XdfFlag {
             id: "flag_launch_control".to_string(),
             title: "Motorsport Launch Control (2-Step)".to_string(),
-            description: "Enables clutch/brake switch stationary RPM limiting and turbo spool strategy.".to_string(),
+            description: "Enables clutch/brake stationary RPM limiting. wb-meta: manager=boost; role=logic; depends=boost_target".to_string(),
+            wideband_meta: WidebandMeta::default(),
             address: 0x13000,
             mask: 0x04,
             is_set: true,
         });
 
+        // Boost manager demo tables (tagged via wb-meta in description)
+        let boost_rpm = vec![2000.0, 3000.0, 4000.0, 5000.0, 6000.0];
+        xdf.tables.push(XdfTable {
+            id: "boost_target".to_string(),
+            title: "Boost Target (kPa)".to_string(),
+            description: "wb-meta: manager=boost; role=target; depends=ve_main,target_lambda".to_string(),
+            wideband_meta: WidebandMeta::default(),
+            address: 0x14000,
+            x_axis: XdfAxis {
+                id: 'x',
+                dim: boost_rpm.len(),
+                address: 0x14080,
+                units: "RPM".to_string(),
+                equation: ScaleEquation::parse("X"),
+                labels: boost_rpm.clone(),
+            },
+            y_axis: XdfAxis {
+                id: 'y',
+                dim: 1,
+                address: 0,
+                units: "—".to_string(),
+                equation: ScaleEquation::parse("X"),
+                labels: vec![0.0],
+            },
+            z_equation: ScaleEquation::parse("X"),
+            z_units: "kPa".to_string(),
+            element_bits: 8,
+            values: vec![vec![110.0, 130.0, 150.0, 160.0, 160.0]],
+        });
+        xdf.tables.push(XdfTable {
+            id: "wg_duty".to_string(),
+            title: "Wastegate Duty Cycle".to_string(),
+            description: "wb-meta: manager=boost; role=actuator; depends=boost_target".to_string(),
+            wideband_meta: WidebandMeta::default(),
+            address: 0x14100,
+            x_axis: XdfAxis {
+                id: 'x',
+                dim: boost_rpm.len(),
+                address: 0x14180,
+                units: "RPM".to_string(),
+                equation: ScaleEquation::parse("X"),
+                labels: boost_rpm,
+            },
+            y_axis: XdfAxis {
+                id: 'y',
+                dim: 1,
+                address: 0,
+                units: "—".to_string(),
+                equation: ScaleEquation::parse("X"),
+                labels: vec![0.0],
+            },
+            z_equation: ScaleEquation::parse("X"),
+            z_units: "%".to_string(),
+            element_bits: 8,
+            values: vec![vec![20.0, 35.0, 50.0, 60.0, 65.0]],
+        });
+
+        enrich_document_strategy_meta(&mut xdf);
         xdf
     }
 }

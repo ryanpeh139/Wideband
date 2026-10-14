@@ -7,6 +7,8 @@ pub mod diagnostics;
 pub mod ecu_bus;
 pub mod flash_job;
 pub mod flash_layout;
+pub mod managers;
+pub mod patch_recipe;
 pub mod isotp;
 pub mod j2534;
 pub mod j2534_host;
@@ -17,6 +19,8 @@ pub mod profile_pack;
 pub mod protocols;
 pub mod security_config;
 pub mod security_session;
+pub mod strategy_meta;
+pub mod strategy_ui;
 pub mod telemetry;
 pub mod surface_mesh;
 pub mod simple_ux;
@@ -147,6 +151,22 @@ mod tests {
         assert_eq!(cuw.image.len(), 2);
         assert_eq!(cuw.image[0], 0x11);
         assert_eq!(cuw.image[1], 0x22);
+    }
+
+    #[test]
+    fn test_strategy_graph_and_patch_recipe_preview() {
+        use crate::patch_recipe::PatchRecipe;
+        use crate::strategy_meta::build_strategy_graph;
+        let xdf = XdfDocument::sample();
+        let graph = build_strategy_graph(&xdf);
+        assert!(graph.nodes.len() >= 5);
+        assert!(graph.edges.iter().any(|e| e.from_id == "ve_main"));
+
+        let recipe =
+            PatchRecipe::load(std::path::Path::new("sample-patch-recipe.json")).expect("sample recipe");
+        let rom = vec![0xFFu8; 0x20000];
+        let preview = recipe.preview(&rom, 0, &xdf).expect("preview");
+        assert!(!preview.notes.is_empty());
     }
 
     #[test]

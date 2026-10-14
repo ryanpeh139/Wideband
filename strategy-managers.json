@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "managers": [
+    {
+      "id": "boost",
+      "title": "Boost & wastegate",
+      "description": "Target pressure, WG duty, and limiters tied to induction.",
+      "match_rules": {
+        "manager_ids": ["boost"],
+        "title_contains": ["boost", "wastegate", "wg"],
+        "param_ids": ["boost_target", "wg_duty"]
+      }
+    },
+    {
+      "id": "load",
+      "title": "Load / torque / fuel",
+      "description": "VE, lambda targets, and torque-related tables.",
+      "match_rules": {
+        "manager_ids": ["load"],
+        "title_contains": ["volumetric", "lambda", "ve", "torque", "load"],
+        "param_ids": ["ve_main", "target_lambda", "spark_base"]
+      }
+    },
+    {
+      "id": "vvt",
+      "title": "VVT / cam phasing",
+      "description": "Intake/exhaust phaser targets and enable flags (stub when XDF tags present).",
+      "match_rules": {
+        "manager_ids": ["vvt"],
+        "title_contains": ["vvt", "cam", "phaser", "valve timing"],
+        "param_ids": ["flag_vvt_enable"]
+      }
+    }
+  ]
+}
