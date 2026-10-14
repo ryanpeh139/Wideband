@@ -240,26 +240,6 @@ impl SecurityKeys {
         }
     }
 
-    pub fn compute_for_profile(seed: &[u8], profile_id: &str) -> Result<Vec<u8>, String> {
-        match profile_id {
-            "tacoma-can" | "tacoma-kline" => {
-                // Default Toyota Denso bench mask
-                Self::compute_denso32(seed, 0x48546976, true)
-            }
-            "silverado-can" => {
-                // Standard Delco 32-bit key
-                Self::compute_gm(seed, 32, 2, true, 0x48546976, 0x12345678, true)
-            }
-            "silverado-vpw" => {
-                // Standard Delco 16-bit key
-                Self::compute_gm(seed, 16, 1, true, 0x4854, 0x1234, true)
-            }
-            _ => {
-                // Fallback: simple invert
-                Ok(seed.iter().map(|b| !b).collect())
-            }
-        }
-    }
 }
 
 pub struct ChecksumEngine;
@@ -296,22 +276,9 @@ impl ChecksumEngine {
         sum
     }
 
-    /// Update checksum on an active ROM buffer and verify validity
-    pub fn update_and_verify(image: &mut [u8], profile_id: &str) -> Result<String, String> {
-        if image.is_empty() {
-            return Err("ROM buffer is empty".to_string());
-        }
-
-        // Example ROM layout: store at the end of the image or at 0x7FFFC
-        let len = image.len();
-        if len >= 4 {
-            let store_idx = len - 4;
-            let sum = Self::sum32(&image[..store_idx]);
-            image[store_idx..store_idx + 4].copy_from_slice(&sum.to_be_bytes());
-            Ok(format!("Checksum Valid (Sum32: 0x{:08X} stamped for {})", sum, profile_id))
-        } else {
-            Ok("Checksum Valid (Small ROM)".to_string())
-        }
+    /// Stamp configured checksum ranges from `security-config.json` (fail-closed if none).
+    pub fn update_and_verify(image: &mut [u8], profile_id: &str, origin: i64) -> Result<String, String> {
+        crate::security_config::PlatformSecurity::stamp_image(profile_id, image, origin)
     }
 }
 
@@ -511,15 +478,17 @@ impl FlashDownload {
         }
 
         let seed = &seed_resp[2..];
-        let key = SecurityKeys::compute_for_profile(seed, &profile.id)?;
+        if !seed.iter().all(|&b| b == 0) {
+            let key = crate::security_config::PlatformSecurity::compute_key(seed, profile)?;
 
-        // Send Key 0x27 0x02
-        let mut key_req = vec![0x27, 0x02];
-        key_req.extend_from_slice(&key);
-        IsoTpLink::send(device, channel, profile.request_id, &key_req)?;
-        let key_resp = IsoTpLink::receive(device, channel, 2000)?;
-        if key_resp.is_empty() || key_resp[0] != 0x67 || key_resp[1] != 0x02 {
-            return Err(format!("Security key validation failed: {:?}", key_resp));
+            // Send Key 0x27 0x02
+            let mut key_req = vec![0x27, 0x02];
+            key_req.extend_from_slice(&key);
+            IsoTpLink::send(device, channel, profile.request_id, &key_req)?;
+            let key_resp = IsoTpLink::receive(device, channel, 2000)?;
+            if key_resp.is_empty() || key_resp[0] != 0x67 || key_resp[1] != 0x02 {
+                return Err(format!("Security key validation failed: {:?}", key_resp));
+            }
         }
 
         // Step 2: Request Download (0x34)
