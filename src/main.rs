@@ -1,6 +1,7 @@
 pub mod audit_log;
 pub mod cal_editor;
 pub mod checksum_routine;
+pub mod compare;
 pub mod definitions;
 pub mod rom_image;
 pub mod diagnostics;

@@ -79,6 +79,10 @@ pub struct WidebandApp {
     pub search_query: String,
     pub stock_tables: Vec<Vec<Vec<f64>>>,
     pub stock_constants: Vec<f64>,
+    /// Second tune decoded with the current XDF (Compare).
+    pub compare: Option<crate::compare::CompareFile>,
+    /// Cell deltas / edited markers measure against the compare file instead of stock.
+    pub diff_vs_compare: bool,
     pub stock_flags: Vec<bool>,
     pub favorites: FavoriteTables,
     pub favorites_path: PathBuf,
@@ -213,6 +217,8 @@ impl WidebandApp {
             search_query: String::new(),
             stock_tables,
             stock_constants,
+            compare: None,
+            diff_vs_compare: false,
             stock_flags,
             favorites,
             favorites_path,
@@ -438,6 +444,8 @@ impl WidebandApp {
                     self.selection_anchor = None;
                     self.table_undo.clear();
                     self.cell_entry = None;
+                    self.compare = None;
+                    self.diff_vs_compare = false;
                     self.live_trace.clear();
                     let label = path.file_name().unwrap_or_default().to_string_lossy().to_string();
                     self.xdf_path = Some(path);
@@ -1372,7 +1380,7 @@ impl WidebandApp {
                                     let is_selected = self.selected_table_idx == idx;
                                     let badge = if y_dim > 1 { "[3D]" } else { "[2D]" };
                                     let edited = self
-                                        .stock_tables
+                                        .baseline_tables()
                                         .get(idx)
                                         .map(|s| table_has_edits(&table_values, s))
                                         .unwrap_or(false);
@@ -1447,7 +1455,7 @@ impl WidebandApp {
                                     if self.favorites_only {
                                         continue;
                                     }
-                                    let basis = self.stock_constants.get(i).copied().unwrap_or(c.value);
+                                    let basis = self.baseline_constants().get(i).copied().unwrap_or(c.value);
                                     let changed = cell_changed(c.value, basis);
                                     ui.allocate_ui(Vec2::new(ui.available_width(), 28.0), |ui| {
                                         ui.horizontal_centered(|ui| {
@@ -1595,6 +1603,14 @@ impl WidebandApp {
                             self.load_xdf_from_path(path);
                         }
                     }
+                    if !beginner_mode && ui.button("Compare ROM\u{2026}").on_hover_text("Open a second ROM to diff against (same XDF)").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("ROM image", &["bin", "cuw"])
+                            .pick_file()
+                        {
+                            self.load_compare_rom(path);
+                        }
+                    }
                     if !beginner_mode && ui.button("Save ROM").clicked() {
                         let mut dialog = rfd::FileDialog::new().add_filter("ROM image", &["bin"]);
                         if let Some(p) = &self.rom_path {
@@ -1633,6 +1649,9 @@ impl WidebandApp {
                         }
                     }
                 });
+                if !beginner_mode {
+                    self.render_compare_bar(ui);
+                }
                 ui.add_space(6.0);
                 ui.separator();
                 ui.add_space(6.0);
@@ -1812,7 +1831,7 @@ impl WidebandApp {
 
     fn render_table_grid(&mut self, ui: &mut egui::Ui) {
         let table = &self.xdf.tables[self.selected_table_idx];
-        let stock = &self.stock_tables[self.selected_table_idx];
+        let stock = &self.baseline_tables()[self.selected_table_idx].clone();
         let x_labels = table.x_axis.labels.clone();
         let y_labels = table.y_axis.labels.clone();
         let rows = table.values.len();
@@ -4035,6 +4054,137 @@ impl WidebandApp {
                 self.ve_corr.show_overlay = false;
                 self.hist.result = Some(h);
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tune compare
+// ---------------------------------------------------------------------------
+
+impl WidebandApp {
+    /// Tables the grid's change markers measure against (stock as opened, or the compare file).
+    fn baseline_tables(&self) -> &[Vec<Vec<f64>>] {
+        match (&self.compare, self.diff_vs_compare) {
+            (Some(c), true) if c.tables.len() == self.xdf.tables.len() => &c.tables,
+            _ => &self.stock_tables,
+        }
+    }
+
+    fn baseline_constants(&self) -> &[f64] {
+        match (&self.compare, self.diff_vs_compare) {
+            (Some(c), true) if c.constants.len() == self.xdf.constants.len() => &c.constants,
+            _ => &self.stock_constants,
+        }
+    }
+
+    fn load_compare_rom(&mut self, path: PathBuf) {
+        let label = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        let bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => return self.log(&format!("Compare: open failed: {}", e)),
+        };
+        match RomImage::from_bytes(&ext, &bytes) {
+            Ok(img) => {
+                // Same buffer shape as the active ROM so addresses decode identically.
+                let mut buf = vec![0xFFu8; self.active_rom.len()];
+                img.load_into_buffer(&mut buf, ext != "cuw");
+                let cmp = crate::compare::CompareFile::decode(&label, &self.xdf, &buf, img.origin as i64);
+                let (t, c) = crate::compare::diff(&self.xdf, &cmp);
+                self.log(&format!(
+                    "Compare: {} — {} table(s) and {} constant(s) differ",
+                    label,
+                    t.len(),
+                    c.len()
+                ));
+                self.compare = Some(cmp);
+                self.diff_vs_compare = true;
+            }
+            Err(e) => self.log(&format!("Compare: {}", e)),
+        }
+    }
+
+    fn render_compare_bar(&mut self, ui: &mut egui::Ui) {
+        let Some(cmp) = &self.compare else {
+            return;
+        };
+        let name = cmp.name.clone();
+        let (tdiffs, cdiffs) = crate::compare::diff(&self.xdf, cmp);
+        let sel_idx = self.selected_table_idx;
+        let this_differs = tdiffs.iter().any(|d| d.table_idx == sel_idx);
+        let mut jump: Option<usize> = None;
+        let mut copy_table = false;
+        let mut close = false;
+
+        egui::Frame::none()
+            .fill(ACCENT_CYAN.gamma_multiply(0.06))
+            .stroke(Stroke::new(1.0, ACCENT_CYAN.gamma_multiply(0.5)))
+            .rounding(egui::Rounding::same(4.0))
+            .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(format!("Comparing with {}", name)).strong().color(ACCENT_CYAN));
+                    ui.label(egui::RichText::new("Deltas vs").color(MUTED));
+                    ui.selectable_value(&mut self.diff_vs_compare, true, "Compare file");
+                    ui.selectable_value(&mut self.diff_vs_compare, false, "Stock (as opened)");
+                    ui.label(
+                        egui::RichText::new(format!("{} tables, {} constants differ", tdiffs.len(), cdiffs.len()))
+                            .color(if tdiffs.is_empty() && cdiffs.is_empty() { EMERALD } else { Color32::from_rgb(255, 214, 0) }),
+                    );
+                    if ui
+                        .add_enabled(this_differs, egui::Button::new("Copy this table from compare"))
+                        .on_hover_text("Replace the current table with the compare file's values (undoable)")
+                        .clicked()
+                    {
+                        copy_table = true;
+                    }
+                    if ui.button("Close compare").clicked() {
+                        close = true;
+                    }
+                });
+                if !tdiffs.is_empty() || !cdiffs.is_empty() {
+                    egui::CollapsingHeader::new(egui::RichText::new("Differences").small().color(MUTED))
+                        .id_salt("compare_list")
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                                for d in &tdiffs {
+                                    let text = format!(
+                                        "{}  \u{2014}  {}/{} cells, max \u{0394} {:.2}",
+                                        d.title, d.changed_cells, d.total_cells, d.max_abs_delta
+                                    );
+                                    if ui.selectable_label(d.table_idx == sel_idx, text).clicked() {
+                                        jump = Some(d.table_idx);
+                                    }
+                                }
+                                for c in &cdiffs {
+                                    ui.label(format!("{}: {:.2} (compare {:.2})", c.title, c.current, c.compare));
+                                }
+                            });
+                        });
+                }
+            });
+
+        if let Some(i) = jump {
+            self.selected_table_idx = i;
+            self.active_cell = (0, 0);
+            self.selection_anchor = None;
+            self.live_trace.clear();
+        }
+        if copy_table {
+            if let Some(src) = self.compare.as_ref().and_then(|c| c.tables.get(sel_idx)).cloned() {
+                self.edit_selected_table("copy table from compare", |v, _| {
+                    for (row, srow) in v.iter_mut().zip(src.iter()) {
+                        for (cell, s) in row.iter_mut().zip(srow.iter()) {
+                            *cell = *s;
+                        }
+                    }
+                });
+            }
+        }
+        if close {
+            self.compare = None;
+            self.diff_vs_compare = false;
         }
     }
 }
