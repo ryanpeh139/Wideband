@@ -207,6 +207,8 @@ pub struct XdfAxis {
     /// Breakpoints live in the ROM at `address` (XDF EMBEDDEDDATA, no static LABELs):
     /// re-read on every ROM bind so a newly opened ROM shows its own RPM/load axes.
     pub rom_backed: bool,
+    /// Cell encoding of the breakpoints in the ROM.
+    pub format: CellFormat,
 }
 
 #[derive(Clone, Debug)]
@@ -221,6 +223,8 @@ pub struct XdfTable {
     pub z_equation: ScaleEquation,
     pub z_units: String,
     pub element_bits: u8,
+    /// Cell encoding (size, sign, byte order, layout, strides) from the Z axis EMBEDDEDDATA.
+    pub format: CellFormat,
     pub values: Vec<Vec<f64>>,
 }
 
@@ -233,6 +237,7 @@ pub struct XdfConstant {
     pub units: String,
     pub equation: ScaleEquation,
     pub value: f64,
+    pub format: CellFormat,
 }
 
 #[derive(Clone, Debug)]
@@ -252,6 +257,8 @@ pub struct XdfDocument {
     pub tables: Vec<XdfTable>,
     pub constants: Vec<XdfConstant>,
     pub flags: Vec<XdfFlag>,
+    /// Problems found while parsing (unsupported cell formats etc.), shown to the user on load.
+    pub warnings: Vec<String>,
 }
 
 impl XdfDocument {
@@ -283,6 +290,23 @@ impl XdfDocument {
             }
         }
 
+        for t in &xdf.tables {
+            if let Err(e) = t.format.check() {
+                xdf.warnings.push(format!("Table \"{}\" is read-only: {}", t.title, e));
+            }
+            for a in [&t.x_axis, &t.y_axis] {
+                if a.rom_backed {
+                    if let Err(e) = a.format.check() {
+                        xdf.warnings.push(format!("Table \"{}\" {} axis not read: {}", t.title, a.id, e));
+                    }
+                }
+            }
+        }
+        for c in &xdf.constants {
+            if let Err(e) = c.format.check() {
+                xdf.warnings.push(format!("Constant \"{}\" is read-only: {}", c.title, e));
+            }
+        }
         enrich_document_strategy_meta(&mut xdf);
         Ok(xdf)
     }
@@ -300,7 +324,7 @@ impl XdfDocument {
             read_table_from_rom(rom, origin, table);
         }
         for constant in &mut self.constants {
-            if let Some(v) = read_scalar_u8(rom, origin, constant.address, &constant.equation) {
+            if let Some(v) = read_cell(rom, origin, constant.address, 0, &constant.format, &constant.equation) {
                 constant.value = v;
             }
         }
@@ -333,12 +357,12 @@ impl XdfDocument {
     }
 
     pub fn write_constant_to_rom(&self, rom: &mut [u8], origin: i64, constant: &XdfConstant) -> bool {
-        write_scalar_u8(rom, origin, constant.address, &constant.equation, constant.value)
+        write_cell(rom, origin, constant.address, 0, &constant.format, &constant.equation, constant.value)
     }
 
     pub fn write_all_constants_to_rom(&self, rom: &mut [u8], origin: i64) {
         for constant in &self.constants {
-            write_scalar_u8(rom, origin, constant.address, &constant.equation, constant.value);
+            write_cell(rom, origin, constant.address, 0, &constant.format, &constant.equation, constant.value);
         }
     }
 
@@ -367,6 +391,7 @@ impl XdfDocument {
             equation: ScaleEquation::parse("X"),
             labels: Vec::new(),
             rom_backed: false,
+            format: CellFormat::default(),
         };
         let mut y_axis = XdfAxis {
             id: 'y',
@@ -376,11 +401,13 @@ impl XdfDocument {
             equation: ScaleEquation::parse("X"),
             labels: Vec::new(),
             rom_backed: false,
+            format: CellFormat::default(),
         };
         let mut z_equation = ScaleEquation::parse("X");
         let mut z_units = "VE %".to_string();
         let mut table_addr = 0u32;
         let mut element_bits = 8u8;
+        let mut z_format = CellFormat::default();
 
         for axis_node in node.children().filter(|n| n.has_tag_name("XDFAXIS")) {
             let axis_id = axis_node.attribute("id").unwrap_or("x");
@@ -394,6 +421,7 @@ impl XdfDocument {
             let labels = parse_axis_labels(&axis_node, dim);
             let has_static_labels = axis_node.children().any(|n| n.has_tag_name("LABEL"));
 
+            let fmt = CellFormat::from_embedded(&axis_node);
             let axis = XdfAxis {
                 id: axis_id.chars().next().unwrap_or('x'),
                 dim,
@@ -402,6 +430,7 @@ impl XdfDocument {
                 equation: ScaleEquation::parse(eq_str),
                 labels,
                 rom_backed: addr != 0 && !has_static_labels,
+                format: fmt,
             };
 
             match axis_id {
@@ -414,6 +443,7 @@ impl XdfDocument {
                     z_equation = ScaleEquation::parse(eq_str);
                     z_units = units.clone();
                     element_bits = Self::embedded_element_bits(&axis_node).unwrap_or(8);
+                    z_format = fmt;
                 }
                 _ => {}
             }
@@ -438,6 +468,7 @@ impl XdfDocument {
             z_equation,
             z_units,
             element_bits,
+            format: z_format,
             values,
         })
     }
@@ -474,6 +505,7 @@ impl XdfDocument {
             units,
             equation: ScaleEquation::parse(eq_str),
             value: 6500.0, // Default rev limiter scalar
+            format: CellFormat::from_embedded(node),
         })
     }
 
@@ -541,6 +573,7 @@ impl XdfDocument {
                 equation: ScaleEquation::parse("X"),
                 labels: x_rpm,
                 rom_backed: false,
+                format: CellFormat::default(),
             },
             y_axis: XdfAxis {
                 id: 'y',
@@ -550,10 +583,12 @@ impl XdfDocument {
                 equation: ScaleEquation::parse("X"),
                 labels: y_map,
                 rom_backed: false,
+                format: CellFormat::default(),
             },
             z_equation: ScaleEquation::parse("X * 0.1"),
             z_units: "%".to_string(),
             element_bits: 8,
+            format: CellFormat::default(),
             values: ve_values,
         });
 
@@ -582,6 +617,7 @@ impl XdfDocument {
                 equation: ScaleEquation::parse("X"),
                 labels: spark_rpm,
                 rom_backed: false,
+                format: CellFormat::default(),
             },
             y_axis: XdfAxis {
                 id: 'y',
@@ -591,10 +627,12 @@ impl XdfDocument {
                 equation: ScaleEquation::parse("X"),
                 labels: spark_load,
                 rom_backed: false,
+                format: CellFormat::default(),
             },
             z_equation: ScaleEquation::parse("X * 0.25"),
             z_units: "deg BTDC".to_string(),
             element_bits: 8,
+            format: CellFormat::default(),
             values: spark_values,
         });
 
@@ -628,6 +666,7 @@ impl XdfDocument {
                 equation: ScaleEquation::parse("X"),
                 labels: lambda_rpm,
                 rom_backed: false,
+                format: CellFormat::default(),
             },
             y_axis: XdfAxis {
                 id: 'y',
@@ -637,10 +676,12 @@ impl XdfDocument {
                 equation: ScaleEquation::parse("X"),
                 labels: lambda_map,
                 rom_backed: false,
+                format: CellFormat::default(),
             },
             z_equation: ScaleEquation::parse("X * 0.0078125"),
             z_units: "Lambda".to_string(),
             element_bits: 8,
+            format: CellFormat::default(),
             values: lambda_values,
         });
 
@@ -653,6 +694,7 @@ impl XdfDocument {
             units: "RPM".to_string(),
             equation: ScaleEquation::parse("X"),
             value: 6500.0,
+            format: CellFormat::default(),
         });
         xdf.constants.push(XdfConstant {
             id: "speed_limiter".to_string(),
@@ -662,6 +704,7 @@ impl XdfDocument {
             units: "MPH".to_string(),
             equation: ScaleEquation::parse("X"),
             value: 115.0,
+            format: CellFormat::default(),
         });
 
         // Flags
@@ -709,6 +752,7 @@ impl XdfDocument {
                 equation: ScaleEquation::parse("X"),
                 labels: boost_rpm.clone(),
                 rom_backed: false,
+                format: CellFormat::default(),
             },
             y_axis: XdfAxis {
                 id: 'y',
@@ -718,10 +762,12 @@ impl XdfDocument {
                 equation: ScaleEquation::parse("X"),
                 labels: vec![0.0],
                 rom_backed: false,
+                format: CellFormat::default(),
             },
             z_equation: ScaleEquation::parse("X"),
             z_units: "kPa".to_string(),
             element_bits: 8,
+            format: CellFormat::default(),
             values: vec![vec![110.0, 130.0, 150.0, 160.0, 160.0]],
         });
         xdf.tables.push(XdfTable {
@@ -738,6 +784,7 @@ impl XdfDocument {
                 equation: ScaleEquation::parse("X"),
                 labels: boost_rpm,
                 rom_backed: false,
+                format: CellFormat::default(),
             },
             y_axis: XdfAxis {
                 id: 'y',
@@ -747,10 +794,12 @@ impl XdfDocument {
                 equation: ScaleEquation::parse("X"),
                 labels: vec![0.0],
                 rom_backed: false,
+                format: CellFormat::default(),
             },
             z_equation: ScaleEquation::parse("X"),
             z_units: "%".to_string(),
             element_bits: 8,
+            format: CellFormat::default(),
             values: vec![vec![20.0, 35.0, 50.0, 60.0, 65.0]],
         });
 
@@ -836,22 +885,40 @@ fn parse_axis_labels(axis_node: &roxmltree::Node, dim: usize) -> Vec<f64> {
 }
 
 fn read_axis_labels_from_rom(rom: &[u8], origin: i64, axis: &mut XdfAxis) {
-    if axis.address == 0 || axis.dim == 0 {
+    if axis.address == 0 || axis.dim == 0 || axis.format.check().is_err() {
         return;
     }
     let mut labels = Vec::with_capacity(axis.dim);
     for i in 0..axis.dim {
-        let addr = axis.address + i as u32;
-        let v = read_scalar_u8(rom, origin, addr, &axis.equation).unwrap_or(i as f64);
+        let off = axis.format.offset_1d(i);
+        let v = read_cell(rom, origin, axis.address, off, &axis.format, &axis.equation).unwrap_or(i as f64);
         labels.push(v);
     }
     axis.labels = labels;
 }
 
-fn read_scalar_u8(rom: &[u8], origin: i64, address: u32, equation: &ScaleEquation) -> Option<f64> {
-    let idx = locate(rom, origin, address as i64)?;
-    let raw = rom[idx] as f64;
-    Some(equation.evaluate(raw))
+/// Decode one cell at `base + offset` and apply the scaling equation.
+fn read_cell(rom: &[u8], origin: i64, base: u32, offset: usize, fmt: &CellFormat, eq: &ScaleEquation) -> Option<f64> {
+    fmt.check().ok()?;
+    let idx = locate(rom, origin, base as i64 + offset as i64)?;
+    let raw = fmt.read_raw(rom, idx)?;
+    Some(eq.evaluate(raw))
+}
+
+/// Invert the equation, round and clamp to the cell's integer range, then encode.
+fn write_cell(rom: &mut [u8], origin: i64, base: u32, offset: usize, fmt: &CellFormat, eq: &ScaleEquation, engineering: f64) -> bool {
+    if fmt.check().is_err() {
+        return false;
+    }
+    let Some(idx) = locate(rom, origin, base as i64 + offset as i64) else {
+        return false;
+    };
+    let (lo, hi) = fmt.raw_range();
+    let raw = eq.invert(engineering);
+    if !raw.is_finite() {
+        return false;
+    }
+    fmt.write_raw(rom, idx, raw.round().clamp(lo, hi))
 }
 
 fn read_table_from_rom(rom: &[u8], origin: i64, table: &mut XdfTable) {
@@ -865,9 +932,8 @@ fn read_table_from_rom(rom: &[u8], origin: i64, table: &mut XdfTable) {
             table.values[r] = vec![0.0; cols];
         }
         for c in 0..cols {
-            let offset = (r * cols + c) as u32;
-            let addr = table.address + offset;
-            if let Some(v) = read_scalar_u8(rom, origin, addr, &table.z_equation) {
+            let off = table.format.offset_2d(r, c, rows, cols);
+            if let Some(v) = read_cell(rom, origin, table.address, off, &table.format, &table.z_equation) {
                 table.values[r][c] = (v * 100.0).round() / 100.0;
             }
         }
@@ -876,7 +942,7 @@ fn read_table_from_rom(rom: &[u8], origin: i64, table: &mut XdfTable) {
 
 fn write_table_to_rom(rom: &mut [u8], origin: i64, table: &XdfTable) -> bool {
     let rows = table.values.len();
-    if rows == 0 {
+    if rows == 0 || table.format.check().is_err() {
         return false;
     }
     let cols = table.values[0].len();
@@ -885,9 +951,8 @@ fn write_table_to_rom(rom: &mut [u8], origin: i64, table: &XdfTable) -> bool {
             if c >= table.values[r].len() {
                 continue;
             }
-            let offset = (r * cols + c) as u32;
-            let addr = table.address + offset;
-            if !write_scalar_u8(rom, origin, addr, &table.z_equation, table.values[r][c]) {
+            let off = table.format.offset_2d(r, c, rows, cols);
+            if !write_cell(rom, origin, table.address, off, &table.format, &table.z_equation, table.values[r][c]) {
                 return false;
             }
         }
@@ -895,19 +960,253 @@ fn write_table_to_rom(rom: &mut [u8], origin: i64, table: &XdfTable) -> bool {
     true
 }
 
-fn write_scalar_u8(
-    rom: &mut [u8],
-    origin: i64,
-    address: u32,
-    equation: &ScaleEquation,
-    engineering: f64,
-) -> bool {
-    let Some(idx) = locate(rom, origin, address as i64) else {
-        return false;
-    };
-    let raw = equation.invert(engineering).round().clamp(0.0, 255.0) as u8;
-    rom[idx] = raw;
-    true
+/// TunerPro `EMBEDDEDDATA` cell encoding.
+///
+/// `mmedtypeflags` bits handled: 0x01 signed, 0x02 LSB-first (little-endian), 0x04 column-major.
+/// Any other bit (e.g. floating point) is reported by [`CellFormat::check`] and the item is left
+/// read-only rather than decoded wrongly. Strides are in bits; 0 = packed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CellFormat {
+    pub bits: u8,
+    pub signed: bool,
+    pub lsb_first: bool,
+    pub column_major: bool,
+    pub major_stride_bits: u32,
+    pub minor_stride_bits: u32,
+    pub unknown_flags: u32,
+}
+
+impl Default for CellFormat {
+    fn default() -> Self {
+        Self {
+            bits: 8,
+            signed: false,
+            lsb_first: false,
+            column_major: false,
+            major_stride_bits: 0,
+            minor_stride_bits: 0,
+            unknown_flags: 0,
+        }
+    }
+}
+
+const FLAG_SIGNED: u32 = 0x01;
+const FLAG_LSB_FIRST: u32 = 0x02;
+const FLAG_COLUMN_MAJOR: u32 = 0x04;
+
+fn parse_num(text: Option<&str>) -> Option<u32> {
+    let t = text?.trim();
+    if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        u32::from_str_radix(h, 16).ok()
+    } else {
+        t.parse().ok()
+    }
+}
+
+impl CellFormat {
+    /// Read the `EMBEDDEDDATA` child of `node` (axis, table or constant).
+    pub fn from_embedded(node: &roxmltree::Node) -> Self {
+        let Some(d) = node.children().find(|n| n.has_tag_name("EMBEDDEDDATA")) else {
+            return Self::default();
+        };
+        let flags = parse_num(d.attribute("mmedtypeflags")).unwrap_or(0);
+        Self {
+            bits: parse_num(d.attribute("mmedelementsizebits")).unwrap_or(8).min(255) as u8,
+            signed: flags & FLAG_SIGNED != 0,
+            lsb_first: flags & FLAG_LSB_FIRST != 0,
+            column_major: flags & FLAG_COLUMN_MAJOR != 0,
+            major_stride_bits: parse_num(d.attribute("mmedmajorstridebits")).unwrap_or(0),
+            minor_stride_bits: parse_num(d.attribute("mmedminorstridebits")).unwrap_or(0),
+            unknown_flags: flags & !(FLAG_SIGNED | FLAG_LSB_FIRST | FLAG_COLUMN_MAJOR),
+        }
+    }
+
+    /// `Err` when this encoding can't be decoded faithfully (caller must not read/write it).
+    pub fn check(&self) -> Result<(), String> {
+        if !matches!(self.bits, 8 | 16 | 32) {
+            return Err(format!("{}-bit cells are not supported", self.bits));
+        }
+        if self.unknown_flags != 0 {
+            return Err(format!("unsupported mmedtypeflags 0x{:X}", self.unknown_flags));
+        }
+        if self.major_stride_bits % 8 != 0 || self.minor_stride_bits % 8 != 0 {
+            return Err("non-byte-aligned stride".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn bytes(&self) -> usize {
+        (self.bits as usize / 8).max(1)
+    }
+
+    fn minor_step(&self) -> usize {
+        if self.minor_stride_bits > 0 {
+            self.minor_stride_bits as usize / 8
+        } else {
+            self.bytes()
+        }
+    }
+
+    /// Byte offset of element `i` in a 1-D run (axis breakpoints).
+    pub fn offset_1d(&self, i: usize) -> usize {
+        i * self.minor_step()
+    }
+
+    /// Byte offset of cell (r, c) in a rows x cols block, honouring order and strides.
+    pub fn offset_2d(&self, r: usize, c: usize, rows: usize, cols: usize) -> usize {
+        let minor = self.minor_step();
+        if self.column_major {
+            let major = if self.major_stride_bits > 0 { self.major_stride_bits as usize / 8 } else { rows * minor };
+            c * major + r * minor
+        } else {
+            let major = if self.major_stride_bits > 0 { self.major_stride_bits as usize / 8 } else { cols * minor };
+            r * major + c * minor
+        }
+    }
+
+    pub fn raw_range(&self) -> (f64, f64) {
+        let b = self.bits as u32;
+        if self.signed {
+            (-(2f64.powi(b as i32 - 1)), 2f64.powi(b as i32 - 1) - 1.0)
+        } else {
+            (0.0, 2f64.powi(b as i32) - 1.0)
+        }
+    }
+
+    fn read_raw(&self, rom: &[u8], idx: usize) -> Option<f64> {
+        let n = self.bytes();
+        let bytes = rom.get(idx..idx + n)?;
+        let mut u: u64 = 0;
+        for k in 0..n {
+            let b = if self.lsb_first { bytes[n - 1 - k] } else { bytes[k] };
+            u = (u << 8) | b as u64;
+        }
+        if self.signed {
+            let shift = 64 - 8 * n as u32;
+            Some(((u << shift) as i64 >> shift) as f64)
+        } else {
+            Some(u as f64)
+        }
+    }
+
+    fn write_raw(&self, rom: &mut [u8], idx: usize, raw: f64) -> bool {
+        let n = self.bytes();
+        let Some(dst) = rom.get_mut(idx..idx + n) else {
+            return false;
+        };
+        let u = (raw as i64) as u64;
+        for k in 0..n {
+            let b = (u >> (8 * (n - 1 - k))) as u8;
+            if self.lsb_first {
+                dst[n - 1 - k] = b;
+            } else {
+                dst[k] = b;
+            }
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod cell_codec_tests {
+    use super::*;
+
+    fn xdf_16bit(flags: &str) -> String {
+        format!(
+            r#"<XDFFORMAT version="1.60"><XDFHEADER><deftitle>t</deftitle></XDFHEADER>
+<XDFTABLE uniqueid="ve16"><title>VE 16-bit</title>
+<XDFAXIS id="x"><indexcount>2</indexcount><units>RPM</units><MATH equation="X" />
+  <EMBEDDEDDATA mmedaddress="0x40" mmedelementsizebits="16" {f} /></XDFAXIS>
+<XDFAXIS id="y"><indexcount>2</indexcount><units>kPa</units><MATH equation="X / 10" />
+  <EMBEDDEDDATA mmedaddress="0x50" mmedelementsizebits="16" {f} /></XDFAXIS>
+<XDFAXIS id="z"><units>%</units><MATH equation="X / 128" />
+  <EMBEDDEDDATA mmedaddress="0x10" mmedelementsizebits="16" {f} /></XDFAXIS>
+</XDFTABLE>
+<XDFCONSTANT uniqueid="revlim"><title>Rev limit</title><units>RPM</units><MATH equation="X" />
+  <EMBEDDEDDATA mmedaddress="0x60" mmedelementsizebits="16" {f} /></XDFCONSTANT>
+</XDFFORMAT>"#,
+            f = flags
+        )
+    }
+
+    #[test]
+    fn reads_16bit_big_endian_denso_style() {
+        let mut doc = XdfDocument::parse(&xdf_16bit("")).unwrap();
+        assert!(doc.warnings.is_empty(), "{:?}", doc.warnings);
+        let mut rom = vec![0u8; 0x80];
+        // Z cells (row-major, BE): 85.5 % * 128 = 10944 = 0x2AC0 ...
+        for (i, raw) in [10944u16, 11008, 12800, 6400].iter().enumerate() {
+            rom[0x10 + i * 2..0x12 + i * 2].copy_from_slice(&raw.to_be_bytes());
+        }
+        rom[0x40..0x44].copy_from_slice(&[0x0B, 0xB8, 0x17, 0x70]); // 3000, 6000 rpm
+        rom[0x50..0x54].copy_from_slice(&[0x01, 0x90, 0x03, 0xE8]); // 400/10, 1000/10 kPa
+        rom[0x60..0x62].copy_from_slice(&7200u16.to_be_bytes());
+        doc.bind_from_rom(&rom, 0);
+        let t = &doc.tables[0];
+        assert_eq!(t.values, vec![vec![85.5, 86.0], vec![100.0, 50.0]]);
+        assert_eq!(t.x_axis.labels, vec![3000.0, 6000.0]);
+        assert_eq!(t.y_axis.labels, vec![40.0, 100.0]);
+        assert_eq!(doc.constants[0].value, 7200.0, "rev limit above 255 needs 16-bit");
+    }
+
+    #[test]
+    fn write_roundtrips_16bit_and_clamps_to_range() {
+        let mut doc = XdfDocument::parse(&xdf_16bit("")).unwrap();
+        let mut rom = vec![0u8; 0x80];
+        doc.tables[0].values = vec![vec![90.0, 600.0], vec![-5.0, 42.25]];
+        assert!(doc.write_table_to_rom(&mut rom, 0, 0));
+        doc.reload_table_from_rom(&rom, 0, 0);
+        // 600 % * 128 = 76800 > 65535 => clamped to 65535/128; -5 => 0.
+        assert_eq!(doc.tables[0].values, vec![vec![90.0, 511.99], vec![0.0, 42.25]]);
+    }
+
+    #[test]
+    fn signed_little_endian() {
+        let xml = xdf_16bit(r#"mmedtypeflags="0x03""#);
+        let mut doc = XdfDocument::parse(&xml).unwrap();
+        let mut rom = vec![0u8; 0x80];
+        rom[0x10..0x12].copy_from_slice(&(-256i16).to_le_bytes());
+        doc.bind_from_rom(&rom, 0);
+        assert_eq!(doc.tables[0].values[0][0], -2.0);
+        doc.tables[0].values[0][0] = -1.5;
+        assert!(doc.write_table_to_rom(&mut rom, 0, 0));
+        assert_eq!(i16::from_le_bytes([rom[0x10], rom[0x11]]), -192);
+    }
+
+    #[test]
+    fn column_major_layout() {
+        let xml = xdf_16bit(r#"mmedtypeflags="0x04""#);
+        let mut doc = XdfDocument::parse(&xml).unwrap();
+        let mut rom = vec![0u8; 0x80];
+        // Column-major: [r0c0, r1c0, r0c1, r1c1]
+        for (i, raw) in [128u16, 256, 384, 512].iter().enumerate() {
+            rom[0x10 + i * 2..0x12 + i * 2].copy_from_slice(&raw.to_be_bytes());
+        }
+        doc.bind_from_rom(&rom, 0);
+        assert_eq!(doc.tables[0].values, vec![vec![1.0, 3.0], vec![2.0, 4.0]]);
+    }
+
+    #[test]
+    fn unknown_flags_make_table_read_only_with_warning() {
+        let xml = xdf_16bit(r#"mmedtypeflags="0x10000""#);
+        let mut doc = XdfDocument::parse(&xml).unwrap();
+        assert!(doc.warnings.iter().any(|w| w.contains("read-only")), "{:?}", doc.warnings);
+        let mut rom = vec![0xAAu8; 0x80];
+        let before = rom.clone();
+        doc.tables[0].values = vec![vec![1.0; 2]; 2];
+        assert!(!doc.write_table_to_rom(&mut rom, 0, 0));
+        assert_eq!(rom, before, "nothing written for an undecodable format");
+    }
+
+    #[test]
+    fn eight_bit_default_unchanged() {
+        let xml = std::fs::read_to_string("tests/fixtures/tacoma-bench-table.xdf").unwrap();
+        let mut doc = XdfDocument::parse(&xml).unwrap();
+        let mut rom = vec![0u8; 0x200];
+        rom[0x100] = 77;
+        doc.bind_from_rom(&rom, 0);
+        assert_eq!(doc.tables[0].values[0][0], 77.0);
+    }
 }
 
 #[cfg(test)]
