@@ -79,6 +79,10 @@ pub struct WidebandApp {
     pub search_query: String,
     pub stock_tables: Vec<Vec<Vec<f64>>>,
     pub stock_constants: Vec<f64>,
+    /// Second tune decoded with the current XDF (Compare).
+    pub compare: Option<crate::compare::CompareFile>,
+    /// Cell deltas / edited markers measure against the compare file instead of stock.
+    pub diff_vs_compare: bool,
     pub stock_flags: Vec<bool>,
     pub favorites: FavoriteTables,
     pub favorites_path: PathBuf,
@@ -89,8 +93,18 @@ pub struct WidebandApp {
     /// True while a drag-select started in the grid is in progress.
     grid_drag_select: bool,
     pub table_undo: UndoStack,
+    /// Typed value being entered for the selection (None = not typing).
+    pub cell_entry: Option<String>,
+    /// How Ctrl+V combines clipboard cells (paste special).
+    pub paste_mode: table_edit::PasteMode,
     /// Log-based VE correction state (panel above the grid).
     pub ve_corr: VeCorrectionUi,
+    pub hist: HistogramUi,
+    /// Scanner dashboard gauges (dashboard.json).
+    pub dashboard: crate::gauges::Dashboard,
+    pub dash_editing: bool,
+    /// Free-text notes saved inside the .wbtune file.
+    pub tune_notes: String,
     /// Live operating point on the selected table (separate from the edit selection).
     pub live_trace: live_trace::LiveTrace,
     pub math_amount: f64,
@@ -208,6 +222,8 @@ impl WidebandApp {
             search_query: String::new(),
             stock_tables,
             stock_constants,
+            compare: None,
+            diff_vs_compare: false,
             stock_flags,
             favorites,
             favorites_path,
@@ -216,7 +232,17 @@ impl WidebandApp {
             selection_anchor: None,
             grid_drag_select: false,
             table_undo: UndoStack::default(),
+            cell_entry: None,
+            paste_mode: table_edit::PasteMode::Replace,
             ve_corr: VeCorrectionUi::default(),
+            hist: HistogramUi::default(),
+            dashboard: {
+                let ids: Vec<String> = TelemetryChannelFile::load_default().channels.iter().map(|c| c.id.clone()).collect();
+                crate::gauges::Dashboard::load(&crate::gauges::Dashboard::default_path())
+                    .unwrap_or_else(|_| crate::gauges::Dashboard::default_layout(&ids))
+            },
+            dash_editing: false,
+            tune_notes: String::new(),
             live_trace: live_trace::LiveTrace::default(),
             math_amount: 5.0,
             checksum_status: CHECKSUM_VALID.to_string(),
@@ -429,6 +455,9 @@ impl WidebandApp {
                     self.active_cell = (0, 0);
                     self.selection_anchor = None;
                     self.table_undo.clear();
+                    self.cell_entry = None;
+                    self.compare = None;
+                    self.diff_vs_compare = false;
                     self.live_trace.clear();
                     let label = path.file_name().unwrap_or_default().to_string_lossy().to_string();
                     self.xdf_path = Some(path);
@@ -1363,7 +1392,7 @@ impl WidebandApp {
                                     let is_selected = self.selected_table_idx == idx;
                                     let badge = if y_dim > 1 { "[3D]" } else { "[2D]" };
                                     let edited = self
-                                        .stock_tables
+                                        .baseline_tables()
                                         .get(idx)
                                         .map(|s| table_has_edits(&table_values, s))
                                         .unwrap_or(false);
@@ -1438,7 +1467,7 @@ impl WidebandApp {
                                     if self.favorites_only {
                                         continue;
                                     }
-                                    let basis = self.stock_constants.get(i).copied().unwrap_or(c.value);
+                                    let basis = self.baseline_constants().get(i).copied().unwrap_or(c.value);
                                     let changed = cell_changed(c.value, basis);
                                     ui.allocate_ui(Vec2::new(ui.available_width(), 28.0), |ui| {
                                         ui.horizontal_centered(|ui| {
@@ -1586,6 +1615,33 @@ impl WidebandApp {
                             self.load_xdf_from_path(path);
                         }
                     }
+                    if !beginner_mode && ui.button("Open Tune\u{2026}").on_hover_text("Open a .wbtune (ROM + definition + notes)").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Wideband tune", &[crate::tune_file::EXTENSION])
+                            .pick_file()
+                        {
+                            self.open_tune(path);
+                        }
+                    }
+                    if !beginner_mode && ui.button("Save Tune\u{2026}").on_hover_text("Save ROM + definition reference + vehicle + notes as .wbtune").clicked() {
+                        let mut dialog = rfd::FileDialog::new().add_filter("Wideband tune", &[crate::tune_file::EXTENSION]);
+                        if let Some(p) = &self.rom_path {
+                            if let Some(stem) = p.file_stem() {
+                                dialog = dialog.set_file_name(format!("{}.{}", stem.to_string_lossy(), crate::tune_file::EXTENSION));
+                            }
+                        }
+                        if let Some(path) = dialog.save_file() {
+                            self.save_tune(path);
+                        }
+                    }
+                    if !beginner_mode && ui.button("Compare ROM\u{2026}").on_hover_text("Open a second ROM to diff against (same XDF)").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("ROM image", &["bin", "cuw"])
+                            .pick_file()
+                        {
+                            self.load_compare_rom(path);
+                        }
+                    }
                     if !beginner_mode && ui.button("Save ROM").clicked() {
                         let mut dialog = rfd::FileDialog::new().add_filter("ROM image", &["bin"]);
                         if let Some(p) = &self.rom_path {
@@ -1624,6 +1680,19 @@ impl WidebandApp {
                         }
                     }
                 });
+                if !beginner_mode {
+                    self.render_compare_bar(ui);
+                    egui::CollapsingHeader::new(egui::RichText::new("Tune notes").small().color(MUTED))
+                        .id_salt("tune_notes")
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut self.tune_notes)
+                                    .desired_rows(3)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("What changed, fuel used, mods, dyno numbers\u{2026} (saved in the .wbtune)"),
+                            );
+                        });
+                }
                 ui.add_space(6.0);
                 ui.separator();
                 ui.add_space(6.0);
@@ -1749,6 +1818,13 @@ impl WidebandApp {
                     {
                         self.redo_table_edit();
                     }
+                    egui::ComboBox::from_id_salt("paste_mode")
+                        .selected_text(format!("Ctrl+V: {}", self.paste_mode.label()))
+                        .show_ui(ui, |ui| {
+                            for m in [table_edit::PasteMode::Replace, table_edit::PasteMode::Add, table_edit::PasteMode::MultiplyPercent] {
+                                ui.selectable_value(&mut self.paste_mode, m, m.label());
+                            }
+                        });
                     let sel = self.selection();
                     let (r0, r1, c0, c1) = sel.bounds();
                     ui.label(
@@ -1760,36 +1836,25 @@ impl WidebandApp {
                         .small()
                         .color(MUTED),
                     );
+                    if let Some(buf) = &self.cell_entry {
+                        ui.label(
+                            egui::RichText::new(format!("Set to: {}\u{258F}  (Enter = apply, Esc = cancel)", buf))
+                                .monospace()
+                                .strong()
+                                .color(ACCENT_CYAN),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new("Type a value + Enter \u{00B7} + - * / step \u{00B7} arrows \u{00B7} Ctrl+C/V")
+                                .small()
+                                .color(MUTED),
+                        );
+                    }
                 });
 
-                // Keyboard: undo/redo, select all, Esc to collapse the selection.
-                if !ui.ctx().wants_keyboard_input() {
-                    let (undo, redo, all, esc) = ui.input(|i| {
-                        let cmd = i.modifiers.command;
-                        (
-                            cmd && !i.modifiers.shift && i.key_pressed(egui::Key::Z),
-                            cmd && (i.key_pressed(egui::Key::Y) || (i.modifiers.shift && i.key_pressed(egui::Key::Z))),
-                            cmd && i.key_pressed(egui::Key::A),
-                            i.key_pressed(egui::Key::Escape),
-                        )
-                    });
-                    if undo {
-                        self.undo_table_edit();
-                    }
-                    if redo {
-                        self.redo_table_edit();
-                    }
-                    if all {
-                        let t = &self.xdf.tables[self.selected_table_idx];
-                        let (rows, cols) = (t.values.len(), t.values.first().map_or(0, |r| r.len()));
-                        self.selection_anchor = Some((0, 0));
-                        self.active_cell = (rows.saturating_sub(1), cols.saturating_sub(1));
-                    }
-                    if esc {
-                        self.selection_anchor = None;
-                    }
-                }
+                self.handle_grid_keyboard(ui);
                 if !beginner_mode {
+                    self.render_histogram_panel(ui);
                     self.render_ve_correction_panel(ui);
                 }
                 ui.add_space(8.0);
@@ -1807,7 +1872,7 @@ impl WidebandApp {
 
     fn render_table_grid(&mut self, ui: &mut egui::Ui) {
         let table = &self.xdf.tables[self.selected_table_idx];
-        let stock = &self.stock_tables[self.selected_table_idx];
+        let stock = &self.baseline_tables()[self.selected_table_idx].clone();
         let x_labels = table.x_axis.labels.clone();
         let y_labels = table.y_axis.labels.clone();
         let rows = table.values.len();
@@ -1815,7 +1880,12 @@ impl WidebandApp {
         let live_cell = self.live_trace.current().map(live_trace::nearest_cell);
         let sel = self.selection().clamped(rows, cols);
         let multi = !sel.is_single();
-        let corr_overlay_owned = self.ve_corr.overlay_for(self.selected_table_idx).cloned();
+        let hist_overlay = self.hist.overlay_for(&self.xdf.tables[self.selected_table_idx]);
+        let corr_overlay_owned = if hist_overlay.is_some() {
+            None
+        } else {
+            self.ve_corr.overlay_for(self.selected_table_idx).cloned()
+        };
         let corr_overlay = corr_overlay_owned.as_ref();
         if !ui.input(|i| i.pointer.primary_down()) {
             self.grid_drag_select = false;
@@ -1887,7 +1957,30 @@ impl WidebandApp {
                             let text_color = Color32::from_rgb(0xFF, 0xFF, 0xFF);
                             let mut cell_text = format_cell_display(val, stock_val);
                             let mut corr_tip: Option<String> = None;
-                            if let Some(res) = corr_overlay {
+                            if let Some((h, lo, hi)) = &hist_overlay {
+                                // Histogram view: heat across the histogram's own range.
+                                match h.value(r, c) {
+                                    Some(hv) => {
+                                        bg_color = heatmap_color(hv, *lo, *hi);
+                                        cell_text = histogram_cell_text(hv);
+                                        corr_tip = Some(format!(
+                                            "{} {} = {}\n{} hits \u{00B7} table value {:.2}",
+                                            h.spec.aggregate.label(),
+                                            h.spec.value_channel,
+                                            histogram_cell_text(hv),
+                                            h.hits(r, c),
+                                            val
+                                        ));
+                                    }
+                                    None => {
+                                        bg_color = Color32::from_rgb(0x1E, 0x23, 0x2A);
+                                        cell_text = String::new();
+                                        if h.hits(r, c) > 0 {
+                                            corr_tip = Some(format!("{} hits (< {} minimum)", h.hits(r, c), h.spec.min_hits));
+                                        }
+                                    }
+                                }
+                            } else if let Some(res) = corr_overlay {
                                 // Suggestion view: red = lean (needs more), blue = rich (needs less).
                                 match res.change_pct(r, c) {
                                     Some(p) => {
@@ -1965,6 +2058,11 @@ impl WidebandApp {
                                 } else if self.grid_drag_select && ui.rect_contains_pointer(response.rect) {
                                     self.active_cell = (r, c);
                                 }
+                                if response.double_clicked() {
+                                    self.selection_anchor = None;
+                                    self.active_cell = (r, c);
+                                    self.cell_entry = Some(format!("{}", val));
+                                }
                                 if response.clicked() {
                                     if ui.input(|i| i.modifiers.shift) {
                                         // Extend from the current anchor (or the old cursor).
@@ -1991,20 +2089,19 @@ impl WidebandApp {
     pub(crate) fn render_telemetry_tab(&mut self, ctx: &egui::Context, beginner_mode: bool) {
         let channel_defs = self.telemetry.lock().unwrap().channels.clone();
 
-        let (gauge_channels, recording, def_title, stats_line, rate_rows) = {
+        let (gauge_values, recording, def_title, stats_line, rate_rows) = {
             let buf = self.telemetry.lock().unwrap();
-            let gauges: Vec<(String, String, String, [u8; 3])> = buf
-                .channels
+            // (label, unit, value) per dashboard gauge; None when the channel isn't defined.
+            let gauges: Vec<Option<(String, String, f32)>> = self
+                .dashboard
+                .gauges
                 .iter()
-                .enumerate()
-                .filter(|(_, ch)| ch.gauge)
-                .map(|(i, ch)| {
-                    (
-                        ch.label.clone(),
-                        Self::format_channel_value(ch.id.as_str(), buf.latest[i]),
-                        ch.unit.clone(),
-                        ch.plot_color(),
-                    )
+                .map(|g| {
+                    let i = buf.channel_idx(&g.channel)?;
+                    let ch = &buf.channels[i];
+                    // Never answered (unsupported / placeholder PID) => no value, not a fake 0.
+                    let v = if buf.channel_rates[i].has_sampled() { buf.latest[i] } else { f32::NAN };
+                    Some((ch.label.clone(), ch.unit.clone(), v))
                 })
                 .collect();
             let tick_ms = buf.scheduler.settings().tick_ms;
@@ -2034,8 +2131,18 @@ impl WidebandApp {
             (gauges, buf.is_recording, buf.definition_title.clone(), stats_line, rate_rows)
         };
 
+        let live = self.is_connected && self.live_poller_active;
         egui::TopBottomPanel::top("gauge_strip").min_height(72.0).show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
+            // Buttons on their own row: a right-to-left layout sharing the gauge row used to take
+            // the whole width and hide every gauge.
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Dashboard").strong().color(TEXT));
+                if !live {
+                    ui.label(egui::RichText::new("(not polling - showing last values)").small().color(MUTED));
+                }
+                if !beginner_mode {
+                    ui.toggle_value(&mut self.dash_editing, "Edit gauges");
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if !beginner_mode && ui.button("Export CSV").clicked() {
                         let path = "datalog.csv".to_string();
@@ -2067,14 +2174,16 @@ impl WidebandApp {
                         self.log("Telemetry history cleared.");
                     }
                 });
-                for (label, text, unit, rgb) in &gauge_channels {
-                    self.render_gauge_card(
-                        ui,
-                        label,
-                        text.clone(),
-                        unit,
-                        Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
-                    );
+            });
+            if self.dash_editing {
+                self.render_dashboard_editor(ui, &channel_defs);
+            }
+            ui.horizontal_wrapped(|ui| {
+                for (spec, v) in self.dashboard.gauges.iter().zip(gauge_values.iter()) {
+                    match v {
+                        Some((label, unit, value)) => paint_gauge(ui, spec, label, unit, *value as f64, live),
+                        None => paint_gauge(ui, spec, &spec.channel, "not defined", f64::NAN, false),
+                    }
                 }
             });
         });
@@ -2546,27 +2655,6 @@ impl WidebandApp {
             });
     }
 
-    fn format_channel_value(channel_id: &str, value: f32) -> String {
-        match channel_id {
-            "rpm" | "ect" | "load" => format!("{:.0}", value),
-            "map" | "timing" => format!("{:.1}", value),
-            "lambda" => format!("{:.3}", value),
-            "vbatt" => format!("{:.2}", value),
-            _ => format!("{:.1}", value),
-        }
-    }
-
-    fn render_gauge_card(&self, ui: &mut egui::Ui, title: &str, value: String, unit: &str, accent: Color32) {
-        ui.group(|ui| {
-            ui.vertical(|ui| {
-                ui.label(egui::RichText::new(title).small().color(Color32::from_rgb(140, 155, 175)));
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(value).size(18.0).strong().color(accent));
-                    ui.label(egui::RichText::new(unit).small().color(Color32::GRAY));
-                });
-            });
-        });
-    }
 }
 
 fn yes_no(v: bool) -> &'static str {
@@ -3606,27 +3694,7 @@ impl WidebandApp {
             None => TargetLambda::Constant(self.ve_corr.target_const),
         };
         let table = self.xdf.tables[table_idx].clone();
-        let result = {
-            let buf = self.telemetry.lock().unwrap();
-            let live: Vec<crate::telemetry::TelemetryFrame>;
-            let frames: &[crate::telemetry::TelemetryFrame] = match self.ve_corr.source {
-                VeLogSource::Recording => &buf.record_frames,
-                VeLogSource::LiveBuffer => {
-                    live = buf.frames.iter().cloned().collect();
-                    &live
-                }
-                VeLogSource::ImportedLog => match &self.telemetry_playback.primary {
-                    Some(log) => &log.frames,
-                    None => &[],
-                },
-            };
-            if frames.is_empty() {
-                None
-            } else {
-                let src = FrameSource::new(&buf.id_index, frames);
-                Some(ve_correction::analyze(&table, &src, &settings))
-            }
-        };
+        let result = self.with_log(self.ve_corr.source, |src| ve_correction::analyze(&table, src, &settings));
         match result {
             None => {
                 self.ve_corr.result = None;
@@ -3650,6 +3718,7 @@ impl WidebandApp {
                     if res.used_trims { "included" } else { "not logged (open-loop lambda only)" },
                 );
                 self.ve_corr.show_overlay = true;
+                self.hist.show_overlay = false;
                 self.ve_corr.result = Some((table_idx, res));
             }
         }
@@ -3677,5 +3746,746 @@ impl WidebandApp {
             changed
         );
         self.log(&format!("Log fuel correction applied to {} cells of {}", changed, self.xdf.tables[idx].title));
+    }
+}
+
+impl WidebandApp {
+    /// HP Tuners-style grid keyboard: type a value + Enter, + - * / step ops, arrows /
+    /// Shift+arrows, Ctrl+C / Ctrl+V (Excel TSV), Ctrl+A, Ctrl+Z / Ctrl+Y, Esc.
+    fn handle_grid_keyboard(&mut self, ui: &mut egui::Ui) {
+        if self.xdf.tables.is_empty() || ui.ctx().wants_keyboard_input() {
+            return;
+        }
+        let (rows, cols) = {
+            let t = &self.xdf.tables[self.selected_table_idx];
+            (t.values.len(), t.values.first().map_or(0, |r| r.len()))
+        };
+        let events = ui.input(|i| i.events.clone());
+        let mut changed_entry = false;
+        for ev in events {
+            match ev {
+                egui::Event::Copy | egui::Event::Cut => {
+                    let tsv = table_edit::to_tsv(&self.xdf.tables[self.selected_table_idx].values, &self.selection());
+                    if !tsv.is_empty() {
+                        let n = self.selection().count();
+                        ui.ctx().copy_text(tsv);
+                        self.log(&format!("Copied {} cell(s)", n));
+                    }
+                }
+                egui::Event::Paste(text) => match table_edit::parse_block(&text) {
+                    Ok(block) => {
+                        let mut wrote = None;
+                        let mode = self.paste_mode;
+                        self.edit_selected_table(&format!("paste ({})", mode.label()), |v, sel| {
+                            wrote = table_edit::paste_block(v, sel, &block, mode)
+                        });
+                        if let Some(w) = wrote {
+                            self.selection_anchor = Some(w.anchor);
+                            self.active_cell = w.cursor;
+                        }
+                    }
+                    Err(e) => self.log(&format!("Paste refused: {}", e)),
+                },
+                egui::Event::Text(t) => {
+                    for ch in t.chars() {
+                        match (&mut self.cell_entry, ch) {
+                            (Some(buf), c) if c.is_ascii_digit() || c == '.' || ((c == '-' || c == 'e') && !buf.contains(c)) => {
+                                buf.push(c);
+                                changed_entry = true;
+                            }
+                            (None, c) if c.is_ascii_digit() || c == '.' => {
+                                self.cell_entry = Some(c.to_string());
+                                changed_entry = true;
+                            }
+                            (None, '=') => {
+                                self.cell_entry = Some(String::new());
+                                changed_entry = true;
+                            }
+                            (None, '+') => self.run_table_math(MathOp::Add(self.math_amount)),
+                            (None, '-') => self.run_table_math(MathOp::Sub(self.math_amount)),
+                            (None, '*') => self.run_table_math(MathOp::Percent(self.math_amount)),
+                            (None, '/') => self.run_table_math(MathOp::Percent(-self.math_amount)),
+                            _ => {}
+                        }
+                    }
+                }
+                egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                    let cmd = modifiers.command;
+                    match key {
+                        egui::Key::Z if cmd && !modifiers.shift => self.undo_table_edit(),
+                        egui::Key::Z if cmd && modifiers.shift => self.redo_table_edit(),
+                        egui::Key::Y if cmd => self.redo_table_edit(),
+                        egui::Key::A if cmd => {
+                            self.selection_anchor = Some((0, 0));
+                            self.active_cell = (rows.saturating_sub(1), cols.saturating_sub(1));
+                        }
+                        egui::Key::Enter => {
+                            if let Some(buf) = self.cell_entry.take() {
+                                match buf.trim().parse::<f64>() {
+                                    Ok(v) => self.run_table_math(MathOp::Set(v)),
+                                    Err(_) if buf.trim().is_empty() => {}
+                                    Err(_) => self.log(&format!("\"{}\" is not a number", buf)),
+                                }
+                                changed_entry = true;
+                            }
+                        }
+                        egui::Key::Escape => {
+                            if self.cell_entry.take().is_none() {
+                                self.selection_anchor = None;
+                            }
+                            changed_entry = true;
+                        }
+                        egui::Key::Backspace => {
+                            if let Some(buf) = &mut self.cell_entry {
+                                buf.pop();
+                                changed_entry = true;
+                            }
+                        }
+                        egui::Key::ArrowUp | egui::Key::ArrowDown | egui::Key::ArrowLeft | egui::Key::ArrowRight if !cmd => {
+                            let (dr, dc) = match key {
+                                egui::Key::ArrowUp => (-1, 0),
+                                egui::Key::ArrowDown => (1, 0),
+                                egui::Key::ArrowLeft => (0, -1),
+                                _ => (0, 1),
+                            };
+                            let moved = table_edit::move_cursor(&self.selection(), dr, dc, modifiers.shift, rows, cols);
+                            self.selection_anchor = if moved.is_single() { None } else { Some(moved.anchor) };
+                            self.active_cell = moved.cursor;
+                            self.cell_entry = None;
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        if changed_entry {
+            ui.ctx().request_repaint();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scanner histograms
+// ---------------------------------------------------------------------------
+
+pub struct HistogramUi {
+    pub source: VeLogSource,
+    pub value_channel: String,
+    pub x_channel: String,
+    pub y_channel: String,
+    pub aggregate: crate::histogram::Aggregate,
+    pub filter_on: bool,
+    pub filter: crate::histogram::Filter,
+    pub min_hits: u32,
+    pub result: Option<crate::histogram::Histogram>,
+    pub show_overlay: bool,
+    pub message: String,
+}
+
+impl Default for HistogramUi {
+    fn default() -> Self {
+        Self {
+            source: VeLogSource::Recording,
+            value_channel: "lambda".into(),
+            x_channel: "rpm".into(),
+            y_channel: "map".into(),
+            aggregate: crate::histogram::Aggregate::Mean,
+            filter_on: false,
+            filter: crate::histogram::Filter { channel: "ect".into(), min: 70.0, max: 130.0 },
+            min_hits: 3,
+            result: None,
+            show_overlay: true,
+            message: String::new(),
+        }
+    }
+}
+
+impl HistogramUi {
+    /// Histogram + value range when it was built for `table` (same id and shape) and is shown.
+    fn overlay_for(&self, table: &crate::definitions::XdfTable) -> Option<(crate::histogram::Histogram, f64, f64)> {
+        let h = self.result.as_ref()?;
+        let shape_ok = h.rows() == table.values.len() && h.cols() == table.values.first().map_or(0, |r| r.len());
+        if !self.show_overlay || h.table_id != table.id || !shape_ok {
+            return None;
+        }
+        let (lo, hi) = h.range().unwrap_or((0.0, 1.0));
+        Some((h.clone(), lo, hi))
+    }
+}
+
+fn histogram_cell_text(v: f64) -> String {
+    if v.abs() >= 100.0 {
+        format!("{:.0}", v)
+    } else if v.abs() >= 10.0 {
+        format!("{:.1}", v)
+    } else {
+        format!("{:.3}", v)
+    }
+}
+
+impl WidebandApp {
+    /// Run `f` over the frames of a log source. `None` when that source has no frames.
+    fn with_log<R>(&self, source: VeLogSource, f: impl FnOnce(&dyn ve_correction::SampleSource) -> R) -> Option<R> {
+        let buf = self.telemetry.lock().unwrap();
+        let live: Vec<crate::telemetry::TelemetryFrame>;
+        let frames: &[crate::telemetry::TelemetryFrame] = match source {
+            VeLogSource::Recording => &buf.record_frames,
+            VeLogSource::LiveBuffer => {
+                live = buf.frames.iter().cloned().collect();
+                &live
+            }
+            VeLogSource::ImportedLog => match &self.telemetry_playback.primary {
+                Some(log) => &log.frames,
+                None => &[],
+            },
+        };
+        if frames.is_empty() {
+            return None;
+        }
+        let src = FrameSource::new(&buf.id_index, frames);
+        Some(f(&src))
+    }
+
+    fn render_histogram_panel(&mut self, ui: &mut egui::Ui) {
+        let table_idx = self.selected_table_idx;
+        let channels: Vec<(String, String)> = {
+            let buf = self.telemetry.lock().unwrap();
+            buf.channels.iter().map(|c| (c.id.clone(), format!("{} ({})", c.label, c.id))).collect()
+        };
+        let (rec_n, live_n) = {
+            let buf = self.telemetry.lock().unwrap();
+            (buf.record_frames.len(), buf.frames.len())
+        };
+        let imported = self.telemetry_playback.primary.as_ref().map(|l| (l.name.clone(), l.frames.len()));
+
+        egui::CollapsingHeader::new(egui::RichText::new("Scanner histogram (bin any channel into this table)").strong().color(TEXT))
+            .id_salt("hist_panel")
+            .default_open(false)
+            .show(ui, |ui| {
+                let channel_combo = |ui: &mut egui::Ui, id: &str, value: &mut String| {
+                    let shown = channels.iter().find(|(c, _)| c == value).map(|(_, l)| l.clone()).unwrap_or_else(|| value.clone());
+                    egui::ComboBox::from_id_salt(id).selected_text(shown).width(170.0).show_ui(ui, |ui| {
+                        for (cid, label) in &channels {
+                            ui.selectable_value(value, cid.clone(), label);
+                        }
+                    });
+                };
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Log:").color(MUTED));
+                    let src_label = |s: VeLogSource| match s {
+                        VeLogSource::Recording => format!("Recorded ({} frames)", rec_n),
+                        VeLogSource::LiveBuffer => format!("Live buffer ({})", live_n),
+                        VeLogSource::ImportedLog => match &imported {
+                            Some((n, f)) => format!("Imported: {} ({})", n, f),
+                            None => "Imported (none)".to_string(),
+                        },
+                    };
+                    egui::ComboBox::from_id_salt("hist_src").selected_text(src_label(self.hist.source)).show_ui(ui, |ui| {
+                        for s in [VeLogSource::Recording, VeLogSource::LiveBuffer, VeLogSource::ImportedLog] {
+                            ui.selectable_value(&mut self.hist.source, s, src_label(s));
+                        }
+                    });
+                    egui::ComboBox::from_id_salt("hist_agg").selected_text(self.hist.aggregate.label()).show_ui(ui, |ui| {
+                        for a in crate::histogram::Aggregate::ALL {
+                            ui.selectable_value(&mut self.hist.aggregate, a, a.label());
+                        }
+                    });
+                    ui.label(egui::RichText::new("of").color(MUTED));
+                    channel_combo(ui, "hist_val", &mut self.hist.value_channel);
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Columns (X):").color(MUTED));
+                    channel_combo(ui, "hist_x", &mut self.hist.x_channel);
+                    ui.label(egui::RichText::new("Rows (Y):").color(MUTED));
+                    channel_combo(ui, "hist_y", &mut self.hist.y_channel);
+                    ui.label(egui::RichText::new("Min hits").color(MUTED));
+                    ui.add(egui::DragValue::new(&mut self.hist.min_hits).range(1..=1000));
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut self.hist.filter_on, "Only when");
+                    channel_combo(ui, "hist_filter", &mut self.hist.filter.channel);
+                    ui.label("between");
+                    ui.add(egui::DragValue::new(&mut self.hist.filter.min).speed(0.5));
+                    ui.label("and");
+                    ui.add(egui::DragValue::new(&mut self.hist.filter.max).speed(0.5));
+                    if ui.button("Use table axes").on_hover_text("Pick X/Y channels from this table's axis units").clicked() {
+                        let t = &self.xdf.tables[table_idx];
+                        if let Some(x) = live_trace::channel_for_axis_units(&t.x_axis.units) {
+                            self.hist.x_channel = x.to_string();
+                        }
+                        if let Some(y) = live_trace::channel_for_axis_units(&t.y_axis.units) {
+                            self.hist.y_channel = y.to_string();
+                        }
+                    }
+                    if ui.button("Build histogram").clicked() {
+                        self.build_histogram();
+                    }
+                });
+                if !self.hist.message.is_empty() {
+                    ui.label(egui::RichText::new(&self.hist.message).small().color(MUTED));
+                }
+                let built_here = self
+                    .hist
+                    .result
+                    .as_ref()
+                    .map_or(false, |h| h.table_id == self.xdf.tables[table_idx].id);
+                if built_here {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.checkbox(&mut self.hist.show_overlay, "Show on grid").changed() && self.hist.show_overlay {
+                            self.ve_corr.show_overlay = false;
+                        }
+                        if ui
+                            .button("Copy histogram")
+                            .on_hover_text("Tab-separated; empty bins stay empty. Then pick a Ctrl+V mode and paste into any table.")
+                            .clicked()
+                        {
+                            if let Some(h) = &self.hist.result {
+                                ui.ctx().copy_text(crate::table_edit::grid_to_tsv(&h.grid()));
+                                // Paste lands at the cursor: put it on the first cell so the bins line up.
+                                self.selection_anchor = None;
+                                self.active_cell = (0, 0);
+                                self.hist.message = "Copied. Select the target table's first cell, choose the Ctrl+V mode, and paste.".into();
+                            }
+                        }
+                        if ui.button("Clear").clicked() {
+                            self.hist.result = None;
+                            self.hist.message.clear();
+                        }
+                    });
+                }
+            });
+    }
+
+    fn build_histogram(&mut self) {
+        let table = self.xdf.tables[self.selected_table_idx].clone();
+        let spec = crate::histogram::HistogramSpec {
+            value_channel: self.hist.value_channel.clone(),
+            x_channel: self.hist.x_channel.clone(),
+            y_channel: self.hist.y_channel.clone(),
+            aggregate: self.hist.aggregate,
+            filter: self.hist.filter_on.then(|| self.hist.filter.clone()),
+            min_hits: self.hist.min_hits,
+        };
+        let res = self.with_log(self.hist.source, |src| {
+            crate::histogram::build(&table.id, &table.x_axis.labels, &table.y_axis.labels, src, &spec)
+        });
+        match res {
+            None => {
+                self.hist.result = None;
+                self.hist.message = "No frames in that log. Record on the Telemetry tab or import a CSV.".into();
+            }
+            Some(h) => {
+                let filled = h.grid().iter().flatten().filter(|c| c.is_some()).count();
+                self.hist.message = format!(
+                    "{} samples binned into {} cells; {} filtered out, {} outside the table axes, {} missing a channel.",
+                    h.used, filled, h.filtered, h.off_axes, h.missing
+                );
+                self.hist.show_overlay = true;
+                self.ve_corr.show_overlay = false;
+                self.hist.result = Some(h);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tune compare
+// ---------------------------------------------------------------------------
+
+impl WidebandApp {
+    /// Tables the grid's change markers measure against (stock as opened, or the compare file).
+    fn baseline_tables(&self) -> &[Vec<Vec<f64>>] {
+        match (&self.compare, self.diff_vs_compare) {
+            (Some(c), true) if c.tables.len() == self.xdf.tables.len() => &c.tables,
+            _ => &self.stock_tables,
+        }
+    }
+
+    fn baseline_constants(&self) -> &[f64] {
+        match (&self.compare, self.diff_vs_compare) {
+            (Some(c), true) if c.constants.len() == self.xdf.constants.len() => &c.constants,
+            _ => &self.stock_constants,
+        }
+    }
+
+    fn load_compare_rom(&mut self, path: PathBuf) {
+        let label = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        let bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => return self.log(&format!("Compare: open failed: {}", e)),
+        };
+        match RomImage::from_bytes(&ext, &bytes) {
+            Ok(img) => {
+                // Same buffer shape as the active ROM so addresses decode identically.
+                let mut buf = vec![0xFFu8; self.active_rom.len()];
+                img.load_into_buffer(&mut buf, ext != "cuw");
+                let cmp = crate::compare::CompareFile::decode(&label, &self.xdf, &buf, img.origin as i64);
+                let (t, c) = crate::compare::diff(&self.xdf, &cmp);
+                self.log(&format!(
+                    "Compare: {} — {} table(s) and {} constant(s) differ",
+                    label,
+                    t.len(),
+                    c.len()
+                ));
+                self.compare = Some(cmp);
+                self.diff_vs_compare = true;
+            }
+            Err(e) => self.log(&format!("Compare: {}", e)),
+        }
+    }
+
+    fn render_compare_bar(&mut self, ui: &mut egui::Ui) {
+        let Some(cmp) = &self.compare else {
+            return;
+        };
+        let name = cmp.name.clone();
+        let (tdiffs, cdiffs) = crate::compare::diff(&self.xdf, cmp);
+        let sel_idx = self.selected_table_idx;
+        let this_differs = tdiffs.iter().any(|d| d.table_idx == sel_idx);
+        let mut jump: Option<usize> = None;
+        let mut copy_table = false;
+        let mut close = false;
+
+        egui::Frame::none()
+            .fill(ACCENT_CYAN.gamma_multiply(0.06))
+            .stroke(Stroke::new(1.0, ACCENT_CYAN.gamma_multiply(0.5)))
+            .rounding(egui::Rounding::same(4.0))
+            .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(format!("Comparing with {}", name)).strong().color(ACCENT_CYAN));
+                    ui.label(egui::RichText::new("Deltas vs").color(MUTED));
+                    ui.selectable_value(&mut self.diff_vs_compare, true, "Compare file");
+                    ui.selectable_value(&mut self.diff_vs_compare, false, "Stock (as opened)");
+                    ui.label(
+                        egui::RichText::new(format!("{} tables, {} constants differ", tdiffs.len(), cdiffs.len()))
+                            .color(if tdiffs.is_empty() && cdiffs.is_empty() { EMERALD } else { Color32::from_rgb(255, 214, 0) }),
+                    );
+                    if ui
+                        .add_enabled(this_differs, egui::Button::new("Copy this table from compare"))
+                        .on_hover_text("Replace the current table with the compare file's values (undoable)")
+                        .clicked()
+                    {
+                        copy_table = true;
+                    }
+                    if ui.button("Close compare").clicked() {
+                        close = true;
+                    }
+                });
+                if !tdiffs.is_empty() || !cdiffs.is_empty() {
+                    egui::CollapsingHeader::new(egui::RichText::new("Differences").small().color(MUTED))
+                        .id_salt("compare_list")
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                                for d in &tdiffs {
+                                    let text = format!(
+                                        "{}  \u{2014}  {}/{} cells, max \u{0394} {:.2}",
+                                        d.title, d.changed_cells, d.total_cells, d.max_abs_delta
+                                    );
+                                    if ui.selectable_label(d.table_idx == sel_idx, text).clicked() {
+                                        jump = Some(d.table_idx);
+                                    }
+                                }
+                                for c in &cdiffs {
+                                    ui.label(format!("{}: {:.2} (compare {:.2})", c.title, c.current, c.compare));
+                                }
+                            });
+                        });
+                }
+            });
+
+        if let Some(i) = jump {
+            self.selected_table_idx = i;
+            self.active_cell = (0, 0);
+            self.selection_anchor = None;
+            self.live_trace.clear();
+        }
+        if copy_table {
+            if let Some(src) = self.compare.as_ref().and_then(|c| c.tables.get(sel_idx)).cloned() {
+                self.edit_selected_table("copy table from compare", |v, _| {
+                    for (row, srow) in v.iter_mut().zip(src.iter()) {
+                        for (cell, s) in row.iter_mut().zip(srow.iter()) {
+                            *cell = *s;
+                        }
+                    }
+                });
+            }
+        }
+        if close {
+            self.compare = None;
+            self.diff_vs_compare = false;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard gauges
+// ---------------------------------------------------------------------------
+
+const GAUGE_SIZE: Vec2 = Vec2::new(150.0, 122.0);
+const GAUGE_ALARM: Color32 = Color32::from_rgb(0xF8, 0x51, 0x49);
+
+fn gauge_value_text(v: f64) -> String {
+    if !v.is_finite() {
+        "--".to_string()
+    } else if v.abs() >= 100.0 {
+        format!("{:.0}", v)
+    } else if v.abs() >= 10.0 {
+        format!("{:.1}", v)
+    } else {
+        format!("{:.2}", v)
+    }
+}
+
+/// One dashboard gauge (dial / bar / digital). Turns red past its warning thresholds.
+fn paint_gauge(ui: &mut egui::Ui, spec: &crate::gauges::GaugeSpec, label: &str, unit: &str, v: f64, live: bool) {
+    use crate::gauges::GaugeStyle;
+    let (rect, _) = ui.allocate_exact_size(GAUGE_SIZE, egui::Sense::hover());
+    let p = ui.painter_at(rect);
+    let alarm = v.is_finite() && spec.alarm(v);
+    let accent = if alarm { GAUGE_ALARM } else { ACCENT_CYAN };
+    let dim = if live { 1.0 } else { 0.55 };
+    p.rect_filled(rect, 6.0, CARD_FILL);
+    p.rect_stroke(rect, 6.0, Stroke::new(if alarm { 2.0 } else { 1.0 }, if alarm { GAUGE_ALARM } else { STROKE }));
+    p.text(rect.center_bottom() - Vec2::new(0.0, 8.0), egui::Align2::CENTER_BOTTOM, label, egui::FontId::proportional(10.5), MUTED);
+    let text = gauge_value_text(v);
+    let frac = spec.fraction(v);
+
+    match spec.style {
+        GaugeStyle::Dial => {
+            let c = egui::pos2(rect.center().x, rect.top() + 50.0);
+            let r = 36.0;
+            // 240° sweep from lower-left (150°) clockwise to lower-right (30°), screen coords.
+            let at = |t: f32, rad: f32| {
+                let a = (150.0 + 240.0 * t).to_radians();
+                c + Vec2::new(a.cos(), a.sin()) * rad
+            };
+            let arc = |t0: f32, t1: f32, rad: f32| -> Vec<egui::Pos2> {
+                let n = ((t1 - t0) * 48.0).ceil().max(2.0) as usize;
+                (0..=n).map(|i| at(t0 + (t1 - t0) * i as f32 / n as f32, rad)).collect()
+            };
+            p.add(egui::Shape::line(arc(0.0, 1.0, r), Stroke::new(6.0, theme::WIDGET_BG)));
+            if let Some(h) = spec.warn_high {
+                p.add(egui::Shape::line(arc(spec.fraction(h), 1.0, r), Stroke::new(6.0, GAUGE_ALARM.gamma_multiply(0.45))));
+            }
+            if let Some(l) = spec.warn_low {
+                p.add(egui::Shape::line(arc(0.0, spec.fraction(l), r), Stroke::new(6.0, GAUGE_ALARM.gamma_multiply(0.45))));
+            }
+            if v.is_finite() && frac > 0.0 {
+                p.add(egui::Shape::line(arc(0.0, frac, r), Stroke::new(6.0, accent.gamma_multiply(dim))));
+            }
+            for k in 0..=4 {
+                let t = k as f32 / 4.0;
+                p.line_segment([at(t, r + 5.0), at(t, r + 9.0)], Stroke::new(1.0, MUTED));
+            }
+            // Range labels sit outside the arc ends so they never touch the readout.
+            p.text(at(0.0, r + 6.0) + Vec2::new(-2.0, 0.0), egui::Align2::RIGHT_CENTER, gauge_value_text(spec.min), egui::FontId::monospace(8.5), MUTED);
+            p.text(at(1.0, r + 6.0) + Vec2::new(2.0, 0.0), egui::Align2::LEFT_CENTER, gauge_value_text(spec.max), egui::FontId::monospace(8.5), MUTED);
+            if v.is_finite() {
+                p.line_segment([c, at(frac, r - 8.0)], Stroke::new(2.0, TEXT.gamma_multiply(dim)));
+            }
+            p.circle_filled(c, 3.5, TEXT);
+            p.text(c + Vec2::new(0.0, 24.0), egui::Align2::CENTER_CENTER, &text, egui::FontId::monospace(16.0), accent.gamma_multiply(dim));
+            p.text(c + Vec2::new(0.0, 38.0), egui::Align2::CENTER_CENTER, unit, egui::FontId::proportional(9.0), MUTED);
+        }
+        GaugeStyle::Bar => {
+            p.text(rect.center() - Vec2::new(0.0, 22.0), egui::Align2::CENTER_CENTER, &text, egui::FontId::monospace(20.0), accent.gamma_multiply(dim));
+            p.text(rect.center() - Vec2::new(0.0, 6.0), egui::Align2::CENTER_CENTER, unit, egui::FontId::proportional(9.0), MUTED);
+            let bar = egui::Rect::from_min_size(rect.left_center() + Vec2::new(12.0, 8.0), Vec2::new(rect.width() - 24.0, 14.0));
+            p.rect_filled(bar, 3.0, theme::WIDGET_BG);
+            let x_of = |t: f32| bar.left() + bar.width() * t;
+            if let Some(h) = spec.warn_high {
+                p.rect_filled(egui::Rect::from_x_y_ranges(x_of(spec.fraction(h))..=bar.right(), bar.y_range()), 3.0, GAUGE_ALARM.gamma_multiply(0.35));
+            }
+            if let Some(l) = spec.warn_low {
+                p.rect_filled(egui::Rect::from_x_y_ranges(bar.left()..=x_of(spec.fraction(l)), bar.y_range()), 3.0, GAUGE_ALARM.gamma_multiply(0.35));
+            }
+            if v.is_finite() {
+                // Bipolar ranges (fuel trims) fill from zero, not from the minimum.
+                let zero = if spec.min < 0.0 && spec.max > 0.0 { spec.fraction(0.0) } else { 0.0 };
+                let (a, b) = if frac >= zero { (zero, frac) } else { (frac, zero) };
+                p.rect_filled(egui::Rect::from_x_y_ranges(x_of(a)..=x_of(b), bar.y_range()), 3.0, accent.gamma_multiply(dim));
+            }
+            p.text(bar.left_bottom() + Vec2::new(0.0, 2.0), egui::Align2::LEFT_TOP, gauge_value_text(spec.min), egui::FontId::monospace(8.5), MUTED);
+            p.text(bar.right_bottom() + Vec2::new(0.0, 2.0), egui::Align2::RIGHT_TOP, gauge_value_text(spec.max), egui::FontId::monospace(8.5), MUTED);
+        }
+        GaugeStyle::Digital => {
+            p.text(rect.center() - Vec2::new(0.0, 8.0), egui::Align2::CENTER_CENTER, &text, egui::FontId::monospace(28.0), accent.gamma_multiply(dim));
+            p.text(rect.center() + Vec2::new(0.0, 16.0), egui::Align2::CENTER_CENTER, unit, egui::FontId::proportional(10.0), MUTED);
+        }
+    }
+}
+
+impl WidebandApp {
+    fn render_dashboard_editor(&mut self, ui: &mut egui::Ui, channels: &[crate::telemetry::TelemetryChannelDef]) {
+        use crate::gauges::{Dashboard, GaugeSpec, GaugeStyle};
+        let mut remove: Option<usize> = None;
+        let mut swap: Option<(usize, usize)> = None;
+        let n = self.dashboard.gauges.len();
+        egui::Frame::none()
+            .fill(CARD_FILL)
+            .stroke(Stroke::new(1.0, STROKE))
+            .inner_margin(egui::Margin::same(6.0))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                    egui::Grid::new("dash_edit").striped(true).spacing([8.0, 4.0]).show(ui, |ui| {
+                        for h in ["Channel", "Style", "Min", "Max", "Warn low", "Warn high", ""] {
+                            ui.label(egui::RichText::new(h).small().color(MUTED));
+                        }
+                        ui.end_row();
+                        for (i, g) in self.dashboard.gauges.iter_mut().enumerate() {
+                            let shown = channels.iter().find(|c| c.id == g.channel).map(|c| c.label.clone()).unwrap_or(g.channel.clone());
+                            egui::ComboBox::from_id_salt(("g_ch", i)).selected_text(shown).width(150.0).show_ui(ui, |ui| {
+                                for c in channels {
+                                    ui.selectable_value(&mut g.channel, c.id.clone(), &c.label);
+                                }
+                            });
+                            egui::ComboBox::from_id_salt(("g_st", i)).selected_text(g.style.label()).width(70.0).show_ui(ui, |ui| {
+                                for st in GaugeStyle::ALL {
+                                    ui.selectable_value(&mut g.style, st, st.label());
+                                }
+                            });
+                            ui.add(egui::DragValue::new(&mut g.min).speed(1.0));
+                            ui.add(egui::DragValue::new(&mut g.max).speed(1.0));
+                            for (slot, default) in [(&mut g.warn_low, g.min), (&mut g.warn_high, g.max)] {
+                                ui.horizontal(|ui| {
+                                    let mut on = slot.is_some();
+                                    if ui.checkbox(&mut on, "").changed() {
+                                        *slot = on.then_some(default);
+                                    }
+                                    if let Some(v) = slot {
+                                        ui.add(egui::DragValue::new(v).speed(0.5));
+                                    }
+                                });
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(i > 0, egui::Button::new("\u{2191}").small()).clicked() {
+                                    swap = Some((i, i - 1));
+                                }
+                                if ui.add_enabled(i + 1 < n, egui::Button::new("\u{2193}").small()).clicked() {
+                                    swap = Some((i, i + 1));
+                                }
+                                if ui.small_button("Remove").clicked() {
+                                    remove = Some(i);
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("g_add").selected_text("Add gauge\u{2026}").show_ui(ui, |ui| {
+                        for c in channels {
+                            if ui.selectable_label(false, &c.label).clicked() {
+                                self.dashboard.gauges.push(GaugeSpec::default_for(&c.id));
+                            }
+                        }
+                    });
+                    if ui.button("Save layout").clicked() {
+                        let path = Dashboard::save_path();
+                        match self.dashboard.save(&path) {
+                            Ok(()) => self.log(&format!("Dashboard saved to {}", path.display())),
+                            Err(e) => self.log(&format!("Dashboard save failed: {}", e)),
+                        }
+                    }
+                    if ui.button("Reset to defaults").clicked() {
+                        let ids: Vec<String> = channels.iter().map(|c| c.id.clone()).collect();
+                        self.dashboard = Dashboard::default_layout(&ids);
+                    }
+                });
+            });
+        if let Some((a, b)) = swap {
+            self.dashboard.gauges.swap(a, b);
+        }
+        if let Some(i) = remove {
+            self.dashboard.gauges.remove(i);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// .wbtune tune files
+// ---------------------------------------------------------------------------
+
+impl WidebandApp {
+    fn save_tune(&mut self, path: PathBuf) {
+        // Same as Save ROM: make sure every edit is in the image before it's captured.
+        self.xdf.write_all_tables_to_rom(&mut self.active_rom, self.rom_origin);
+        self.xdf.write_all_constants_to_rom(&mut self.active_rom, self.rom_origin);
+        for flag in &self.xdf.flags {
+            self.xdf.write_flag_to_rom(&mut self.active_rom, self.rom_origin, flag);
+        }
+        let prof_id = self.profiles[self.selected_profile_idx].id.clone();
+        let input = crate::tune_file::SaveInput {
+            profile_id: &prof_id,
+            vin: &self.ecu_id.vin,
+            cal_id: &self.ecu_id.cal_id,
+            notes: &self.tune_notes,
+            rom: &self.active_rom,
+            rom_origin: self.rom_origin,
+            xdf_path: self.xdf_path.as_deref(),
+            xdf_title: &self.xdf.title,
+        };
+        match crate::tune_file::save(&path, &input) {
+            Ok(()) => {
+                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                if self.xdf_path.is_none() {
+                    self.log(&format!(
+                        "Saved tune {} (definition came from a profile pack, so it isn't referenced; reopen with the same pack)",
+                        name
+                    ));
+                } else {
+                    self.log(&format!("Saved tune {}", name));
+                }
+            }
+            Err(e) => self.log(&format!("Save tune failed: {}", e)),
+        }
+    }
+
+    fn open_tune(&mut self, path: PathBuf) {
+        let opened = match crate::tune_file::open(&path) {
+            Ok(o) => o,
+            Err(e) => return self.log(&format!("Open tune failed: {}", e)),
+        };
+        let t = &opened.tune;
+        if self.profile_index_for_id(&t.profile_id).is_some() {
+            self.select_profile_id(&t.profile_id);
+        } else {
+            self.log(&format!("Tune was saved for profile '{}', which isn't installed", t.profile_id));
+        }
+        match &opened.xdf {
+            crate::tune_file::XdfStatus::Match(p) => self.load_xdf_from_path(p.clone()),
+            crate::tune_file::XdfStatus::Changed(p) => {
+                self.log(&format!(
+                    "Warning: {} changed since this tune was saved; table addresses or scaling may differ",
+                    p.display()
+                ));
+                self.load_xdf_from_path(p.clone());
+            }
+            crate::tune_file::XdfStatus::Missing => self.log(&format!(
+                "Definition \"{}\" not found; open the matching XDF to edit this tune",
+                t.xdf_title
+            )),
+        }
+        self.active_rom = opened.rom;
+        self.rom_origin = t.rom_origin;
+        self.rom_path = Some(path.clone());
+        self.rom_from_ecu = false;
+        self.tune_notes = t.notes.clone();
+        self.compare = None;
+        self.diff_vs_compare = false;
+        self.xdf.bind_from_rom(&self.active_rom, self.rom_origin);
+        self.refresh_stock_baseline();
+        self.table_undo.clear();
+        self.refresh_checksum_badge();
+        self.log(&format!(
+            "Opened tune {} (saved {}{}{})",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            t.saved_utc,
+            if t.vin.is_empty() { String::new() } else { format!(", VIN {}", t.vin) },
+            if t.cal_id.is_empty() { String::new() } else { format!(", cal {}", t.cal_id) },
+        ));
     }
 }

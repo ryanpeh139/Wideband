@@ -421,6 +421,11 @@ pub struct ChannelRateStats {
 impl ChannelRateStats {
     const WINDOW: Duration = Duration::from_secs(1);
 
+    /// False until the ECU has answered for this channel at least once (value is just 0.0).
+    pub fn has_sampled(&self) -> bool {
+        self.window_start.is_some()
+    }
+
     pub fn on_sample(&mut self, now: Instant) {
         if self.window_start.is_none() {
             self.window_start = Some(now);
