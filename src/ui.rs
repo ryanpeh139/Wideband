@@ -33,6 +33,7 @@ use crate::telemetry_playback::{
     import_log_csv, ImportedLog, LogMarker, MathChannelDef, TelemetryPlaybackState,
     TelemetryViewMode,
 };
+use crate::tester_present::{IdleTesterOutcome, IdleTesterPresent};
 use crate::theme::{
     self, paint_live_cell_glow, paint_studio_badge, studio_tab_button, ACCENT_CYAN, CARD_FILL,
     EMERALD, MUTED, STROKE, TEXT, heatmap_color,
@@ -99,6 +100,7 @@ pub struct WidebandApp {
     pub live_poller_active: bool,
     pub last_poll_time: Instant,
     pub telemetry_playback: TelemetryPlaybackState,
+    pub idle_tester_present: IdleTesterPresent,
 
     // 3D Surface Mesh
     pub mesh_yaw: f32,
@@ -216,6 +218,7 @@ impl WidebandApp {
             live_poller_active: true,
             last_poll_time: Instant::now(),
             telemetry_playback: TelemetryPlaybackState::default(),
+            idle_tester_present: IdleTesterPresent::new(),
             mesh_yaw: 0.785,  // 45 degrees
             mesh_pitch: 0.523, // 30 degrees
             mesh_zoom: 1.0,
@@ -579,15 +582,47 @@ impl WidebandApp {
         self.active_device = Some(dev);
         self.is_connected = true;
         self.connection_last_error.clear();
+        if is_virtual {
+            self.idle_tester_present.disarm();
+        } else {
+            self.idle_tester_present.arm_for_real_hardware();
+            self.log(
+                "Idle session hold: TesterPresent (0x3E) every 2 s on this profile (real Pass-Thru only).",
+            );
+        }
     }
 
     pub fn disconnect_cable(&mut self) {
+        self.idle_tester_present.disarm();
         if let Some(mut dev) = self.active_device.take() {
             let _ = dev.close();
             self.is_connected = false;
             self.header_vbatt = None;
             PlatformSecurity::install(&PlatformSecurity::default_config_path());
             self.log("Cable disconnected.");
+        }
+    }
+
+    pub fn poll_idle_tester_present(&mut self) {
+        if !self.is_connected || self.active_device_virtual || self.is_flashing {
+            return;
+        }
+        let prof = self.profiles[self.selected_profile_idx].clone();
+        if let Some(dev) = &mut self.active_device {
+            match self.idle_tester_present.tick(
+                dev.as_mut(),
+                &prof,
+                self.is_connected,
+                self.active_device_virtual,
+                self.is_flashing,
+            ) {
+                IdleTesterOutcome::Skipped | IdleTesterOutcome::Sent => {}
+                IdleTesterOutcome::Failed => {
+                    self.log(
+                        "TesterPresent was not answered; idle keepalive stopped (channel stays open). Reconnect to retry.",
+                    );
+                }
+            }
         }
     }
 
@@ -1152,6 +1187,7 @@ impl WidebandApp {
 impl eframe::App for WidebandApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_telemetry();
+        self.poll_idle_tester_present();
         self.tick_virtual_ladder();
         let dt = ctx.input(|i| i.stable_dt) as f64;
         self.telemetry_playback.tick_playback(dt);
