@@ -51,6 +51,15 @@ mod imp {
             Self::locate_host_exe().exists()
         }
 
+        /// Actionable copy for connect / first-run when the x86 host is absent on 64-bit Windows.
+        pub fn missing_host_user_message() -> String {
+            let path = Self::locate_host_exe();
+            format!(
+                "J2534Host.exe is missing (expected {}). On Windows, run scripts\\Package-WindowsRelease.ps1 or compile J2534Host.cs with csc.exe /platform:x86, then run scripts\\Friday-CablePrep.ps1 before connect.",
+                path.display()
+            )
+        }
+
         fn locate_host_exe() -> PathBuf {
             if let Ok(exe) = std::env::current_exe() {
                 let beside = exe.parent().unwrap_or(Path::new(".")).join("J2534Host.exe");
@@ -349,5 +358,9 @@ pub struct HostPassThruDevice;
 impl HostPassThruDevice {
     pub fn host_available() -> bool {
         false
+    }
+
+    pub fn missing_host_user_message() -> String {
+        String::new()
     }
 }

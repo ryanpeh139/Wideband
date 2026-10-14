@@ -1,7 +1,15 @@
 {
   "_comment": "Copy to security-config.json beside wideband.exe. Replace YOUR_* placeholders with values you are authorized to use. Never commit real OEM masks.",
+  "_tacoma_can_checklist": [
+    "1) After Identify ECU, note Cal ID (89663-xxxxx) — pick or add a densoGenerations id for that OS.",
+    "2) Set densoGenerations[].mask to your authorized Denso32 XOR mask; set that row configured=true.",
+    "3) Set profiles.tacoma-can.generation to that id (or inline mask), algorithm denso32, endian big, configured=true only when mask is real.",
+    "4) From your XDF/stock ROM: fill checksums[] start/end/store for tacoma-can; set configured=true after bench-validating on a copy.",
+    "5) Leave configured=false until intentional — app stays fail-closed for 0x27 flash and checksum stamp."
+  ],
   "profiles": {
     "tacoma-can": {
+      "_profile_note": "generation links to densoGenerations[].id; flash uses security-config only — not flash-layout.json",
       "algorithm": "denso32",
       "generation": "denso32-your-os",
       "endian": "big",

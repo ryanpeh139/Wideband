@@ -1,6 +1,8 @@
 {
+  "_comment": "Bench defaults only — align tacoma-can addresses/sizes with YOUR stock ROM and TunerPro XDF before Read Stock ROM or cal flash. See tests/security-config-tacoma-can.sample.json for mask/checksum rows.",
   "profiles": {
     "tacoma-can": {
+      "_tacoma_notes": "89663-xxxxx cal images: confirm rom_origin + cal_flash_segments match XDF addresses; stock_read size must match ECM image length; checksum start/end/store live in security-config.json checksums[] (not here).",
       "rom_origin": 65536,
       "image_bytes": 1048576,
       "stock_read": {
