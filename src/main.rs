@@ -406,6 +406,7 @@ mod tests {
         sim.close().unwrap();
     }
 
+    #[test]
     fn test_virtual_ecu_read_only_diagnostics() {
         use diagnostics::{decode_dtc_bytes, DiagnosticsReader};
 

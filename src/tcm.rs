@@ -768,6 +768,10 @@ mod tests {
 
     #[test]
     fn tcm_flash_is_fail_closed_without_security() {
+        let _guard = crate::security_config::PlatformSecurity::test_serial_guard();
+        crate::security_config::PlatformSecurity::install(
+            &std::path::PathBuf::from("security-config.json"),
+        );
         let layout = FlashLayoutMap::load("flash-layout.json").expect("layout");
         let prof = TcmProfile::tacoma_can_tcm();
         let blockers = flash_blockers(&prof, false, &layout);

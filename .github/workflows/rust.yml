@@ -17,7 +17,7 @@ jobs:
       - name: cargo build
         run: cargo build --locked
       - name: cargo test
-        run: cargo test --locked
+        run: cargo test --locked -- --test-threads=1
       - name: Install Windows GNU target
         run: rustup target add x86_64-pc-windows-gnu
       - name: Install MinGW linker

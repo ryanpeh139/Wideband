@@ -1220,6 +1220,11 @@ mod security_config_tests {
         let _guard = PlatformSecurity::test_serial_guard();
         PlatformSecurity::install(&PathBuf::from("tests/security-config-test.json"));
         PlatformSecurity::register_bench_keys_for_virtual();
+        assert_eq!(
+            PlatformSecurity::security_mode("tacoma-can", false),
+            SecurityMode::Bench,
+            "bench keys must override production JSON for tacoma-can"
+        );
         let blockers = PlatformSecurity::flash_blockers("tacoma-can", false);
         assert!(
             blockers.iter().any(|b| b.contains("Production flash blocked")),
