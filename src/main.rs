@@ -10,6 +10,7 @@ pub mod flash_job;
 pub mod flash_layout;
 pub mod managers;
 pub mod patch_recipe;
+pub mod gauges;
 pub mod histogram;
 pub mod isotp;
 pub mod live_trace;

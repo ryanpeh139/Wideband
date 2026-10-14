@@ -100,6 +100,9 @@ pub struct WidebandApp {
     /// Log-based VE correction state (panel above the grid).
     pub ve_corr: VeCorrectionUi,
     pub hist: HistogramUi,
+    /// Scanner dashboard gauges (dashboard.json).
+    pub dashboard: crate::gauges::Dashboard,
+    pub dash_editing: bool,
     /// Live operating point on the selected table (separate from the edit selection).
     pub live_trace: live_trace::LiveTrace,
     pub math_amount: f64,
@@ -231,6 +234,12 @@ impl WidebandApp {
             paste_mode: table_edit::PasteMode::Replace,
             ve_corr: VeCorrectionUi::default(),
             hist: HistogramUi::default(),
+            dashboard: {
+                let ids: Vec<String> = TelemetryChannelFile::load_default().channels.iter().map(|c| c.id.clone()).collect();
+                crate::gauges::Dashboard::load(&crate::gauges::Dashboard::default_path())
+                    .unwrap_or_else(|_| crate::gauges::Dashboard::default_layout(&ids))
+            },
+            dash_editing: false,
             live_trace: live_trace::LiveTrace::default(),
             math_amount: 5.0,
             checksum_status: CHECKSUM_VALID.to_string(),
@@ -2048,20 +2057,19 @@ impl WidebandApp {
     pub(crate) fn render_telemetry_tab(&mut self, ctx: &egui::Context, beginner_mode: bool) {
         let channel_defs = self.telemetry.lock().unwrap().channels.clone();
 
-        let (gauge_channels, recording, def_title, stats_line, rate_rows) = {
+        let (gauge_values, recording, def_title, stats_line, rate_rows) = {
             let buf = self.telemetry.lock().unwrap();
-            let gauges: Vec<(String, String, String, [u8; 3])> = buf
-                .channels
+            // (label, unit, value) per dashboard gauge; None when the channel isn't defined.
+            let gauges: Vec<Option<(String, String, f32)>> = self
+                .dashboard
+                .gauges
                 .iter()
-                .enumerate()
-                .filter(|(_, ch)| ch.gauge)
-                .map(|(i, ch)| {
-                    (
-                        ch.label.clone(),
-                        Self::format_channel_value(ch.id.as_str(), buf.latest[i]),
-                        ch.unit.clone(),
-                        ch.plot_color(),
-                    )
+                .map(|g| {
+                    let i = buf.channel_idx(&g.channel)?;
+                    let ch = &buf.channels[i];
+                    // Never answered (unsupported / placeholder PID) => no value, not a fake 0.
+                    let v = if buf.channel_rates[i].has_sampled() { buf.latest[i] } else { f32::NAN };
+                    Some((ch.label.clone(), ch.unit.clone(), v))
                 })
                 .collect();
             let tick_ms = buf.scheduler.settings().tick_ms;
@@ -2091,8 +2099,18 @@ impl WidebandApp {
             (gauges, buf.is_recording, buf.definition_title.clone(), stats_line, rate_rows)
         };
 
+        let live = self.is_connected && self.live_poller_active;
         egui::TopBottomPanel::top("gauge_strip").min_height(72.0).show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
+            // Buttons on their own row: a right-to-left layout sharing the gauge row used to take
+            // the whole width and hide every gauge.
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Dashboard").strong().color(TEXT));
+                if !live {
+                    ui.label(egui::RichText::new("(not polling - showing last values)").small().color(MUTED));
+                }
+                if !beginner_mode {
+                    ui.toggle_value(&mut self.dash_editing, "Edit gauges");
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if !beginner_mode && ui.button("Export CSV").clicked() {
                         let path = "datalog.csv".to_string();
@@ -2124,14 +2142,16 @@ impl WidebandApp {
                         self.log("Telemetry history cleared.");
                     }
                 });
-                for (label, text, unit, rgb) in &gauge_channels {
-                    self.render_gauge_card(
-                        ui,
-                        label,
-                        text.clone(),
-                        unit,
-                        Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
-                    );
+            });
+            if self.dash_editing {
+                self.render_dashboard_editor(ui, &channel_defs);
+            }
+            ui.horizontal_wrapped(|ui| {
+                for (spec, v) in self.dashboard.gauges.iter().zip(gauge_values.iter()) {
+                    match v {
+                        Some((label, unit, value)) => paint_gauge(ui, spec, label, unit, *value as f64, live),
+                        None => paint_gauge(ui, spec, &spec.channel, "not defined", f64::NAN, false),
+                    }
                 }
             });
         });
@@ -2603,27 +2623,6 @@ impl WidebandApp {
             });
     }
 
-    fn format_channel_value(channel_id: &str, value: f32) -> String {
-        match channel_id {
-            "rpm" | "ect" | "load" => format!("{:.0}", value),
-            "map" | "timing" => format!("{:.1}", value),
-            "lambda" => format!("{:.3}", value),
-            "vbatt" => format!("{:.2}", value),
-            _ => format!("{:.1}", value),
-        }
-    }
-
-    fn render_gauge_card(&self, ui: &mut egui::Ui, title: &str, value: String, unit: &str, accent: Color32) {
-        ui.group(|ui| {
-            ui.vertical(|ui| {
-                ui.label(egui::RichText::new(title).small().color(Color32::from_rgb(140, 155, 175)));
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(value).size(18.0).strong().color(accent));
-                    ui.label(egui::RichText::new(unit).small().color(Color32::GRAY));
-                });
-            });
-        });
-    }
 }
 
 fn yes_no(v: bool) -> &'static str {
@@ -4185,6 +4184,191 @@ impl WidebandApp {
         if close {
             self.compare = None;
             self.diff_vs_compare = false;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard gauges
+// ---------------------------------------------------------------------------
+
+const GAUGE_SIZE: Vec2 = Vec2::new(150.0, 122.0);
+const GAUGE_ALARM: Color32 = Color32::from_rgb(0xF8, 0x51, 0x49);
+
+fn gauge_value_text(v: f64) -> String {
+    if !v.is_finite() {
+        "--".to_string()
+    } else if v.abs() >= 100.0 {
+        format!("{:.0}", v)
+    } else if v.abs() >= 10.0 {
+        format!("{:.1}", v)
+    } else {
+        format!("{:.2}", v)
+    }
+}
+
+/// One dashboard gauge (dial / bar / digital). Turns red past its warning thresholds.
+fn paint_gauge(ui: &mut egui::Ui, spec: &crate::gauges::GaugeSpec, label: &str, unit: &str, v: f64, live: bool) {
+    use crate::gauges::GaugeStyle;
+    let (rect, _) = ui.allocate_exact_size(GAUGE_SIZE, egui::Sense::hover());
+    let p = ui.painter_at(rect);
+    let alarm = v.is_finite() && spec.alarm(v);
+    let accent = if alarm { GAUGE_ALARM } else { ACCENT_CYAN };
+    let dim = if live { 1.0 } else { 0.55 };
+    p.rect_filled(rect, 6.0, CARD_FILL);
+    p.rect_stroke(rect, 6.0, Stroke::new(if alarm { 2.0 } else { 1.0 }, if alarm { GAUGE_ALARM } else { STROKE }));
+    p.text(rect.center_bottom() - Vec2::new(0.0, 8.0), egui::Align2::CENTER_BOTTOM, label, egui::FontId::proportional(10.5), MUTED);
+    let text = gauge_value_text(v);
+    let frac = spec.fraction(v);
+
+    match spec.style {
+        GaugeStyle::Dial => {
+            let c = egui::pos2(rect.center().x, rect.top() + 50.0);
+            let r = 36.0;
+            // 240° sweep from lower-left (150°) clockwise to lower-right (30°), screen coords.
+            let at = |t: f32, rad: f32| {
+                let a = (150.0 + 240.0 * t).to_radians();
+                c + Vec2::new(a.cos(), a.sin()) * rad
+            };
+            let arc = |t0: f32, t1: f32, rad: f32| -> Vec<egui::Pos2> {
+                let n = ((t1 - t0) * 48.0).ceil().max(2.0) as usize;
+                (0..=n).map(|i| at(t0 + (t1 - t0) * i as f32 / n as f32, rad)).collect()
+            };
+            p.add(egui::Shape::line(arc(0.0, 1.0, r), Stroke::new(6.0, theme::WIDGET_BG)));
+            if let Some(h) = spec.warn_high {
+                p.add(egui::Shape::line(arc(spec.fraction(h), 1.0, r), Stroke::new(6.0, GAUGE_ALARM.gamma_multiply(0.45))));
+            }
+            if let Some(l) = spec.warn_low {
+                p.add(egui::Shape::line(arc(0.0, spec.fraction(l), r), Stroke::new(6.0, GAUGE_ALARM.gamma_multiply(0.45))));
+            }
+            if v.is_finite() && frac > 0.0 {
+                p.add(egui::Shape::line(arc(0.0, frac, r), Stroke::new(6.0, accent.gamma_multiply(dim))));
+            }
+            for k in 0..=4 {
+                let t = k as f32 / 4.0;
+                p.line_segment([at(t, r + 5.0), at(t, r + 9.0)], Stroke::new(1.0, MUTED));
+            }
+            // Range labels sit outside the arc ends so they never touch the readout.
+            p.text(at(0.0, r + 6.0) + Vec2::new(-2.0, 0.0), egui::Align2::RIGHT_CENTER, gauge_value_text(spec.min), egui::FontId::monospace(8.5), MUTED);
+            p.text(at(1.0, r + 6.0) + Vec2::new(2.0, 0.0), egui::Align2::LEFT_CENTER, gauge_value_text(spec.max), egui::FontId::monospace(8.5), MUTED);
+            if v.is_finite() {
+                p.line_segment([c, at(frac, r - 8.0)], Stroke::new(2.0, TEXT.gamma_multiply(dim)));
+            }
+            p.circle_filled(c, 3.5, TEXT);
+            p.text(c + Vec2::new(0.0, 24.0), egui::Align2::CENTER_CENTER, &text, egui::FontId::monospace(16.0), accent.gamma_multiply(dim));
+            p.text(c + Vec2::new(0.0, 38.0), egui::Align2::CENTER_CENTER, unit, egui::FontId::proportional(9.0), MUTED);
+        }
+        GaugeStyle::Bar => {
+            p.text(rect.center() - Vec2::new(0.0, 22.0), egui::Align2::CENTER_CENTER, &text, egui::FontId::monospace(20.0), accent.gamma_multiply(dim));
+            p.text(rect.center() - Vec2::new(0.0, 6.0), egui::Align2::CENTER_CENTER, unit, egui::FontId::proportional(9.0), MUTED);
+            let bar = egui::Rect::from_min_size(rect.left_center() + Vec2::new(12.0, 8.0), Vec2::new(rect.width() - 24.0, 14.0));
+            p.rect_filled(bar, 3.0, theme::WIDGET_BG);
+            let x_of = |t: f32| bar.left() + bar.width() * t;
+            if let Some(h) = spec.warn_high {
+                p.rect_filled(egui::Rect::from_x_y_ranges(x_of(spec.fraction(h))..=bar.right(), bar.y_range()), 3.0, GAUGE_ALARM.gamma_multiply(0.35));
+            }
+            if let Some(l) = spec.warn_low {
+                p.rect_filled(egui::Rect::from_x_y_ranges(bar.left()..=x_of(spec.fraction(l)), bar.y_range()), 3.0, GAUGE_ALARM.gamma_multiply(0.35));
+            }
+            if v.is_finite() {
+                // Bipolar ranges (fuel trims) fill from zero, not from the minimum.
+                let zero = if spec.min < 0.0 && spec.max > 0.0 { spec.fraction(0.0) } else { 0.0 };
+                let (a, b) = if frac >= zero { (zero, frac) } else { (frac, zero) };
+                p.rect_filled(egui::Rect::from_x_y_ranges(x_of(a)..=x_of(b), bar.y_range()), 3.0, accent.gamma_multiply(dim));
+            }
+            p.text(bar.left_bottom() + Vec2::new(0.0, 2.0), egui::Align2::LEFT_TOP, gauge_value_text(spec.min), egui::FontId::monospace(8.5), MUTED);
+            p.text(bar.right_bottom() + Vec2::new(0.0, 2.0), egui::Align2::RIGHT_TOP, gauge_value_text(spec.max), egui::FontId::monospace(8.5), MUTED);
+        }
+        GaugeStyle::Digital => {
+            p.text(rect.center() - Vec2::new(0.0, 8.0), egui::Align2::CENTER_CENTER, &text, egui::FontId::monospace(28.0), accent.gamma_multiply(dim));
+            p.text(rect.center() + Vec2::new(0.0, 16.0), egui::Align2::CENTER_CENTER, unit, egui::FontId::proportional(10.0), MUTED);
+        }
+    }
+}
+
+impl WidebandApp {
+    fn render_dashboard_editor(&mut self, ui: &mut egui::Ui, channels: &[crate::telemetry::TelemetryChannelDef]) {
+        use crate::gauges::{Dashboard, GaugeSpec, GaugeStyle};
+        let mut remove: Option<usize> = None;
+        let mut swap: Option<(usize, usize)> = None;
+        let n = self.dashboard.gauges.len();
+        egui::Frame::none()
+            .fill(CARD_FILL)
+            .stroke(Stroke::new(1.0, STROKE))
+            .inner_margin(egui::Margin::same(6.0))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                    egui::Grid::new("dash_edit").striped(true).spacing([8.0, 4.0]).show(ui, |ui| {
+                        for h in ["Channel", "Style", "Min", "Max", "Warn low", "Warn high", ""] {
+                            ui.label(egui::RichText::new(h).small().color(MUTED));
+                        }
+                        ui.end_row();
+                        for (i, g) in self.dashboard.gauges.iter_mut().enumerate() {
+                            let shown = channels.iter().find(|c| c.id == g.channel).map(|c| c.label.clone()).unwrap_or(g.channel.clone());
+                            egui::ComboBox::from_id_salt(("g_ch", i)).selected_text(shown).width(150.0).show_ui(ui, |ui| {
+                                for c in channels {
+                                    ui.selectable_value(&mut g.channel, c.id.clone(), &c.label);
+                                }
+                            });
+                            egui::ComboBox::from_id_salt(("g_st", i)).selected_text(g.style.label()).width(70.0).show_ui(ui, |ui| {
+                                for st in GaugeStyle::ALL {
+                                    ui.selectable_value(&mut g.style, st, st.label());
+                                }
+                            });
+                            ui.add(egui::DragValue::new(&mut g.min).speed(1.0));
+                            ui.add(egui::DragValue::new(&mut g.max).speed(1.0));
+                            for (slot, default) in [(&mut g.warn_low, g.min), (&mut g.warn_high, g.max)] {
+                                ui.horizontal(|ui| {
+                                    let mut on = slot.is_some();
+                                    if ui.checkbox(&mut on, "").changed() {
+                                        *slot = on.then_some(default);
+                                    }
+                                    if let Some(v) = slot {
+                                        ui.add(egui::DragValue::new(v).speed(0.5));
+                                    }
+                                });
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(i > 0, egui::Button::new("\u{2191}").small()).clicked() {
+                                    swap = Some((i, i - 1));
+                                }
+                                if ui.add_enabled(i + 1 < n, egui::Button::new("\u{2193}").small()).clicked() {
+                                    swap = Some((i, i + 1));
+                                }
+                                if ui.small_button("Remove").clicked() {
+                                    remove = Some(i);
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("g_add").selected_text("Add gauge\u{2026}").show_ui(ui, |ui| {
+                        for c in channels {
+                            if ui.selectable_label(false, &c.label).clicked() {
+                                self.dashboard.gauges.push(GaugeSpec::default_for(&c.id));
+                            }
+                        }
+                    });
+                    if ui.button("Save layout").clicked() {
+                        let path = Dashboard::save_path();
+                        match self.dashboard.save(&path) {
+                            Ok(()) => self.log(&format!("Dashboard saved to {}", path.display())),
+                            Err(e) => self.log(&format!("Dashboard save failed: {}", e)),
+                        }
+                    }
+                    if ui.button("Reset to defaults").clicked() {
+                        let ids: Vec<String> = channels.iter().map(|c| c.id.clone()).collect();
+                        self.dashboard = Dashboard::default_layout(&ids);
+                    }
+                });
+            });
+        if let Some((a, b)) = swap {
+            self.dashboard.gauges.swap(a, b);
+        }
+        if let Some(i) = remove {
+            self.dashboard.gauges.remove(i);
         }
     }
 }
