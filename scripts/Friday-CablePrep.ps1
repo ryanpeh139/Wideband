@@ -31,10 +31,10 @@ $script:passCount = 0
 function Write-Result($name, $ok, $detail) {
     if ($ok) {
         $script:passCount++
-        Write-Host ("PASS  " + $name + " — " + $detail) -ForegroundColor Green
+        Write-Host ("PASS  " + $name + " - " + $detail) -ForegroundColor Green
     } else {
         $script:failCount++
-        Write-Host ("FAIL  " + $name + " — " + $detail) -ForegroundColor Red
+        Write-Host ("FAIL  " + $name + " - " + $detail) -ForegroundColor Red
     }
 }
 
@@ -93,7 +93,7 @@ if ($found.Count -gt 0) {
 }
 Write-Result "J2534 registry + DLL on disk" $regOk $regDetail
 
-# security-config: tacoma-can profile row exists (configured may still be false — fail-closed is OK)
+# security-config: tacoma-can profile row exists (configured may still be false - fail-closed is OK)
 $secOk = $false
 $secDetail = "could not read security-config.json"
 $secPath = Join-Path $ReleaseDir "security-config.json"
@@ -110,7 +110,7 @@ if (Test-Path -LiteralPath $secPath) {
             if ($configured) {
                 $secDetail = "profiles.tacoma-can present, configured=true (production keys active)"
             } else {
-                $secDetail = "profiles.tacoma-can present, configured=false (fail-closed flash — expected until you set OEM mask)"
+                $secDetail = "profiles.tacoma-can present, configured=false (fail-closed flash - expected until you set OEM mask)"
             }
         } else {
             $secDetail = "profiles.tacoma-can missing in JSON"
@@ -122,7 +122,7 @@ if (Test-Path -LiteralPath $secPath) {
 Write-Result "security-config tacoma-can row" $secOk $secDetail
 
 if ([string]::IsNullOrWhiteSpace($DllPath)) {
-    Write-Result "device_check.ps1 probe (optional)" $true "skipped — pass -DllPath to your PassThru FunctionLibrary"
+    Write-Result "device_check.ps1 probe (optional)" $true "skipped - pass -DllPath to your PassThru FunctionLibrary"
 } elseif (-not $hasDeviceCheck) {
     Write-Result "device_check.ps1 probe" $false "device_check.ps1 not found"
 } else {
@@ -142,13 +142,13 @@ if ([string]::IsNullOrWhiteSpace($DllPath)) {
 Write-Host ""
 if ($script:failCount -eq 0) {
     Write-Host "OVERALL: PASS ($script:passCount checks)" -ForegroundColor Green
-    Write-Host "You may open wideband.exe — use profile tacoma-can and your registry J2534 device (not Virtual ECU)."
+    Write-Host "You may open wideband.exe - use profile tacoma-can and your registry J2534 device (not Virtual ECU)."
     exit 0
 } else {
     Write-Host "OVERALL: FAIL ($script:failCount failed, $script:passCount passed)" -ForegroundColor Red
     Write-Host "Fix FAIL lines above. Typical fixes:"
-    Write-Host "  • Run scripts\Package-WindowsRelease.ps1 to copy J2534Host + profiles"
-    Write-Host "  • Install Mini-VCI / VXDIAG J2534 driver (PassThruSupport registry)"
-    Write-Host "  • device_check.ps1 -DllPath <your FunctionLibrary path>"
+    Write-Host "  - Run scripts\Package-WindowsRelease.ps1 to copy J2534Host + profiles"
+    Write-Host "  - Install Mini-VCI / VXDIAG J2534 driver (PassThruSupport registry)"
+    Write-Host "  - device_check.ps1 -DllPath <your FunctionLibrary path>"
     exit 1
 }
