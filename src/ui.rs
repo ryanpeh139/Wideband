@@ -8,7 +8,7 @@ use crate::security_config::{PlatformSecurity, CHECKSUM_UPDATED, CHECKSUM_VALID}
 use std::fs;
 use std::path::PathBuf;
 use crate::surface_mesh;
-use crate::telemetry::TelemetryBuffer;
+use crate::telemetry::{decode_channel_value, TelemetryBuffer, TelemetryChannelFile};
 use crate::theme::{
     self, paint_live_cell_glow, paint_studio_badge, studio_tab_button, ACCENT_CYAN, CARD_FILL,
     EMERALD, MUTED, STROKE, TEXT, heatmap_color,
@@ -17,7 +17,7 @@ use eframe::egui::{self, Color32, Pos2, Stroke, Vec2};
 use egui_extras::{Column, TableBuilder};
 use egui_plot::{Line, Plot, PlotPoints};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceTab {
@@ -110,7 +110,9 @@ impl WidebandApp {
             rom_origin: 0,
             rom_path: None,
             xdf_path: None,
-            telemetry: Arc::new(Mutex::new(TelemetryBuffer::new(5000))),
+            telemetry: Arc::new(Mutex::new(
+                TelemetryBuffer::from_definition(&TelemetryChannelFile::load_default(), 5000),
+            )),
             trace_rpm: 2400.0,
             trace_map: 70.0,
             live_poller_active: true,
@@ -299,29 +301,54 @@ impl WidebandApp {
             return;
         }
 
-        if self.last_poll_time.elapsed() < Duration::from_millis(50) {
+        let tick = {
+            let buf = self.telemetry.lock().unwrap();
+            buf.scheduler.tick_interval()
+        };
+        if self.last_poll_time.elapsed() < tick {
             return;
         }
         self.last_poll_time = Instant::now();
+        let now = Instant::now();
 
         if let Some(dev) = &mut self.active_device {
             let prof = &self.profiles[self.selected_profile_idx];
-            let pids = [0x0C, 0x0B, 0x04, 0x05, 0x0E, 0x0F, 0x11, 0x24];
-            let mut snap = self.telemetry.lock().unwrap().latest();
-            snap.time_sec = self.telemetry.lock().unwrap().start_time.elapsed().as_secs_f64();
+            let due: Vec<(usize, Vec<u8>, String)> = {
+                let mut buf = self.telemetry.lock().unwrap();
+                buf.scheduler
+                    .due_indices(&buf.channels, now)
+                    .into_iter()
+                    .map(|idx| {
+                        let ch = &buf.channels[idx];
+                        (
+                            idx,
+                            ch.build_request_bytes(),
+                            ch.decode.clone(),
+                        )
+                    })
+                    .collect()
+            };
 
-            for &pid in &pids {
-                let req = vec![0x01, pid];
-                if let Ok(()) = crate::protocols::IsoTpLink::send(dev.as_mut(), 1, prof.request_id, &req) {
+            for (idx, req, decode_id) in due {
+                if let Ok(()) =
+                    crate::protocols::IsoTpLink::send(dev.as_mut(), 1, prof.request_id, &req)
+                {
                     if let Ok(resp) = crate::protocols::IsoTpLink::receive(dev.as_mut(), 1, 10) {
-                        TelemetryBuffer::parse_mode01_response(&mut snap, &resp);
+                        if let Some(value) = decode_channel_value(&decode_id, &resp) {
+                            let mut buf = self.telemetry.lock().unwrap();
+                            buf.set_channel_value(idx, value);
+                            buf.scheduler.mark_polled(idx, now);
+                        }
                     }
                 }
             }
 
-            self.trace_rpm = snap.rpm;
-            self.trace_map = snap.map_kpa;
-            self.telemetry.lock().unwrap().push(snap);
+            {
+                let mut buf = self.telemetry.lock().unwrap();
+                self.trace_rpm = buf.value("rpm");
+                self.trace_map = buf.value("map");
+                buf.push_frame();
+            }
 
             // Update tracked active cell in active table
             if !self.xdf.tables.is_empty() {
@@ -978,23 +1005,60 @@ impl WidebandApp {
 
 impl WidebandApp {
     fn render_telemetry_tab(&mut self, ctx: &egui::Context) {
+        let (gauge_channels, recording, def_title) = {
+            let buf = self.telemetry.lock().unwrap();
+            let gauges: Vec<(String, String, String, [u8; 3])> = buf
+                .channels
+                .iter()
+                .enumerate()
+                .filter(|(_, ch)| ch.gauge)
+                .map(|(i, ch)| {
+                    (
+                        ch.label.clone(),
+                        Self::format_channel_value(ch.id.as_str(), buf.latest[i]),
+                        ch.unit.clone(),
+                        ch.plot_color(),
+                    )
+                })
+                .collect();
+            (gauges, buf.is_recording, buf.definition_title.clone())
+        };
+
         egui::TopBottomPanel::top("gauge_strip").min_height(72.0).show(ctx, |ui| {
-            let snap = self.telemetry.lock().unwrap().latest();
             ui.horizontal_centered(|ui| {
                 ui.add_space(8.0);
-                self.render_gauge_card(ui, "ENGINE RPM", format!("{:.0}", snap.rpm), "RPM", Color32::from_rgb(0, 229, 255));
-                self.render_gauge_card(ui, "MANIFOLD MAP", format!("{:.1}", snap.map_kpa), "kPa", Color32::from_rgb(255, 193, 7));
-                self.render_gauge_card(ui, "LAMBDA (AFR)", format!("{:.3}", snap.lambda), "λ", Color32::from_rgb(0, 230, 118));
-                self.render_gauge_card(ui, "SPARK ADVANCE", format!("{:.1}", snap.timing_deg), "deg", Color32::from_rgb(244, 67, 54));
-                self.render_gauge_card(ui, "COOLANT ECT", format!("{:.0}", snap.ect_c), "°C", Color32::from_rgb(30, 136, 229));
-                self.render_gauge_card(ui, "CALC LOAD", format!("{:.0}", snap.load_pct), "%", Color32::from_rgb(255, 152, 0));
+                for (label, text, unit, rgb) in &gauge_channels {
+                    self.render_gauge_card(
+                        ui,
+                        label,
+                        text.clone(),
+                        unit,
+                        Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
+                    );
+                }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Export CSV Log").clicked() {
                         let exported = self.telemetry.lock().unwrap().export_csv("datalog.csv").is_ok();
                         if exported {
                             self.log("Datalog exported successfully to datalog.csv");
+                        } else {
+                            self.log("Export failed — start live polling or record first.");
                         }
+                    }
+                    let rec_label = if recording { "■ Stop Record" } else { "● Record" };
+                    if ui.button(rec_label).clicked() {
+                        let on = {
+                            let mut buf = self.telemetry.lock().unwrap();
+                            let next = !buf.is_recording;
+                            buf.set_recording(next);
+                            next
+                        };
+                        self.log(if on {
+                            "Telemetry recording started (samples appended to record buffer)."
+                        } else {
+                            "Telemetry recording stopped."
+                        });
                     }
                     if ui.button("Clear Log").clicked() {
                         self.telemetry.lock().unwrap().clear();
@@ -1005,46 +1069,66 @@ impl WidebandApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading(egui::RichText::new("Oscilloscope Real-Time Telemetry Strip Chart").size(15.0).color(Color32::WHITE));
+            ui.horizontal(|ui| {
+                ui.heading(
+                    egui::RichText::new("Definition-Driven Live Strip Chart")
+                        .size(15.0)
+                        .color(Color32::WHITE),
+                );
+                ui.label(
+                    egui::RichText::new(format!("({})", def_title))
+                        .small()
+                        .color(Color32::GRAY),
+                );
+            });
             ui.add_space(4.0);
 
             let buffer = self.telemetry.lock().unwrap();
-            let mut rpm_points = Vec::new();
-            let mut map_points = Vec::new();
-            let mut lambda_points = Vec::new();
-            let mut timing_points = Vec::new();
-
-            for s in &buffer.snapshots {
-                rpm_points.push([s.time_sec, s.rpm as f64]);
-                map_points.push([s.time_sec, s.map_kpa as f64 * 30.0]); // Scaled for visible overlay
-                lambda_points.push([s.time_sec, s.lambda as f64 * 3000.0]);
-                timing_points.push([s.time_sec, s.timing_deg as f64 * 100.0]);
+            let mut plot_lines: Vec<Line> = Vec::new();
+            for (ch_idx, ch) in buffer.channels.iter().enumerate() {
+                if ch.plot.is_none() {
+                    continue;
+                }
+                let scale = ch.plot_scale();
+                let mut points = Vec::new();
+                for frame in &buffer.frames {
+                    if ch_idx < frame.values.len() {
+                        points.push([frame.time_sec, frame.values[ch_idx] as f64 * scale]);
+                    }
+                }
+                let rgb = ch.plot_color();
+                let name = if scale != 1.0 {
+                    format!("{} (×{})", ch.label, scale)
+                } else {
+                    ch.label.clone()
+                };
+                plot_lines.push(
+                    Line::new(PlotPoints::new(points))
+                        .color(Color32::from_rgb(rgb[0], rgb[1], rgb[2]))
+                        .name(name),
+                );
             }
-
-            let rpm_line = Line::new(PlotPoints::new(rpm_points))
-                .color(Color32::from_rgb(0, 229, 255))
-                .name("RPM");
-            let map_line = Line::new(PlotPoints::new(map_points))
-                .color(Color32::from_rgb(255, 193, 7))
-                .name("MAP (kPa x30)");
-            let lambda_line = Line::new(PlotPoints::new(lambda_points))
-                .color(Color32::from_rgb(0, 230, 118))
-                .name("Lambda (x3000)");
-            let timing_line = Line::new(PlotPoints::new(timing_points))
-                .color(Color32::from_rgb(244, 67, 54))
-                .name("Timing (° x100)");
 
             Plot::new("telemetry_oscilloscope")
                 .view_aspect(2.2)
                 .show_axes([true, true])
                 .legend(egui_plot::Legend::default())
                 .show(ui, |plot_ui| {
-                    plot_ui.line(rpm_line);
-                    plot_ui.line(map_line);
-                    plot_ui.line(lambda_line);
-                    plot_ui.line(timing_line);
+                    for line in plot_lines {
+                        plot_ui.line(line);
+                    }
                 });
         });
+    }
+
+    fn format_channel_value(channel_id: &str, value: f32) -> String {
+        match channel_id {
+            "rpm" | "ect" | "load" => format!("{:.0}", value),
+            "map" | "timing" => format!("{:.1}", value),
+            "lambda" => format!("{:.3}", value),
+            "vbatt" => format!("{:.2}", value),
+            _ => format!("{:.1}", value),
+        }
     }
 
     fn render_gauge_card(&self, ui: &mut egui::Ui, title: &str, value: String, unit: &str, accent: Color32) {

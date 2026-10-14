@@ -1,146 +1,448 @@
-use std::collections::VecDeque;
+use serde::Deserialize;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct TelemetrySnapshot {
-    pub time_sec: f64,
-    pub rpm: f32,
-    pub map_kpa: f32,
-    pub load_pct: f32,
-    pub ect_c: f32,
-    pub timing_deg: f32,
-    pub iat_c: f32,
-    pub tps_pct: f32,
-    pub lambda: f32,
+// ---------------------------------------------------------------------------
+// JSON channel definition
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct TelemetryChannelFile {
+    pub version: u32,
+    pub title: Option<String>,
+    pub channels: Vec<TelemetryChannelDef>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct TelemetryChannelDef {
+    pub id: String,
+    pub label: String,
+    pub unit: String,
+    pub priority: u8,
+    pub interval_ms: u64,
+    pub request: ChannelRequestDef,
+    pub decode: String,
+    #[serde(default = "default_true")]
+    pub gauge: bool,
+    pub plot: Option<PlotStyleDef>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct PlotStyleDef {
+    pub scale: f64,
+    pub color: [u8; 3],
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "service", rename_all = "snake_case")]
+pub enum ChannelRequestDef {
+    Mode01 { pid: u8 },
+    Uds22 { did: u16 },
+}
+
+impl TelemetryChannelFile {
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+        let file: TelemetryChannelFile =
+            serde_json::from_str(&text).map_err(|e| format!("Invalid telemetry JSON: {}", e))?;
+        if file.channels.is_empty() {
+            return Err("telemetry channel file has no channels".to_string());
+        }
+        Ok(file)
+    }
+
+    pub fn default_path() -> PathBuf {
+        PathBuf::from("telemetry-channels.json")
+    }
+
+    pub fn load_default() -> Self {
+        Self::load(&Self::default_path()).unwrap_or_else(|e| {
+            eprintln!("telemetry: {} — using built-in fallback", e);
+            Self::builtin_fallback()
+        })
+    }
+
+    fn builtin_fallback() -> Self {
+        serde_json::from_str(
+            r#"{
+            "version": 1,
+            "channels": [
+              {"id":"rpm","label":"RPM","unit":"RPM","priority":1,"interval_ms":50,
+               "request":{"service":"mode01","pid":12},"decode":"pid_0c_rpm","gauge":true,
+               "plot":{"scale":1.0,"color":[0,229,255]}}
+            ]
+          }"#,
+        )
+        .expect("builtin telemetry fallback")
+    }
+}
+
+impl TelemetryChannelDef {
+    pub fn build_request_bytes(&self) -> Vec<u8> {
+        match &self.request {
+            ChannelRequestDef::Mode01 { pid } => vec![0x01, *pid],
+            ChannelRequestDef::Uds22 { did } => vec![0x22, (did >> 8) as u8, (did & 0xFF) as u8],
+        }
+    }
+
+    pub fn plot_scale(&self) -> f64 {
+        self.plot.as_ref().map(|p| p.scale).unwrap_or(1.0)
+    }
+
+    pub fn plot_color(&self) -> [u8; 3] {
+        self.plot
+            .as_ref()
+            .map(|p| p.color)
+            .unwrap_or([180, 180, 180])
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Response decode (definition-driven by decode id)
+// ---------------------------------------------------------------------------
+
+pub fn decode_channel_value(decode: &str, resp: &[u8]) -> Option<f32> {
+    if resp.len() < 2 {
+        return None;
+    }
+    if resp[0] == 0x7F {
+        return None;
+    }
+
+    match decode {
+        "pid_0c_rpm" => {
+            if resp[0] == 0x41 && resp.len() >= 4 && resp[1] == 0x0C {
+                let raw = ((resp[2] as u16) << 8) | (resp[3] as u16);
+                Some(raw as f32 / 4.0)
+            } else {
+                None
+            }
+        }
+        "pid_0b_map_kpa" => {
+            if resp[0] == 0x41 && resp.len() >= 3 && resp[1] == 0x0B {
+                Some(resp[2] as f32)
+            } else {
+                None
+            }
+        }
+        "pid_04_load" => {
+            if resp[0] == 0x41 && resp.len() >= 3 && resp[1] == 0x04 {
+                Some((resp[2] as f32) * 100.0 / 255.0)
+            } else {
+                None
+            }
+        }
+        "pid_05_ect" => {
+            if resp[0] == 0x41 && resp.len() >= 3 && resp[1] == 0x05 {
+                Some((resp[2] as f32) - 40.0)
+            } else {
+                None
+            }
+        }
+        "pid_0e_timing" => {
+            if resp[0] == 0x41 && resp.len() >= 3 && resp[1] == 0x0E {
+                Some((resp[2] as f32) / 2.0 - 64.0)
+            } else {
+                None
+            }
+        }
+        "pid_0f_iat" => {
+            if resp[0] == 0x41 && resp.len() >= 3 && resp[1] == 0x0F {
+                Some((resp[2] as f32) - 40.0)
+            } else {
+                None
+            }
+        }
+        "pid_11_tps" => {
+            if resp[0] == 0x41 && resp.len() >= 3 && resp[1] == 0x11 {
+                Some((resp[2] as f32) * 100.0 / 255.0)
+            } else {
+                None
+            }
+        }
+        "pid_24_lambda" => {
+            if resp[0] == 0x41 && resp.len() >= 4 && (resp[1] == 0x24 || resp[1] == 0x34) {
+                let raw = ((resp[2] as u16) << 8) | (resp[3] as u16);
+                Some(raw as f32 / 32768.0)
+            } else {
+                None
+            }
+        }
+        "did_f010_vbatt" => {
+            if resp[0] == 0x62 && resp.len() >= 5 && resp[1] == 0xF0 && resp[2] == 0x10 {
+                let raw = ((resp[3] as u16) << 8) | (resp[4] as u16);
+                Some(raw as f32 / 1000.0)
+            } else {
+                None
+            }
+        }
+        "did_f011_oil_temp" => {
+            if resp[0] == 0x62 && resp.len() >= 4 && resp[1] == 0xF0 && resp[2] == 0x11 {
+                Some((resp[3] as f32) - 40.0)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler — priority + per-channel sample interval
+// ---------------------------------------------------------------------------
+
+pub struct TelemetryScheduler {
+    last_poll: Vec<Instant>,
+    tick_ms: u64,
+}
+
+impl TelemetryScheduler {
+    pub fn new(channel_count: usize, tick_ms: u64) -> Self {
+        // Stagger start so every channel is eligible on the first scheduler tick.
+        let stale = Instant::now() - std::time::Duration::from_secs(3600);
+        Self {
+            last_poll: vec![stale; channel_count],
+            tick_ms,
+        }
+    }
+
+    /// Channel indices due for a request, highest priority (lowest number) first.
+    pub fn due_indices(&self, channels: &[TelemetryChannelDef], now: Instant) -> Vec<usize> {
+        let mut due: Vec<(u8, usize)> = channels
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, ch)| {
+                let elapsed = now.duration_since(self.last_poll[idx]).as_millis() as u64;
+                if elapsed >= ch.interval_ms {
+                    Some((ch.priority, idx))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        due.sort_by_key(|(pri, _)| *pri);
+        due.into_iter().map(|(_, idx)| idx).collect()
+    }
+
+    pub fn mark_polled(&mut self, idx: usize, when: Instant) {
+        if idx < self.last_poll.len() {
+            self.last_poll[idx] = when;
+        }
+    }
+
+    pub fn tick_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.tick_ms)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic ring buffer + optional recording
+// ---------------------------------------------------------------------------
+
 #[derive(Clone, Debug)]
+pub struct TelemetryFrame {
+    pub time_sec: f64,
+    pub values: Vec<f32>,
+}
+
 pub struct TelemetryBuffer {
-    pub snapshots: VecDeque<TelemetrySnapshot>,
+    pub channels: Vec<TelemetryChannelDef>,
+    pub id_index: HashMap<String, usize>,
+    pub latest: Vec<f32>,
+    pub frames: VecDeque<TelemetryFrame>,
     pub max_capacity: usize,
-    pub is_logging: bool,
+    pub is_recording: bool,
+    pub record_frames: Vec<TelemetryFrame>,
     pub start_time: Instant,
+    pub scheduler: TelemetryScheduler,
+    pub definition_title: String,
 }
 
 impl TelemetryBuffer {
-    pub fn new(capacity: usize) -> Self {
+    pub fn from_definition(def: &TelemetryChannelFile, capacity: usize) -> Self {
+        let channels = def.channels.clone();
+        let id_index: HashMap<String, usize> = channels
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.id.clone(), i))
+            .collect();
+        let channel_count = channels.len();
         Self {
-            snapshots: VecDeque::with_capacity(capacity),
+            channels,
+            id_index,
+            latest: vec![0.0; channel_count],
+            frames: VecDeque::with_capacity(capacity.min(1024)),
             max_capacity: capacity,
-            is_logging: false,
+            is_recording: false,
+            record_frames: Vec::new(),
             start_time: Instant::now(),
+            scheduler: TelemetryScheduler::new(channel_count, 50),
+            definition_title: def.title.clone().unwrap_or_else(|| "Live channels".to_string()),
         }
     }
 
-    pub fn push(&mut self, snap: TelemetrySnapshot) {
-        if self.snapshots.len() >= self.max_capacity {
-            self.snapshots.pop_front();
-        }
-        self.snapshots.push_back(snap);
+    pub fn channel_idx(&self, id: &str) -> Option<usize> {
+        self.id_index.get(id).copied()
     }
 
-    pub fn latest(&self) -> TelemetrySnapshot {
-        self.snapshots.back().copied().unwrap_or_default()
+    pub fn value(&self, id: &str) -> f32 {
+        self.channel_idx(id)
+            .and_then(|i| self.latest.get(i).copied())
+            .unwrap_or(0.0)
+    }
+
+    pub fn set_channel_value(&mut self, idx: usize, value: f32) {
+        if idx < self.latest.len() {
+            self.latest[idx] = value;
+        }
+    }
+
+    pub fn push_frame(&mut self) {
+        let time_sec = self.start_time.elapsed().as_secs_f64();
+        let frame = TelemetryFrame {
+            time_sec,
+            values: self.latest.clone(),
+        };
+        if self.frames.len() >= self.max_capacity {
+            self.frames.pop_front();
+        }
+        self.frames.push_back(frame.clone());
+        if self.is_recording {
+            self.record_frames.push(frame);
+        }
     }
 
     pub fn clear(&mut self) {
-        self.snapshots.clear();
+        self.frames.clear();
+        self.record_frames.clear();
+        self.latest.fill(0.0);
         self.start_time = Instant::now();
+        let now = Instant::now();
+        for t in &mut self.scheduler.last_poll {
+            *t = now;
+        }
+    }
+
+    pub fn set_recording(&mut self, on: bool) {
+        if on && !self.is_recording {
+            self.record_frames.clear();
+        }
+        self.is_recording = on;
     }
 
     pub fn export_csv(&self, path: &str) -> Result<(), String> {
-        let mut file = File::create(path).map_err(|e| format!("Failed to create CSV file: {}", e))?;
-        writeln!(file, "Time_s,RPM,MAP_kPa,Load_pct,ECT_C,Timing_deg,IAT_C,TPS_pct,Lambda")
-            .map_err(|e| format!("Failed to write header: {}", e))?;
+        let export_rows: Vec<&TelemetryFrame> = if !self.record_frames.is_empty() {
+            self.record_frames.iter().collect()
+        } else {
+            self.frames.iter().collect()
+        };
+        if export_rows.is_empty() {
+            return Err("No telemetry samples to export".to_string());
+        }
 
-        for s in &self.snapshots {
-            writeln!(
-                file,
-                "{:.3},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.3}",
-                s.time_sec, s.rpm, s.map_kpa, s.load_pct, s.ect_c, s.timing_deg, s.iat_c, s.tps_pct, s.lambda
-            ).map_err(|e| format!("Failed to write row: {}", e))?;
+        let mut file = File::create(path).map_err(|e| format!("Failed to create CSV: {}", e))?;
+        let header_ids: Vec<&str> = self.channels.iter().map(|c| c.id.as_str()).collect();
+        writeln!(file, "Time_s,{}", header_ids.join(","))
+            .map_err(|e| format!("Failed to write header: {}", e))?;
+        for frame in export_rows {
+            let mut line = format!("{:.3}", frame.time_sec);
+            for v in &frame.values {
+                line.push(',');
+                line.push_str(&format!("{:.4}", v));
+            }
+            writeln!(file, "{}", line).map_err(|e| format!("Failed to write row: {}", e))?;
         }
         Ok(())
     }
 
-    pub fn import_csv(path: &str) -> Result<Vec<TelemetrySnapshot>, String> {
-        let file = File::open(path).map_err(|e| format!("Failed to open CSV file: {}", e))?;
+    pub fn import_csv(path: &str, def: &TelemetryChannelFile) -> Result<Vec<TelemetryFrame>, String> {
+        let file = File::open(path).map_err(|e| format!("Failed to open CSV: {}", e))?;
         let reader = BufReader::new(file);
-        let mut result = Vec::new();
-
-        for (idx, line) in reader.lines().enumerate() {
-            let line = line.map_err(|e| format!("Error reading line: {}", e))?;
-            if idx == 0 || line.trim().is_empty() {
-                continue; // Skip header
-            }
-
-            let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
-            if parts.len() >= 9 {
-                let snap = TelemetrySnapshot {
-                    time_sec: parts[0].parse().unwrap_or(0.0),
-                    rpm: parts[1].parse().unwrap_or(0.0),
-                    map_kpa: parts[2].parse().unwrap_or(0.0),
-                    load_pct: parts[3].parse().unwrap_or(0.0),
-                    ect_c: parts[4].parse().unwrap_or(0.0),
-                    timing_deg: parts[5].parse().unwrap_or(0.0),
-                    iat_c: parts[6].parse().unwrap_or(0.0),
-                    tps_pct: parts[7].parse().unwrap_or(0.0),
-                    lambda: parts[8].parse().unwrap_or(1.0),
-                };
-                result.push(snap);
-            }
+        let mut lines: Vec<String> = reader
+            .lines()
+            .map(|l| l.map_err(|e| e.to_string()))
+            .collect::<Result<_, _>>()?;
+        if lines.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(result)
+        let header: Vec<&str> = lines[0].split(',').map(|s| s.trim()).collect();
+        if header.len() < 2 || header[0] != "Time_s" {
+            return Err("CSV header must start with Time_s".to_string());
+        }
+        let col_map: HashMap<String, usize> = def
+            .channels
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.id.clone(), i + 1))
+            .collect();
+        let mut out = Vec::new();
+        for line in lines.iter().skip(1) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+            let time_sec = parts[0].parse().unwrap_or(0.0);
+            let mut values = vec![0.0f32; def.channels.len()];
+            for (col_idx, col_name) in header.iter().enumerate().skip(1) {
+                if let Some(&ch_idx) = col_map.get(*col_name) {
+                    if col_idx < parts.len() {
+                        values[ch_idx - 1] = parts[col_idx].parse().unwrap_or(0.0);
+                    }
+                }
+            }
+            out.push(TelemetryFrame { time_sec, values });
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_load_default_channels() {
+        let def = TelemetryChannelFile::load_default();
+        assert!(def.channels.len() >= 8);
+        assert!(def.channels.iter().any(|c| c.id == "rpm"));
     }
 
-    pub fn parse_mode01_response(snap: &mut TelemetrySnapshot, resp: &[u8]) {
-        if resp.len() < 3 || resp[0] != 0x41 {
-            return;
-        }
+    #[test]
+    fn test_scheduler_respects_interval_and_priority() {
+        let def = TelemetryChannelFile::load_default();
+        let sched = TelemetryScheduler::new(def.channels.len(), 50);
+        let now = Instant::now();
+        let due = sched.due_indices(&def.channels, now);
+        assert!(!due.is_empty());
+        let rpm_idx = def.channels.iter().position(|c| c.id == "rpm").unwrap();
+        assert_eq!(due[0], rpm_idx);
+    }
 
-        let pid = resp[1];
-        match pid {
-            0x0C => {
-                // RPM: ((A * 256) + B) / 4
-                if resp.len() >= 4 {
-                    let raw = ((resp[2] as u16) << 8) | (resp[3] as u16);
-                    snap.rpm = raw as f32 / 4.0;
-                }
-            }
-            0x0B => {
-                // MAP (kPa): A
-                snap.map_kpa = resp[2] as f32;
-            }
-            0x04 => {
-                // Calculated Engine Load %: A * 100 / 255
-                snap.load_pct = (resp[2] as f32) * 100.0 / 255.0;
-            }
-            0x05 => {
-                // ECT C: A - 40
-                snap.ect_c = (resp[2] as f32) - 40.0;
-            }
-            0x0E => {
-                // Timing Advance deg: (A / 2) - 64
-                snap.timing_deg = ((resp[2] as f32) / 2.0) - 64.0;
-            }
-            0x0F => {
-                // IAT C: A - 40
-                snap.iat_c = (resp[2] as f32) - 40.0;
-            }
-            0x11 => {
-                // Throttle Position %: A * 100 / 255
-                snap.tps_pct = (resp[2] as f32) * 100.0 / 255.0;
-            }
-            0x24 | 0x34 => {
-                // Wideband Lambda: ((A * 256) + B) / 32768
-                if resp.len() >= 4 {
-                    let raw = ((resp[2] as u16) << 8) | (resp[3] as u16);
-                    snap.lambda = (raw as f32) / 32768.0;
-                }
-            }
-            _ => {}
-        }
+    #[test]
+    fn test_decode_mode01_rpm() {
+        let resp = vec![0x41, 0x0C, 0x1F, 0x40];
+        let v = decode_channel_value("pid_0c_rpm", &resp).unwrap();
+        assert!((v - 2000.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_dynamic_buffer_csv_roundtrip() {
+        let def = TelemetryChannelFile::load_default();
+        let mut buf = TelemetryBuffer::from_definition(&def, 100);
+        buf.set_channel_value(0, 1234.0);
+        buf.push_frame();
+        let path = std::env::temp_dir().join("wideband-telemetry-test.csv");
+        buf.export_csv(path.to_str().unwrap()).unwrap();
+        let imported = TelemetryBuffer::import_csv(path.to_str().unwrap(), &def).unwrap();
+        assert_eq!(imported.len(), 1);
+        assert!((imported[0].values[0] - 1234.0).abs() < 0.01);
     }
 }
