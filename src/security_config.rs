@@ -7,11 +7,17 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 #[cfg(test)]
-fn test_install_lock() -> std::sync::MutexGuard<'static, ()> {
+fn test_serial_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Hold for the full body of any test that reads or writes `PlatformSecurity` state (parallel-safe).
+#[cfg(test)]
+pub fn test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
+    test_serial_lock()
 }
 
 pub const CHECKSUM_VALID: &str = "Checksum Valid";
@@ -154,8 +160,6 @@ impl PlatformSecurity {
     }
 
     pub fn install(path: &Path) {
-        #[cfg(test)]
-        let _test_install_guard = test_install_lock();
         let mut guard = state().lock().unwrap();
         guard.profile_keys.clear();
         guard.file_configured_profiles.clear();
@@ -205,8 +209,6 @@ impl PlatformSecurity {
 
     /// Bench-only key registration for the virtual ECU loopback (mask 0). Not for production hardware.
     pub fn register_bench_keys_for_virtual() {
-        #[cfg(test)]
-        let _test_install_guard = test_install_lock();
         let mut guard = state().lock().unwrap();
         for id in ["tacoma-can", "tacoma-kline"] {
             guard.profile_keys.insert(
@@ -345,9 +347,9 @@ Configure security-config.json with your authorized Denso mask or generation bef
     }
 
     pub fn security_report(profile_id: &str, virtual_ecu: bool) -> SecurityReport {
-        let guard = state().lock().unwrap();
         let mode = Self::security_mode(profile_id, virtual_ecu);
         let flash_blockers = Self::flash_blockers(profile_id, virtual_ecu);
+        let guard = state().lock().unwrap();
 
         let profiles: Vec<ProfileSecurityLine> = BUILT_IN_PROFILES
             .iter()
@@ -1207,6 +1209,7 @@ mod security_config_tests {
 
     #[test]
     fn rejects_missing_profiles_object() {
+        let _guard = PlatformSecurity::test_serial_guard();
         let path = write_temp_config(
             "wideband-sec-no-profiles.json",
             r#"{ "checksums": [] }"#,
@@ -1218,6 +1221,7 @@ mod security_config_tests {
 
     #[test]
     fn production_flash_blocked_with_bench_keys_only() {
+        let _guard = PlatformSecurity::test_serial_guard();
         PlatformSecurity::install(&PathBuf::from("tests/security-config-test.json"));
         PlatformSecurity::register_bench_keys_for_virtual();
         let blockers = PlatformSecurity::flash_blockers("tacoma-can", false);
@@ -1231,6 +1235,7 @@ mod security_config_tests {
 
     #[test]
     fn fail_closed_when_profile_not_configured() {
+        let _guard = PlatformSecurity::test_serial_guard();
         PlatformSecurity::install(&PathBuf::from("security-config.json"));
         let blockers = PlatformSecurity::flash_blockers("tacoma-can", false);
         assert!(!blockers.is_empty());
