@@ -36,6 +36,41 @@ pub fn apply_motorsport_theme(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
+/// System fonts with arrows / geometric shapes (→ ← ● ▶ ⏸ ↻) that egui's bundled Ubuntu font
+/// lacks — without one those glyphs render as empty boxes. First existing file wins.
+const SYMBOL_FALLBACK_FONTS: &[&str] = &[
+    "C:\\Windows\\Fonts\\seguisym.ttf",
+    "C:\\Windows\\Fonts\\segoeui.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+];
+
+/// Append an installed symbol font as the last fallback of both families. Call once at startup
+/// (`set_fonts` re-rasterises the atlas). No-op when none is installed.
+pub fn install_symbol_fallback_font(ctx: &egui::Context) {
+    let Some((path, bytes)) = SYMBOL_FALLBACK_FONTS
+        .iter()
+        .find_map(|p| std::fs::read(p).ok().map(|b| (*p, b)))
+    else {
+        eprintln!("theme: no system symbol font found; arrows/bullets may render as boxes");
+        return;
+    };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts
+        .font_data
+        .insert("symbol-fallback".to_owned(), egui::FontData::from_owned(bytes));
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .push("symbol-fallback".to_owned());
+    }
+    ctx.set_fonts(fonts);
+    eprintln!("theme: symbol fallback font {}", path);
+}
+
 pub fn motorsport_visuals() -> Visuals {
     let mut visuals = Visuals::dark();
     let r = round_all();
@@ -206,6 +241,12 @@ pub fn paint_live_cell_glow(painter: &egui::Painter, rect: egui::Rect) {
     let cyan = ACCENT_CYAN;
     painter.rect_stroke(rect.shrink(0.5), 2.0, Stroke::new(1.0, cyan));
     painter.rect_stroke(rect.expand(1.0), 3.0, Stroke::new(1.0, cyan.gamma_multiply(0.45)));
+}
+
+/// Live operating-point cell (engine is here now) — green, distinct from the cyan edit selection.
+pub fn paint_operating_cell_glow(painter: &egui::Painter, rect: egui::Rect) {
+    painter.rect_stroke(rect.shrink(1.5), 2.0, Stroke::new(2.0, EMERALD));
+    painter.rect_stroke(rect.expand(2.0), 3.0, Stroke::new(1.5, EMERALD.gamma_multiply(0.4)));
 }
 
 pub fn studio_tab_button(

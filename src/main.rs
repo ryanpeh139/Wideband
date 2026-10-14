@@ -10,6 +10,7 @@ pub mod flash_layout;
 pub mod managers;
 pub mod patch_recipe;
 pub mod isotp;
+pub mod live_trace;
 pub mod j2534;
 pub mod j2534_host;
 pub mod definition_pack;
@@ -49,6 +50,7 @@ fn main() -> eframe::Result<()> {
         native_options,
         Box::new(|cc| {
             theme::apply_motorsport_theme(&cc.egui_ctx);
+            theme::install_symbol_fallback_font(&cc.egui_ctx);
             Ok(Box::new(WidebandApp::new(cc)))
         }),
     )
