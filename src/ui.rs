@@ -8,10 +8,8 @@ use crate::diagnostics::{
 };
 use crate::flash_job::FlashJob;
 use crate::flash_layout::FlashLayoutMap;
-use crate::j2534::{
-    connect_for_profile, create_device, transport_hint_for_device, J2534DeviceInfo, J2534RegistryScanner,
-    PassThruDevice, READ_VBATT,
-};
+use crate::j2534::{connect_for_profile, PassThruDevice, READ_VBATT};
+use crate::transport::{TransportAvailability, TransportDevice, TransportKind, TransportRegistry};
 #[cfg(windows)]
 use crate::j2534_host::HostPassThruDevice;
 use crate::protocols::{EcuIdentification, EcuIdentifier, EcuProfile};
@@ -48,7 +46,7 @@ pub enum WorkspaceTab {
 
 pub struct WidebandApp {
     // Hardware & Protocols
-    pub devices: Vec<J2534DeviceInfo>,
+    pub devices: Vec<TransportDevice>,
     pub selected_device_idx: usize,
     pub profiles: Vec<EcuProfile>,
     pub selected_profile_idx: usize,
@@ -116,7 +114,7 @@ pub struct WidebandApp {
 impl WidebandApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply_motorsport_theme(&cc.egui_ctx);
-        let devices = J2534RegistryScanner::scan();
+        let devices = TransportRegistry::discover();
         let catalog = crate::profile_pack::ProfileCatalog::load_default();
         let profiles = catalog.profiles;
         if !catalog.load_note.is_empty() {
@@ -353,6 +351,21 @@ impl WidebandApp {
         }
     }
 
+    pub fn rescan_devices(&mut self) {
+        if self.is_connected {
+            self.log("Rescan skipped while connected — disconnect first.");
+            return;
+        }
+        self.devices = TransportRegistry::discover();
+        if self.selected_device_idx >= self.devices.len() {
+            self.selected_device_idx = 0;
+        }
+        self.log(&format!(
+            "Device scan: {} transport(s) (USB J2534, Bluetooth, Ethernet, virtual bench).",
+            self.devices.len()
+        ));
+    }
+
     pub fn connect_cable(&mut self) {
         self.connection_last_error.clear();
         self.header_vbatt = None;
@@ -360,10 +373,10 @@ impl WidebandApp {
             self.connection_last_error = "No cable device selected.".to_string();
             return;
         }
-        let dev_info = self.devices[self.selected_device_idx].clone();
-        let is_virtual = dev_info.is_virtual;
-        let dev_name = dev_info.list_label();
-        let transport = transport_hint_for_device(&dev_info);
+        let dev_row = self.devices[self.selected_device_idx].clone();
+        let is_virtual = dev_row.is_virtual_bench();
+        let dev_name = dev_row.list_label();
+        let transport = dev_row.transport_hint();
 
         if is_virtual {
             self.log(
@@ -371,18 +384,31 @@ impl WidebandApp {
             );
         }
 
-        if !is_virtual && !dev_info.exists {
-            self.connection_last_error =
-                format!("PassThru DLL not found: {}", dev_info.library_path);
+        if !dev_row.is_connectable() {
+            self.connection_last_error = match &dev_row.availability {
+                TransportAvailability::Offline => format!(
+                    "{} is offline — check power, pairing, or Wi-Fi.",
+                    dev_row.display_name
+                ),
+                TransportAvailability::MissingDll => {
+                    "PassThru DLL not found for this registry entry.".to_string()
+                }
+                TransportAvailability::NotConfigured => {
+                    "Wireless adapter not configured — see docs/wireless-transport-adapters.md."
+                        .to_string()
+                }
+                TransportAvailability::Error(msg) => msg.clone(),
+                TransportAvailability::Ready => "Device is not available.".to_string(),
+            };
             self.log(&format!(
-                "{}. Install the Mini-VCI or VXDIAG (Toyota) J2534 driver, then rescan devices.",
+                "{}. Install drivers or set WIDEBAND_BT_SERIAL / WIDEBAND_ETH_GATEWAYS, then Rescan.",
                 self.connection_last_error
             ));
             return;
         }
 
         #[cfg(windows)]
-        if !is_virtual && !HostPassThruDevice::host_available() {
+        if dev_row.kind == TransportKind::UsbJ2534 && !HostPassThruDevice::host_available() {
             self.log(
                 "J2534Host.exe is missing beside wideband.exe. Build it from J2534Host.cs (x86) — required for most 32-bit cable DLLs.",
             );
@@ -390,10 +416,25 @@ impl WidebandApp {
 
         self.log(&format!("Opening {} via {}", dev_name, transport));
 
-        let mut dev = create_device(&dev_info);
+        let mut dev = match dev_row.open_pass_thru() {
+            Ok(d) => d,
+            Err(e) => {
+                self.connection_last_error = e.clone();
+                self.devices[self.selected_device_idx].availability =
+                    TransportAvailability::Error(e.clone());
+                self.log(&format!(
+                    "Failed to open {}: {} (check USB, driver, pairing, or gateway)",
+                    dev_name,
+                    e
+                ));
+                return;
+            }
+        };
         match dev.open() {
             Err(e) => {
                 self.connection_last_error = e.clone();
+                self.devices[self.selected_device_idx].availability =
+                    TransportAvailability::Error(e.clone());
                 self.log(&format!(
                     "Failed to open {}: {} (check USB, driver, and VX Manager / MVCI license if applicable)",
                     dev_name,
@@ -459,7 +500,7 @@ impl WidebandApp {
         } else {
             self.devices
                 .get(self.selected_device_idx)
-                .map(|d| d.is_virtual)
+                .map(|d| d.is_virtual_bench())
                 .unwrap_or(true)
         }
     }
@@ -839,6 +880,13 @@ impl WidebandApp {
                     ui.selectable_value(&mut self.selected_device_idx, idx, dev.list_label());
                 }
             });
+        if ui
+            .button(egui::RichText::new("Rescan").size(10.0).color(MUTED))
+            .on_hover_text("Refresh USB J2534 registry and wireless env entries")
+            .clicked()
+        {
+            self.rescan_devices();
+        }
     }
 
     fn paint_workspace_tabs(&mut self, ui: &mut egui::Ui, compact: bool) {
