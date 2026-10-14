@@ -482,7 +482,8 @@ pub fn paint_surface_mesh(
         }
     }
 
-    // 3. Overlays.
+    // 3. Overlays. The trail goes first so axis labels and the cursor stay readable on top.
+    paint_live_trail(&scene, &clip, live_trail, live_off_table);
     let mut placed = Vec::new();
     for (anchor, label, color) in &axis_labels {
         paint_axis_label_avoiding(&clip, *anchor, label, *color, &mut placed);
@@ -493,7 +494,6 @@ pub fn paint_surface_mesh(
         }
     }
     paint_cell_marker(&scene, &clip, active_cell, ACCENT_CYAN, true);
-    paint_live_trail(&scene, &clip, live_trail, live_off_table);
     paint_readout(&scene, &clip, rect, hover_cell.unwrap_or(active_cell), hover_cell.is_some());
 
     let mut badge = format!("{:.0}%", zoom * 100.0);

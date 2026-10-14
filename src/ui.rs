@@ -28,6 +28,7 @@ use crate::simple_ux::SimpleUxState;
 use crate::live_trace;
 use crate::surface_mesh;
 use crate::table_edit::{self, CellSelection, MathOp, UndoStack};
+use crate::ve_correction::{self, CorrectionResult, CorrectionSettings, FrameSource, TargetLambda};
 use crate::telemetry::{decode_channel_value, TelemetryBuffer, TelemetryChannelFile, TelemetryFrame};
 use crate::telemetry_playback::{
     import_log_csv, ImportedLog, LogMarker, MathChannelDef, TelemetryPlaybackState,
@@ -88,6 +89,8 @@ pub struct WidebandApp {
     /// True while a drag-select started in the grid is in progress.
     grid_drag_select: bool,
     pub table_undo: UndoStack,
+    /// Log-based VE correction state (panel above the grid).
+    pub ve_corr: VeCorrectionUi,
     /// Live operating point on the selected table (separate from the edit selection).
     pub live_trace: live_trace::LiveTrace,
     pub math_amount: f64,
@@ -213,6 +216,7 @@ impl WidebandApp {
             selection_anchor: None,
             grid_drag_select: false,
             table_undo: UndoStack::default(),
+            ve_corr: VeCorrectionUi::default(),
             live_trace: live_trace::LiveTrace::default(),
             math_amount: 5.0,
             checksum_status: CHECKSUM_VALID.to_string(),
@@ -1769,6 +1773,9 @@ impl WidebandApp {
                         self.selection_anchor = None;
                     }
                 }
+                if !beginner_mode {
+                    self.render_ve_correction_panel(ui);
+                }
                 ui.add_space(8.0);
 
                 let grid_avail = ui.available_size();
@@ -1792,6 +1799,8 @@ impl WidebandApp {
         let live_cell = self.live_trace.current().map(live_trace::nearest_cell);
         let sel = self.selection().clamped(rows, cols);
         let multi = !sel.is_single();
+        let corr_overlay_owned = self.ve_corr.overlay_for(self.selected_table_idx).cloned();
+        let corr_overlay = corr_overlay_owned.as_ref();
         if !ui.input(|i| i.pointer.primary_down()) {
             self.grid_drag_select = false;
         }
@@ -1858,9 +1867,42 @@ impl WidebandApp {
                             let is_selected = self.active_cell == (r, c);
                             let is_live = live_cell == Some((r, c));
 
-                            let bg_color = heatmap_color(val, min_val, max_val);
+                            let mut bg_color = heatmap_color(val, min_val, max_val);
                             let text_color = Color32::from_rgb(0xFF, 0xFF, 0xFF);
-                            let cell_text = format_cell_display(val, stock_val);
+                            let mut cell_text = format_cell_display(val, stock_val);
+                            let mut corr_tip: Option<String> = None;
+                            if let Some(res) = corr_overlay {
+                                // Suggestion view: red = lean (needs more), blue = rich (needs less).
+                                match res.change_pct(r, c) {
+                                    Some(p) => {
+                                        let k = (p.abs() / res.max_change_pct.max(1.0)).min(1.0) as f32;
+                                        let hot = if p >= 0.0 {
+                                            Color32::from_rgb(0xD9, 0x3A, 0x2B)
+                                        } else {
+                                            Color32::from_rgb(0x2F, 0x6F, 0xE0)
+                                        };
+                                        bg_color = lerp_color(Color32::from_rgb(0x2A, 0x30, 0x38), hot, 0.25 + 0.75 * k);
+                                        // Avoid "-0.0%" for tiny negatives.
+                                        let shown = if p.abs() < 0.05 { 0.0 } else { p };
+                                        cell_text = format!("{:+.1}%", shown);
+                                        let s = res.stats[r][c];
+                                        corr_tip = Some(format!(
+                                            "{:.2} -> {:.2}\n{} samples, weight {:.1}",
+                                            val,
+                                            val * (1.0 + p / 100.0),
+                                            s.hits,
+                                            s.weight
+                                        ));
+                                    }
+                                    None => {
+                                        bg_color = Color32::from_rgb(0x1E, 0x23, 0x2A);
+                                        let s = res.stats.get(r).and_then(|row| row.get(c)).copied().unwrap_or_default();
+                                        if s.hits > 0 {
+                                            corr_tip = Some(format!("Not enough data: weight {:.1} < {:.1}", s.weight, res.min_weight));
+                                        }
+                                    }
+                                }
+                            }
 
                             row.col(|ui| {
                                 let rect = ui.available_rect_before_wrap();
@@ -1896,6 +1938,10 @@ impl WidebandApp {
                                         .color(text_color),
                                 );
                                 let response = response.interact(egui::Sense::click_and_drag());
+                                let response = match &corr_tip {
+                                    Some(t) => response.on_hover_text(t.as_str()),
+                                    None => response,
+                                };
                                 if response.drag_started() {
                                     self.grid_drag_select = true;
                                     self.selection_anchor = Some((r, c));
@@ -3336,5 +3382,284 @@ impl WidebandApp {
                 }
             });
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Log-based VE / fuel-table correction panel
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum VeLogSource {
+    /// Frames captured with Record on the Telemetry tab.
+    Recording,
+    /// The rolling live buffer (most recent samples).
+    LiveBuffer,
+    /// The primary log imported on the Telemetry tab.
+    ImportedLog,
+}
+
+pub struct VeCorrectionUi {
+    pub source: VeLogSource,
+    /// `None` = constant target lambda; `Some(idx)` = commanded-lambda table index.
+    pub target_table: Option<usize>,
+    pub target_const: f64,
+    pub settings: CorrectionSettings,
+    pub result: Option<(usize, CorrectionResult)>,
+    pub show_overlay: bool,
+    pub message: String,
+}
+
+impl Default for VeCorrectionUi {
+    fn default() -> Self {
+        Self {
+            source: VeLogSource::Recording,
+            target_table: None,
+            target_const: 1.0,
+            settings: CorrectionSettings::default(),
+            result: None,
+            show_overlay: true,
+            message: String::new(),
+        }
+    }
+}
+
+impl VeCorrectionUi {
+    pub fn overlay_for(&self, table_idx: usize) -> Option<&CorrectionResult> {
+        match &self.result {
+            Some((idx, res)) if *idx == table_idx && self.show_overlay => Some(res),
+            _ => None,
+        }
+    }
+}
+
+fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
+}
+
+/// Heuristic: tables where a larger value means more fuel (correction direction is valid).
+fn looks_like_fuel_table(t: &crate::definitions::XdfTable) -> bool {
+    let s = format!("{} {} {}", t.id, t.title, t.z_units).to_ascii_lowercase();
+    ["ve", "fuel", "inj", "airflow", "volumetric"].iter().any(|k| s.contains(k))
+        && !s.contains("lambda")
+        && !s.contains("afr")
+}
+
+fn looks_like_lambda_target(t: &crate::definitions::XdfTable) -> bool {
+    let s = format!("{} {}", t.id, t.title).to_ascii_lowercase();
+    (s.contains("lambda") || s.contains("afr") || s.contains("eq ratio")) && t.values.len() >= 2
+}
+
+impl WidebandApp {
+    fn render_ve_correction_panel(&mut self, ui: &mut egui::Ui) {
+        let table_idx = self.selected_table_idx;
+        let table_title = self.xdf.tables[table_idx].title.clone();
+        let fuel_like = looks_like_fuel_table(&self.xdf.tables[table_idx]);
+        let (rec_n, live_n) = {
+            let buf = self.telemetry.lock().unwrap();
+            (buf.record_frames.len(), buf.frames.len())
+        };
+        let imported = self.telemetry_playback.primary.as_ref().map(|l| (l.name.clone(), l.frames.len()));
+        let lambda_tables: Vec<(usize, String)> = self
+            .xdf
+            .tables
+            .iter()
+            .enumerate()
+            .filter(|(i, t)| *i != table_idx && looks_like_lambda_target(t))
+            .map(|(i, t)| (i, t.title.clone()))
+            .collect();
+
+        egui::CollapsingHeader::new(
+            egui::RichText::new("Log-based fuel correction (VE from wideband + trims)").strong().color(TEXT),
+        )
+        .id_salt("ve_corr_panel")
+        .default_open(false)
+        .show(ui, |ui| {
+            if !fuel_like {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "\u{26A0} \"{}\" doesn't look like a VE / fuel table. Corrections assume a larger value = more fuel.",
+                        table_title
+                    ))
+                    .small()
+                    .color(Color32::from_rgb(255, 152, 0)),
+                );
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Log:").color(MUTED));
+                let src_label = |s: VeLogSource| match s {
+                    VeLogSource::Recording => format!("Recorded session ({} frames)", rec_n),
+                    VeLogSource::LiveBuffer => format!("Live buffer ({} frames)", live_n),
+                    VeLogSource::ImportedLog => match &imported {
+                        Some((n, f)) => format!("Imported: {} ({} frames)", n, f),
+                        None => "Imported log (none loaded)".to_string(),
+                    },
+                };
+                egui::ComboBox::from_id_salt("ve_src")
+                    .selected_text(src_label(self.ve_corr.source))
+                    .show_ui(ui, |ui| {
+                        for s in [VeLogSource::Recording, VeLogSource::LiveBuffer, VeLogSource::ImportedLog] {
+                            ui.selectable_value(&mut self.ve_corr.source, s, src_label(s));
+                        }
+                    });
+
+                ui.label(egui::RichText::new("Target \u{03BB}:").color(MUTED));
+                let target_text = match self.ve_corr.target_table {
+                    Some(i) => self.xdf.tables.get(i).map(|t| t.title.clone()).unwrap_or_default(),
+                    None => "Constant".to_string(),
+                };
+                egui::ComboBox::from_id_salt("ve_target")
+                    .selected_text(target_text)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.ve_corr.target_table, None, "Constant");
+                        for (i, title) in &lambda_tables {
+                            ui.selectable_value(&mut self.ve_corr.target_table, Some(*i), title);
+                        }
+                    });
+                if self.ve_corr.target_table.is_none() {
+                    ui.add(egui::DragValue::new(&mut self.ve_corr.target_const).speed(0.005).range(0.6..=1.5));
+                }
+                if ui.button("Analyze log").clicked() {
+                    self.run_ve_analysis();
+                }
+            });
+
+            egui::CollapsingHeader::new(egui::RichText::new("Filters").small().color(MUTED))
+                .id_salt("ve_filters")
+                .show(ui, |ui| {
+                    let st = &mut self.ve_corr.settings;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Min RPM");
+                        ui.add(egui::DragValue::new(&mut st.min_rpm).speed(10.0).range(0.0..=3000.0));
+                        ui.label("Min ECT \u{00B0}C");
+                        ui.add(egui::DragValue::new(&mut st.min_ect_c).speed(1.0).range(-40.0..=110.0));
+                        ui.label("\u{03BB} window");
+                        ui.add(egui::DragValue::new(&mut st.lambda_min).speed(0.01).range(0.5..=1.0));
+                        ui.add(egui::DragValue::new(&mut st.lambda_max).speed(0.01).range(1.0..=2.0));
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Max TPS rate %/s");
+                        ui.add(egui::DragValue::new(&mut st.max_tps_rate_pct_s).speed(1.0).range(1.0..=500.0));
+                        ui.label("Sensor delay s");
+                        ui.add(egui::DragValue::new(&mut st.lambda_delay_s).speed(0.01).range(0.0..=1.0));
+                        ui.label("Min samples/cell");
+                        ui.add(egui::DragValue::new(&mut st.min_weight).speed(0.5).range(1.0..=200.0));
+                        ui.label("Max change %");
+                        ui.add(egui::DragValue::new(&mut st.max_change_pct).speed(0.5).range(1.0..=50.0));
+                    });
+                });
+
+            if !self.ve_corr.message.is_empty() {
+                ui.label(egui::RichText::new(&self.ve_corr.message).small().color(MUTED));
+            }
+
+            let has_result = matches!(&self.ve_corr.result, Some((i, _)) if *i == table_idx);
+            if has_result {
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut self.ve_corr.show_overlay, "Show suggested % on grid");
+                    if ui.button("Select cells with data").clicked() {
+                        if let Some((_, res)) = &self.ve_corr.result {
+                            if let Some((r0, r1, c0, c1)) = res.data_bounds() {
+                                self.selection_anchor = Some((r0, c0));
+                                self.active_cell = (r1, c1);
+                            }
+                        }
+                    }
+                    if ui
+                        .button("Apply to selection")
+                        .on_hover_text("Multiply each selected cell that has data by its suggested factor (undoable)")
+                        .clicked()
+                    {
+                        self.apply_ve_correction();
+                    }
+                    if ui.button("Clear").clicked() {
+                        self.ve_corr.result = None;
+                        self.ve_corr.message.clear();
+                    }
+                });
+            }
+        });
+    }
+
+    fn run_ve_analysis(&mut self) {
+        let table_idx = self.selected_table_idx;
+        let mut settings = self.ve_corr.settings.clone();
+        settings.target = match self.ve_corr.target_table.and_then(|i| self.xdf.tables.get(i)) {
+            Some(t) => TargetLambda::Table(t.clone()),
+            None => TargetLambda::Constant(self.ve_corr.target_const),
+        };
+        let table = self.xdf.tables[table_idx].clone();
+        let result = {
+            let buf = self.telemetry.lock().unwrap();
+            let live: Vec<crate::telemetry::TelemetryFrame>;
+            let frames: &[crate::telemetry::TelemetryFrame] = match self.ve_corr.source {
+                VeLogSource::Recording => &buf.record_frames,
+                VeLogSource::LiveBuffer => {
+                    live = buf.frames.iter().cloned().collect();
+                    &live
+                }
+                VeLogSource::ImportedLog => match &self.telemetry_playback.primary {
+                    Some(log) => &log.frames,
+                    None => &[],
+                },
+            };
+            if frames.is_empty() {
+                None
+            } else {
+                let src = FrameSource::new(&buf.id_index, frames);
+                Some(ve_correction::analyze(&table, &src, &settings))
+            }
+        };
+        match result {
+            None => {
+                self.ve_corr.result = None;
+                self.ve_corr.message =
+                    "No frames in that log. Record a drive on the Telemetry tab, or import a CSV log.".to_string();
+            }
+            Some(res) => {
+                let r = &res.rejected;
+                self.ve_corr.message = format!(
+                    "Used {} samples; rejected {} (low rpm {}, cold {}, \u{03BB} out of window {}, transient {}, off table {}, missing channels {}). \
+                     {} cells have suggestions. Fuel trims {}.",
+                    res.used,
+                    r.total(),
+                    r.low_rpm,
+                    r.cold,
+                    r.lambda_out_of_window,
+                    r.transient,
+                    r.off_table,
+                    r.missing_channels,
+                    res.cells_with_data(),
+                    if res.used_trims { "included" } else { "not logged (open-loop lambda only)" },
+                );
+                self.ve_corr.show_overlay = true;
+                self.ve_corr.result = Some((table_idx, res));
+            }
+        }
+    }
+
+    fn apply_ve_correction(&mut self) {
+        let Some((idx, res)) = self.ve_corr.result.clone() else {
+            return;
+        };
+        if idx != self.selected_table_idx {
+            return;
+        }
+        let mut changed = 0;
+        self.edit_selected_table("log fuel correction", |v, sel| {
+            changed = ve_correction::apply(v, &res, sel.bounds());
+        });
+        if changed == 0 {
+            self.ve_corr.message = "No selected cells have enough data. Use \"Select cells with data\" first.".to_string();
+            return;
+        }
+        // The suggestions were relative to the old values; drop them so they can't be applied twice.
+        self.ve_corr.result = None;
+        self.ve_corr.message = format!(
+            "Applied to {} cells (Ctrl+Z to undo). Log again with the new table to refine.",
+            changed
+        );
+        self.log(&format!("Log fuel correction applied to {} cells of {}", changed, self.xdf.tables[idx].title));
     }
 }

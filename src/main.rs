@@ -33,6 +33,7 @@ pub mod theme;
 pub mod transport;
 pub mod ui;
 pub mod uds;
+pub mod ve_correction;
 
 use eframe::egui;
 use ui::WidebandApp;
