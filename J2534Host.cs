@@ -7,9 +7,10 @@ using System.Text;
 // 32-bit helper. Wideband.exe is 64-bit and cannot load esp32.dll.
 // CONNECT baud extended protocol flags.
 // Protocol 5 is CAN. Protocol 4 is ISO 14230. Protocol 1 is J1850 VPW.
-// CAN data starts with the id, little-endian. K-Line and VPW data is the frame.
-// Commands: OPEN, CONNECT, FILTER, READ, WRITE, VERSION, CLOSE, QUIT.
-// Programming voltage, ioctl, and periodic messages are not available.
+// CAN data starts with the id, big-endian, as SAE J2534-1 requires.
+// K-Line and VPW data is the frame. ISO 14230 can send FAST_INIT.
+// Commands: OPEN, CONNECT, INIT, FILTER, READ, WRITE, VERSION, CLOSE, QUIT.
+// Programming voltage and periodic messages are not available.
 sealed class J2534Host
 {
     const int MessageBytes = 4152;
@@ -18,6 +19,8 @@ sealed class J2534Host
     const int ProtocolVpw = 1;
     const uint Can29Bit = 0x100;
     const uint PassFilter = 1;
+    // SAE J2534-1: FAST_INIT is 0x05. 0x03 is READ_VBATT.
+    const uint FastInit = 0x05;
     static readonly byte[] Zeros = new byte[MessageBytes];
 
     [DllImport("kernel32", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -62,6 +65,9 @@ sealed class J2534Host
     [UnmanagedFunctionPointer(CallingConvention.StdCall, CharSet = CharSet.Ansi)]
     delegate int VersionFn(uint deviceId, StringBuilder firmware, StringBuilder dll, StringBuilder api);
 
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    delegate int IoctlFn(uint channelId, uint ioctlId, IntPtr input, IntPtr output);
+
     IntPtr module;
     bool deviceOpen;
     bool channelOpen;
@@ -82,6 +88,7 @@ sealed class J2534Host
     StopFilterFn stopFilterFn;
     ErrorFn errorFn;
     VersionFn versionFn;
+    IoctlFn ioctlFn;
 
     static int Main(string[] args)
     {
@@ -114,7 +121,7 @@ sealed class J2534Host
             var packed = new byte[4];
             Marshal.Copy(IntPtr.Add(message, 24), packed, 0, 4);
             uint roundTrip = ReadId(message);
-            bool ok = packed[0] == 0xE8 && packed[1] == 0x07 && packed[2] == 0x00 && packed[3] == 0x00 && roundTrip == 0x7E8;
+            bool ok = packed[0] == 0x00 && packed[1] == 0x00 && packed[2] == 0x07 && packed[3] == 0xE8 && roundTrip == 0x7E8;
             Console.WriteLine(packed[0].ToString("X2") + " " + packed[1].ToString("X2") + " " + packed[2].ToString("X2") + " " + packed[3].ToString("X2"));
             return ok ? 0 : 1;
         }
@@ -133,6 +140,7 @@ sealed class J2534Host
             Split(line, out verb, out rest);
             if (verb == "OPEN") return Open(rest);
             if (verb == "CONNECT") return Connect(rest);
+            if (verb == "INIT") return Init(rest);
             if (verb == "FILTER") return Filter(rest);
             if (verb == "READ") return Read();
             if (verb == "WRITE") return Write(rest);
@@ -180,6 +188,9 @@ sealed class J2534Host
             IntPtr versionPtr = GetProcAddress(module, "PassThruReadVersion");
             if (versionPtr != IntPtr.Zero)
                 versionFn = (VersionFn)Marshal.GetDelegateForFunctionPointer(versionPtr, typeof(VersionFn));
+            IntPtr ioctlPtr = GetProcAddress(module, "PassThruIoctl");
+            if (ioctlPtr != IntPtr.Zero)
+                ioctlFn = (IoctlFn)Marshal.GetDelegateForFunctionPointer(ioctlPtr, typeof(IoctlFn));
             uint id;
             int status = openFn(IntPtr.Zero, out id);
             if (status != 0)
@@ -233,6 +244,45 @@ sealed class J2534Host
         channelId = id;
         channelOpen = true;
         return OkHandles();
+    }
+
+    string Init(string rest)
+    {
+        if (!channelOpen) return Fail("The channel is not open.", -1);
+        if (protocol != ProtocolKLine) return Fail("Fast init is only used on ISO 14230.", -1);
+        if (ioctlFn == null) return Fail("The cable library is missing PassThruIoctl.", -1);
+        string hex = rest == null ? "" : rest.Replace(" ", "");
+        byte[] request = hex.Length == 0 ? StartCommunication() : ParseHexBytes(hex, 260);
+        if (request.Length == 0) return Fail("Fast init needs a start-communication message.", -1);
+        IntPtr input = AllocMessage();
+        IntPtr output = AllocMessage();
+        try
+        {
+            WriteUInt(input, 0, ProtocolKLine);
+            WriteUInt(input, 16, (uint)request.Length);
+            Marshal.Copy(request, 0, IntPtr.Add(input, 24), request.Length);
+            WriteUInt(output, 0, ProtocolKLine);
+            WriteUInt(output, 16, 4128);
+            int status = ioctlFn(channelId, FastInit, input, output);
+            if (status != 0) return Fail(Describe(status), status);
+            uint dataSize = ReadUInt(output, 16);
+            if (dataSize > 4128) dataSize = 0;
+            var response = new byte[dataSize];
+            if (dataSize > 0) Marshal.Copy(IntPtr.Add(output, 24), response, 0, (int)dataSize);
+            return "{\"ok\":true,\"data\":\"" + ToHex(response) + "\"}";
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(input);
+            Marshal.FreeHGlobal(output);
+        }
+    }
+
+    static byte[] StartCommunication()
+    {
+        var frame = new byte[] { 0x81, 0x10, 0xF1, 0x81, 0x00 };
+        frame[4] = (byte)((frame[0] + frame[1] + frame[2] + frame[3]) & 0xFF);
+        return frame;
     }
 
     string Version()
@@ -401,6 +451,7 @@ sealed class J2534Host
         stopFilterFn = null;
         errorFn = null;
         versionFn = null;
+        ioctlFn = null;
         if (module != IntPtr.Zero)
         {
             FreeLibrary(module);
@@ -590,10 +641,10 @@ sealed class J2534Host
     static void WriteId(IntPtr message, uint id)
     {
         var packed = new byte[4];
-        packed[0] = (byte)(id & 0xFF);
-        packed[1] = (byte)((id >> 8) & 0xFF);
-        packed[2] = (byte)((id >> 16) & 0xFF);
-        packed[3] = (byte)((id >> 24) & 0xFF);
+        packed[0] = (byte)((id >> 24) & 0xFF);
+        packed[1] = (byte)((id >> 16) & 0xFF);
+        packed[2] = (byte)((id >> 8) & 0xFF);
+        packed[3] = (byte)(id & 0xFF);
         Marshal.Copy(packed, 0, IntPtr.Add(message, 24), 4);
     }
 
@@ -601,7 +652,7 @@ sealed class J2534Host
     {
         var packed = new byte[4];
         Marshal.Copy(IntPtr.Add(message, 24), packed, 0, 4);
-        return (uint)packed[0] | ((uint)packed[1] << 8) | ((uint)packed[2] << 16) | ((uint)packed[3] << 24);
+        return ((uint)packed[0] << 24) | ((uint)packed[1] << 16) | ((uint)packed[2] << 8) | packed[3];
     }
 
     static void WriteUInt(IntPtr message, int offset, uint value)

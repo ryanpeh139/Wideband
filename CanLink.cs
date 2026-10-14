@@ -29,6 +29,8 @@ namespace Wideband
         public string SocketInterface = "can0";
         public uint ProtocolId = 5;
         public uint ConnectFlags = 0;
+        public byte Tester = 0xF1;
+        public byte Ecu = 0x10;
     }
 
     sealed class CanLinkException : Exception
@@ -154,6 +156,11 @@ namespace Wideband
                     ChannelId = ReadIdValue(connected, "channel_id");
                     uint reportedDevice = ReadIdValue(connected, "device_id");
                     if (reportedDevice != 0) DeviceId = reportedDevice;
+                    if (protocol == 4)
+                    {
+                        byte[] wake = KwpFrame.Pack(settings.Ecu, settings.Tester, new byte[] { 0x81 });
+                        RequireOk(Command("INIT " + ToHex(wake), 15000));
+                    }
                     if (protocol == 5)
                         RequireOk(Command("FILTER " + settings.FilterId.ToString("X") + " " + settings.FilterMask.ToString("X"), 15000));
                     else

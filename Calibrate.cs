@@ -817,6 +817,18 @@ namespace Wideband
             get { return checksumMark.Text; }
         }
 
+        public TuneDocument Document
+        {
+            get { return document; }
+        }
+
+        public bool CommitTable(TuneTable table, string message)
+        {
+            if (!romBacked) return false;
+            if (message == null) message = "";
+            return WriteTable(table, message);
+        }
+
         static Font BadgeFont()
         {
             var face = new Font("Bahnschrift", 11f, FontStyle.Bold, GraphicsUnit.Point);
@@ -1410,13 +1422,13 @@ namespace Wideband
             WriteTable(current, message);
         }
 
-        void WriteTable(TuneTable table, string message)
+        bool WriteTable(TuneTable table, string message)
         {
             if (rom == null || table == null || table.Binding == null)
             {
                 status.Text = message;
                 RefreshSwitchChecks();
-                return;
+                return false;
             }
             byte[] trial = (byte[])rom.Bytes.Clone();
             try
@@ -1432,12 +1444,13 @@ namespace Wideband
                 if (current != null) Bind();
                 RefreshSwitchChecks();
                 status.Text = ex.Message;
-                return;
+                return false;
             }
             if (current != null) Bind();
             status.Text = message + " The ROM buffer was updated.";
             RefreshChecksum();
             RefreshSwitchChecks();
+            return true;
         }
 
         void Trace()
@@ -1451,7 +1464,6 @@ namespace Wideband
 
     sealed class LogPanel : UserControl
     {
-        readonly TuneDocument document;
         readonly CalibratePanel calibrate;
         readonly string savePath;
         readonly LogChart chart;
@@ -1461,7 +1473,7 @@ namespace Wideband
 
         public LogPanel(TuneDocument document, CalibratePanel calibrate, string savePath)
         {
-            this.document = document;
+            if (document == null) throw new ArgumentNullException("document");
             this.calibrate = calibrate;
             this.savePath = savePath;
             Dock = DockStyle.Fill;
@@ -1579,7 +1591,8 @@ namespace Wideband
 
         void SuggestClicked(object sender, EventArgs e)
         {
-            TuneTable ve = document.Find("ve");
+            TuneDocument calibration = calibrate.Document;
+            TuneTable ve = calibration == null ? null : calibration.Find("ve");
             if (log == null || ve == null)
             {
                 result.Text = "Open a log before asking for a VE suggestion.";
@@ -1621,7 +1634,17 @@ namespace Wideband
                     changed++;
                 }
             }
-            document.Write(savePath);
+            if (!calibration.Persist)
+            {
+                if (!calibrate.CommitTable(ve, "Applied a VE suggestion from the log."))
+                {
+                    result.Text = "The VE suggestion could not be stored in the ROM buffer.";
+                    return;
+                }
+                result.Text = "Applied a VE suggestion from " + used + " log rows to " + changed + " ROM cells. The ECU was not written.";
+                return;
+            }
+            calibration.Write(savePath);
             calibrate.RefreshTable("ve");
             result.Text = "Applied a VE suggestion from " + used + " log rows to " + changed + " sample cells. The ECU was not written.";
         }

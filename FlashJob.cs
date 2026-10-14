@@ -151,7 +151,7 @@ namespace Wideband
                     int percent = 55;
                     if (total > 0) percent = 55 + (int)(35L * sent / total);
                     Report(FlashStage.Transfer, percent, sent, "Transferring the image.");
-                }, plan.ChunkBytes, plan.AddressBytes, plan.SizeBytes, plan.MaxPending);
+                }, plan.ChunkBytes, plan.AddressBytes, plan.SizeBytes, plan.MaxPending, plan.Diagnostic);
                 download.ShouldContinue = shouldContinue;
                 DownloadResult transferred = download.Run(plan.Address, plan.Image);
                 result.BytesSent = transferred.BytesSent;
@@ -284,6 +284,9 @@ namespace Wideband
                 throw new ArgumentOutOfRangeException("plan", "An erase routine id is required when erase is requested.");
             if (plan.MaxPending < 1)
                 throw new ArgumentOutOfRangeException("plan", "The pending-response limit must be at least 1.");
+            if (plan.Diagnostic == DiagnosticProtocol.Kwp
+                && (!UdsEncoding.Fits(plan.Address, 3) || !UdsEncoding.Fits(plan.Image.Length, 3)))
+                throw new ArgumentOutOfRangeException("plan", "A KWP2000 address and image length must fit in 3 bytes.");
         }
     }
 }

@@ -2,7 +2,8 @@ using System;
 
 namespace Wideband
 {
-    // ISO 14229 download sequencing: 0x34, 0x36, 0x37.
+    // Download sequencing: 0x34, 0x36, 0x37.
+    // UDS uses the ISO 14229 address and length fields. KWP2000 uses a 3-byte address, 0x00, and a 3-byte size.
     // The image bytes and address come from the caller. This file does not erase memory or calculate a checksum.
     enum DownloadStep
     {
@@ -41,6 +42,7 @@ namespace Wideband
         readonly int addressBytes;
         readonly int sizeBytes;
         readonly int maxPending;
+        readonly DiagnosticProtocol diagnostic;
         DownloadStep step = DownloadStep.Idle;
         DownloadStep failedDuring = DownloadStep.Idle;
         byte[] image;
@@ -64,6 +66,11 @@ namespace Wideband
         }
 
         public FlashDownload(IDiagnosticLink link, DownloadProgressHandler progress, int chunkBytes, int addressBytes, int sizeBytes, int maxPending)
+            : this(link, progress, chunkBytes, addressBytes, sizeBytes, maxPending, DiagnosticProtocol.Uds)
+        {
+        }
+
+        public FlashDownload(IDiagnosticLink link, DownloadProgressHandler progress, int chunkBytes, int addressBytes, int sizeBytes, int maxPending, DiagnosticProtocol diagnostic)
         {
             if (link == null) throw new ArgumentNullException("link");
             if (chunkBytes < 1 || chunkBytes > 4095)
@@ -80,6 +87,7 @@ namespace Wideband
             this.addressBytes = addressBytes;
             this.sizeBytes = sizeBytes;
             this.maxPending = maxPending;
+            this.diagnostic = diagnostic;
         }
 
         public Func<bool> ShouldContinue;
@@ -104,6 +112,10 @@ namespace Wideband
                 throw new ArgumentOutOfRangeException("address", "The address does not fit in the address field.");
             if (!Fits(image.Length, sizeBytes))
                 throw new ArgumentOutOfRangeException("image", "The image length does not fit in the size field.");
+            if (diagnostic == DiagnosticProtocol.Kwp && !Fits(address, 3))
+                throw new ArgumentOutOfRangeException("address", "A KWP2000 address must fit in 3 bytes.");
+            if (diagnostic == DiagnosticProtocol.Kwp && !Fits(image.Length, 3))
+                throw new ArgumentOutOfRangeException("image", "A KWP2000 image length must fit in 3 bytes.");
             if (step != DownloadStep.Idle && step != DownloadStep.Failed && step != DownloadStep.Complete)
                 throw new InvalidOperationException("A download is already running.");
             this.image = image;
@@ -215,7 +227,20 @@ namespace Wideband
                 FailNegative(response, 0x36);
                 return;
             }
-            if (response.Length < 2 || response[0] != 0x76 || response[1] != (byte)sentSequence)
+            if (diagnostic == DiagnosticProtocol.Kwp)
+            {
+                if (response.Length < 1 || response[0] != 0x76)
+                {
+                    Fail("The transfer response was not valid.");
+                    return;
+                }
+                if (response.Length >= 2 && response[1] != (byte)sentSequence)
+                {
+                    Fail("The block sequence counter did not match.");
+                    return;
+                }
+            }
+            else if (response.Length < 2 || response[0] != 0x76 || response[1] != (byte)sentSequence)
             {
                 Fail("The block sequence counter did not match.");
                 return;
@@ -254,6 +279,19 @@ namespace Wideband
 
         byte[] BuildDownload(long address, int size)
         {
+            if (diagnostic == DiagnosticProtocol.Kwp)
+            {
+                byte[] kwp = new byte[8];
+                kwp[0] = 0x34;
+                kwp[1] = (byte)((address >> 16) & 0xFF);
+                kwp[2] = (byte)((address >> 8) & 0xFF);
+                kwp[3] = (byte)(address & 0xFF);
+                kwp[4] = 0x00;
+                kwp[5] = (byte)((size >> 16) & 0xFF);
+                kwp[6] = (byte)((size >> 8) & 0xFF);
+                kwp[7] = (byte)(size & 0xFF);
+                return kwp;
+            }
             byte[] message = new byte[3 + addressBytes + sizeBytes];
             message[0] = 0x34;
             message[1] = 0x00;
@@ -274,9 +312,17 @@ namespace Wideband
         }
 
         // maxNumberOfBlockLength includes the service id and the sequence counter.
+        // KWP2000 returns that length as the single byte after 0x74.
         bool TryMaxBlock(byte[] response, out int maxBlock)
         {
             maxBlock = 0;
+            if (diagnostic == DiagnosticProtocol.Kwp)
+            {
+                if (response == null || response.Length < 2 || response[0] != 0x74) return false;
+                maxBlock = response[1];
+                if (maxBlock > chunkBytes + 2) maxBlock = chunkBytes + 2;
+                return true;
+            }
             if (response == null || response.Length < 3 || response[0] != 0x74) return false;
             int count = (response[1] >> 4) & 0x0F;
             if (count < 1 || count > 4) return false;

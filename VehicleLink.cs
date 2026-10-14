@@ -94,6 +94,8 @@ namespace Wideband
             openSettings.ProtocolId = selected.ProtocolId;
             openSettings.ConnectFlags = selected.ConnectFlags;
             openSettings.ExtendedId = selected.ExtendedId;
+            openSettings.Tester = selected.Tester;
+            openSettings.Ecu = selected.Ecu;
             if (selected.Bus == VehicleBus.CanIsoTp)
             {
                 openSettings.FilterId = selected.ResponseId;
