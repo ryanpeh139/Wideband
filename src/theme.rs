@@ -101,10 +101,38 @@ pub fn header_frame() -> egui::Frame {
         .inner_margin(egui::Margin::symmetric(12.0, 6.0))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum StudioHeaderTier {
+    Wide,
+    Medium,
+    Compact,
+}
+
+pub fn studio_header_tier(ctx: &egui::Context) -> StudioHeaderTier {
+    let w = ctx.screen_rect().width();
+    if w < 920.0 {
+        StudioHeaderTier::Compact
+    } else if w < 1260.0 {
+        StudioHeaderTier::Medium
+    } else {
+        StudioHeaderTier::Wide
+    }
+}
+
+/// Proportional side-panel width (default, min, max) from the current viewport.
+pub fn side_panel_widths(ctx: &egui::Context) -> (f32, f32, f32) {
+    let w = ctx.screen_rect().width().max(520.0);
+    let default_w = (w * 0.20).clamp(170.0, 300.0);
+    let min_w = 150.0;
+    let max_w = (w * 0.32).clamp(190.0, 360.0);
+    (default_w, min_w, max_w)
+}
+
 /// Owner-drawn studio brand badge: `WIDEBAND // MOTORSPORT STUDIO`.
-pub fn paint_studio_badge(ui: &mut egui::Ui) {
+pub fn paint_studio_badge(ui: &mut egui::Ui, compact: bool) {
     let height = 28.0;
-    let (rect, _response) = ui.allocate_exact_size(egui::vec2(280.0, height), egui::Sense::hover());
+    let width = if compact { 196.0 } else { 280.0 };
+    let (rect, _response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     let painter = ui.painter();
 
     painter.rect_filled(rect, ROUNDING, WIDGET_BG);
@@ -130,12 +158,14 @@ pub fn paint_studio_badge(ui: &mut egui::Ui) {
     painter.galley(egui::pos2(x, text_y - sep.size().y * 0.5), sep, MUTED);
     x += sep_w + 6.0;
 
-    let studio = painter.layout_no_wrap(
-        "MOTORSPORT STUDIO".into(),
-        egui::FontId::proportional(11.0),
-        MUTED,
-    );
-    painter.galley(egui::pos2(x, text_y - studio.size().y * 0.5), studio, MUTED);
+    if !compact {
+        let studio = painter.layout_no_wrap(
+            "MOTORSPORT STUDIO".into(),
+            egui::FontId::proportional(11.0),
+            MUTED,
+        );
+        painter.galley(egui::pos2(x, text_y - studio.size().y * 0.5), studio, MUTED);
+    }
 }
 
 /// Cobalt → Teal → Warm Amber → Crimson heatmap ramp.
@@ -178,17 +208,24 @@ pub fn paint_live_cell_glow(painter: &egui::Painter, rect: egui::Rect) {
     painter.rect_stroke(rect.expand(1.0), 3.0, Stroke::new(1.0, cyan.gamma_multiply(0.45)));
 }
 
-pub fn studio_tab_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
+pub fn studio_tab_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    selected: bool,
+    compact: bool,
+) -> egui::Response {
+    let font_size = if compact { 11.0 } else { 12.0 };
     let text = if selected {
         egui::RichText::new(label)
-            .size(12.0)
+            .size(font_size)
             .strong()
             .color(ACCENT_CYAN)
     } else {
-        egui::RichText::new(label).size(12.0).color(MUTED)
+        egui::RichText::new(label).size(font_size).color(MUTED)
     };
 
-    let mut button = egui::Button::new(text).min_size(egui::vec2(96.0, 28.0));
+    let min_w = if compact { 76.0 } else { 96.0 };
+    let mut button = egui::Button::new(text).min_size(egui::vec2(min_w, 28.0));
     if selected {
         button = button.fill(WIDGET_BG).stroke(Stroke::new(1.5, ACCENT_BLUE));
     } else {

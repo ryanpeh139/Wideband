@@ -22,7 +22,7 @@ fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 880.0])
-            .with_min_inner_size([1024.0, 680.0])
+            .with_min_inner_size([880.0, 600.0])
             .with_title("Wideband Motorsport Studio — OEM Calibration & Diagnostics"),
         ..Default::default()
     };
