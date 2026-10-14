@@ -27,6 +27,7 @@ use std::path::PathBuf;
 use crate::simple_ux::SimpleUxState;
 use crate::live_trace;
 use crate::surface_mesh;
+use crate::table_edit::{self, CellSelection, MathOp, UndoStack};
 use crate::telemetry::{decode_channel_value, TelemetryBuffer, TelemetryChannelFile, TelemetryFrame};
 use crate::telemetry_playback::{
     import_log_csv, ImportedLog, LogMarker, MathChannelDef, TelemetryPlaybackState,
@@ -82,6 +83,11 @@ pub struct WidebandApp {
     pub favorites_path: PathBuf,
     pub favorites_only: bool,
     pub active_cell: (usize, usize),
+    /// Other corner of a block selection (None = single cell at `active_cell`).
+    pub selection_anchor: Option<(usize, usize)>,
+    /// True while a drag-select started in the grid is in progress.
+    grid_drag_select: bool,
+    pub table_undo: UndoStack,
     /// Live operating point on the selected table (separate from the edit selection).
     pub live_trace: live_trace::LiveTrace,
     pub math_amount: f64,
@@ -204,6 +210,9 @@ impl WidebandApp {
             favorites_path,
             favorites_only: false,
             active_cell: (0, 0),
+            selection_anchor: None,
+            grid_drag_select: false,
+            table_undo: UndoStack::default(),
             live_trace: live_trace::LiveTrace::default(),
             math_amount: 5.0,
             checksum_status: CHECKSUM_VALID.to_string(),
@@ -325,7 +334,10 @@ impl WidebandApp {
 
     fn commit_table_edits(&mut self) {
         let idx = self.selected_table_idx;
-        self.xdf.write_table_to_rom(&mut self.active_rom, self.rom_origin, idx);
+        if self.xdf.write_table_to_rom(&mut self.active_rom, self.rom_origin, idx) {
+            // Show what the ROM actually holds after equation inverse + integer quantisation.
+            self.xdf.reload_table_from_rom(&self.active_rom, self.rom_origin, idx);
+        }
         self.refresh_checksum_badge();
     }
 
@@ -395,6 +407,7 @@ impl WidebandApp {
                 self.rom_path = Some(path);
                 self.xdf.bind_from_rom(&self.active_rom, self.rom_origin);
                 self.refresh_stock_baseline();
+                self.table_undo.clear();
                 self.refresh_checksum_badge();
                 self.log(&msg);
             }
@@ -410,6 +423,8 @@ impl WidebandApp {
                     self.tcm_param_view = build_parameter_view(&self.xdf);
                     self.selected_table_idx = 0;
                     self.active_cell = (0, 0);
+                    self.selection_anchor = None;
+                    self.table_undo.clear();
                     self.live_trace.clear();
                     let label = path.file_name().unwrap_or_default().to_string_lossy().to_string();
                     self.xdf_path = Some(path);
@@ -862,67 +877,63 @@ impl WidebandApp {
         }
     }
 
-    pub fn run_table_math(&mut self, op: char) {
-        if self.xdf.tables.is_empty() {
-            return;
-        }
-        let table = &mut self.xdf.tables[self.selected_table_idx];
-        let (r, c) = self.active_cell;
-        if r < table.values.len() && c < table.values[r].len() {
-            let cur = table.values[r][c];
-            let updated = match op {
-                '+' => cur + self.math_amount,
-                '-' => cur - self.math_amount,
-                '*' => cur * (1.0 + (self.math_amount / 100.0)),
-                '%' => cur * (self.math_amount / 100.0),
-                '=' => self.math_amount,
-                _ => cur,
-            };
-            table.values[r][c] = (updated * 100.0).round() / 100.0;
-            self.commit_table_edits();
+    /// Selection rectangle in the grid (anchor..cursor); the cursor is `active_cell`.
+    pub fn selection(&self) -> CellSelection {
+        CellSelection {
+            anchor: self.selection_anchor.unwrap_or(self.active_cell),
+            cursor: self.active_cell,
         }
     }
 
-    pub fn interpolate_active_row(&mut self) {
+    /// Apply `edit` to the selected table's values with an undo snapshot, then commit to ROM.
+    fn edit_selected_table(&mut self, label: &str, edit: impl FnOnce(&mut [Vec<f64>], &CellSelection)) {
         if self.xdf.tables.is_empty() {
             return;
         }
-        let table = &mut self.xdf.tables[self.selected_table_idx];
-        let r = self.active_cell.0;
-        if r < table.values.len() && table.values[r].len() >= 2 {
-            let row = &mut table.values[r];
-            let first = row[0];
-            let last = *row.last().unwrap();
-            let n = row.len();
-            for i in 0..n {
-                let frac = i as f64 / (n - 1) as f64;
-                row[i] = ((first + (last - first) * frac) * 100.0).round() / 100.0;
-            }
-            self.commit_table_edits();
+        let idx = self.selected_table_idx;
+        let sel = self.selection();
+        let before = self.xdf.tables[idx].values.clone();
+        edit(&mut self.xdf.tables[idx].values, &sel);
+        if self.xdf.tables[idx].values == before {
+            return;
+        }
+        self.table_undo.record(idx, before, label);
+        self.commit_table_edits();
+    }
+
+    pub fn run_table_math(&mut self, op: MathOp) {
+        let label = match op {
+            MathOp::Add(a) => format!("+{}", a),
+            MathOp::Sub(a) => format!("-{}", a),
+            MathOp::Percent(p) => format!("{:+}%", p),
+            MathOp::Set(a) => format!("= {}", a),
+        };
+        self.edit_selected_table(&label, |v, sel| table_edit::apply_math(v, sel, op));
+    }
+
+    pub fn undo_table_edit(&mut self) {
+        let tables = &self.xdf.tables;
+        if let Some((idx, values, label)) = self.table_undo.undo(|i| tables[i].values.clone()) {
+            self.restore_table_values(idx, values);
+            self.log(&format!("Undo: {}", label));
         }
     }
 
-    pub fn smooth_table(&mut self) {
-        if self.xdf.tables.is_empty() {
+    pub fn redo_table_edit(&mut self) {
+        let tables = &self.xdf.tables;
+        if let Some((idx, values, label)) = self.table_undo.redo(|i| tables[i].values.clone()) {
+            self.restore_table_values(idx, values);
+            self.log(&format!("Redo: {}", label));
+        }
+    }
+
+    fn restore_table_values(&mut self, idx: usize, values: Vec<Vec<f64>>) {
+        if idx >= self.xdf.tables.len() {
             return;
         }
-        let table = &mut self.xdf.tables[self.selected_table_idx];
-        let rows = table.values.len();
-        let cols = table.values[0].len();
-        let mut smoothed = table.values.clone();
-
-        for r in 1..rows - 1 {
-            for c in 1..cols - 1 {
-                let avg = (table.values[r - 1][c]
-                    + table.values[r + 1][c]
-                    + table.values[r][c - 1]
-                    + table.values[r][c + 1]
-                    + table.values[r][c] * 4.0)
-                    / 8.0;
-                smoothed[r][c] = (avg * 100.0).round() / 100.0;
-            }
-        }
-        table.values = smoothed;
+        // Show the table being changed so an undo never edits something off-screen.
+        self.selected_table_idx = idx;
+        self.xdf.tables[idx].values = values;
         self.commit_table_edits();
     }
 
@@ -1384,6 +1395,7 @@ impl WidebandApp {
                                                 self.selected_table_idx = idx;
                                                 self.live_trace.clear();
                                                 self.active_cell = (0, 0);
+                                                self.selection_anchor = None;
                                             }
                                         });
                                     });
@@ -1519,6 +1531,7 @@ impl WidebandApp {
                     if response.clicked() {
                         if let Some(cell) = hover_cell {
                             self.active_cell = cell;
+                            self.selection_anchor = None;
                         }
                     }
                 } else {
@@ -1654,27 +1667,108 @@ impl WidebandApp {
 
                 ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("Math Step:").strong().color(TEXT));
-                    ui.add(egui::DragValue::new(&mut self.math_amount).speed(0.5).range(0.1..=100.0));
+                    // Wide range so "=" can set any engineering value (RPM limits, negative timing).
+                    ui.add(egui::DragValue::new(&mut self.math_amount).speed(0.5).range(-100000.0..=100000.0));
+                    let amt = self.math_amount;
 
-                    if ui.button("  +  ").clicked() {
-                        self.run_table_math('+');
+                    if ui.button("  +  ").on_hover_text("Add step to selection").clicked() {
+                        self.run_table_math(MathOp::Add(amt));
                     }
-                    if ui.button("  -  ").clicked() {
-                        self.run_table_math('-');
+                    if ui.button("  -  ").on_hover_text("Subtract step from selection").clicked() {
+                        self.run_table_math(MathOp::Sub(amt));
                     }
-                    if ui.button("  %  ").clicked() {
-                        self.run_table_math('%');
+                    if ui.button(" +% ").on_hover_text("Increase selection by step %").clicked() {
+                        self.run_table_math(MathOp::Percent(amt));
                     }
-                    if ui.button("  =  ").clicked() {
-                        self.run_table_math('=');
+                    if ui.button(" -% ").on_hover_text("Decrease selection by step %").clicked() {
+                        self.run_table_math(MathOp::Percent(-amt));
                     }
-                    if !beginner_mode && ui.button("Interpolate Row").clicked() {
-                        self.interpolate_active_row();
+                    if ui.button("  =  ").on_hover_text("Set selection to step").clicked() {
+                        self.run_table_math(MathOp::Set(amt));
                     }
-                    if !beginner_mode && ui.button("Smooth 3D").clicked() {
-                        self.smooth_table();
+                    if !beginner_mode {
+                        ui.separator();
+                        if ui.button("Interp H").on_hover_text("Linear fill across each selected row").clicked() {
+                            self.edit_selected_table("interpolate H", table_edit::interpolate_horizontal);
+                        }
+                        if ui.button("Interp V").on_hover_text("Linear fill down each selected column").clicked() {
+                            self.edit_selected_table("interpolate V", table_edit::interpolate_vertical);
+                        }
+                        if ui.button("Interp 2D").on_hover_text("Bilinear fill from the selection's 4 corners").clicked() {
+                            self.edit_selected_table("interpolate 2D", table_edit::interpolate_2d);
+                        }
+                        if ui.button("Smooth").on_hover_text("Smooth selection (whole table if one cell)").clicked() {
+                            if self.selection().is_single() {
+                                let (rows, cols) = {
+                                    let t = &self.xdf.tables[self.selected_table_idx];
+                                    (t.values.len(), t.values.first().map_or(0, |r| r.len()))
+                                };
+                                self.selection_anchor = Some((0, 0));
+                                self.active_cell = (rows.saturating_sub(1), cols.saturating_sub(1));
+                            }
+                            self.edit_selected_table("smooth", table_edit::smooth);
+                        }
                     }
+                    ui.separator();
+                    let undo_tip = self
+                        .table_undo
+                        .undo_label()
+                        .map(|l| format!("Undo {} (Ctrl+Z)", l))
+                        .unwrap_or_else(|| "Nothing to undo".to_string());
+                    if ui
+                        .add_enabled(self.table_undo.can_undo(), egui::Button::new("Undo"))
+                        .on_hover_text(undo_tip)
+                        .clicked()
+                    {
+                        self.undo_table_edit();
+                    }
+                    if ui
+                        .add_enabled(self.table_undo.can_redo(), egui::Button::new("Redo"))
+                        .on_hover_text("Redo (Ctrl+Y / Ctrl+Shift+Z)")
+                        .clicked()
+                    {
+                        self.redo_table_edit();
+                    }
+                    let sel = self.selection();
+                    let (r0, r1, c0, c1) = sel.bounds();
+                    ui.label(
+                        egui::RichText::new(if sel.is_single() {
+                            format!("Cell R{} C{}", r0, c0)
+                        } else {
+                            format!("{} cells (R{}-{} C{}-{})", sel.count(), r0, r1, c0, c1)
+                        })
+                        .small()
+                        .color(MUTED),
+                    );
                 });
+
+                // Keyboard: undo/redo, select all, Esc to collapse the selection.
+                if !ui.ctx().wants_keyboard_input() {
+                    let (undo, redo, all, esc) = ui.input(|i| {
+                        let cmd = i.modifiers.command;
+                        (
+                            cmd && !i.modifiers.shift && i.key_pressed(egui::Key::Z),
+                            cmd && (i.key_pressed(egui::Key::Y) || (i.modifiers.shift && i.key_pressed(egui::Key::Z))),
+                            cmd && i.key_pressed(egui::Key::A),
+                            i.key_pressed(egui::Key::Escape),
+                        )
+                    });
+                    if undo {
+                        self.undo_table_edit();
+                    }
+                    if redo {
+                        self.redo_table_edit();
+                    }
+                    if all {
+                        let t = &self.xdf.tables[self.selected_table_idx];
+                        let (rows, cols) = (t.values.len(), t.values.first().map_or(0, |r| r.len()));
+                        self.selection_anchor = Some((0, 0));
+                        self.active_cell = (rows.saturating_sub(1), cols.saturating_sub(1));
+                    }
+                    if esc {
+                        self.selection_anchor = None;
+                    }
+                }
                 ui.add_space(8.0);
 
                 let grid_avail = ui.available_size();
@@ -1696,6 +1790,11 @@ impl WidebandApp {
         let rows = table.values.len();
         let cols = table.values[0].len();
         let live_cell = self.live_trace.current().map(live_trace::nearest_cell);
+        let sel = self.selection().clamped(rows, cols);
+        let multi = !sel.is_single();
+        if !ui.input(|i| i.pointer.primary_down()) {
+            self.grid_drag_select = false;
+        }
 
         // Calculate Min/Max for heatmap
         let mut min_val = f64::MAX;
@@ -1777,6 +1876,11 @@ impl WidebandApp {
                                     );
                                 }
 
+                                if multi && sel.contains((r, c)) {
+                                    // Wash + outline: a faint tint alone vanished on teal/blue cells.
+                                    painter.rect_filled(rect, 2.0, Color32::from_rgba_unmultiplied(255, 255, 255, 48));
+                                    painter.rect_stroke(rect.shrink(1.0), 2.0, Stroke::new(1.5, ACCENT_CYAN));
+                                }
                                 if is_live {
                                     theme::paint_operating_cell_glow(painter, rect);
                                 }
@@ -1791,7 +1895,21 @@ impl WidebandApp {
                                         .strong()
                                         .color(text_color),
                                 );
+                                let response = response.interact(egui::Sense::click_and_drag());
+                                if response.drag_started() {
+                                    self.grid_drag_select = true;
+                                    self.selection_anchor = Some((r, c));
+                                    self.active_cell = (r, c);
+                                } else if self.grid_drag_select && ui.rect_contains_pointer(response.rect) {
+                                    self.active_cell = (r, c);
+                                }
                                 if response.clicked() {
+                                    if ui.input(|i| i.modifiers.shift) {
+                                        // Extend from the current anchor (or the old cursor).
+                                        self.selection_anchor = Some(self.selection_anchor.unwrap_or(self.active_cell));
+                                    } else {
+                                        self.selection_anchor = None;
+                                    }
                                     self.active_cell = (r, c);
                                 }
                             });

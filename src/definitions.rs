@@ -318,6 +318,14 @@ impl XdfDocument {
         write_table_to_rom(rom, origin, &self.tables[table_idx])
     }
 
+    /// Re-decode one table from the ROM, so the UI shows what was actually stored after the
+    /// equation inverse + integer quantisation (not the unrounded edit value).
+    pub fn reload_table_from_rom(&mut self, rom: &[u8], origin: i64, table_idx: usize) {
+        if let Some(table) = self.tables.get_mut(table_idx) {
+            read_table_from_rom(rom, origin, table);
+        }
+    }
+
     pub fn write_all_tables_to_rom(&self, rom: &mut [u8], origin: i64) {
         for table in &self.tables {
             write_table_to_rom(rom, origin, table);
