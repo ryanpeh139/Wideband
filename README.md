@@ -13,6 +13,8 @@ cargo test
 
 Run the binary as `wideband` (or `target/debug/wideband` / `target/release/wideband`). J2534 bench logic, XDF parsing, ISO-TP/UDS flash paths, and the motorsport calibration workspace live in `src/`.
 
+**2017 Tacoma + Mini-VCI or VXDIAG VCX Nano (Toyota):** see [`docs/tacoma-can-j2534-bring-up.md`](docs/tacoma-can-j2534-bring-up.md). Place **`J2534Host.exe`** (32-bit, from `J2534Host.cs`) next to **`wideband.exe`** on Windows.
+
 The legacy C# WinForms tree (`Wideband.cs`, `Calibrate.cs`, …) remains for reference and Windows-only `csc.exe` handoff; new UI work targets Rust.
 
 ## Handoff

@@ -84,8 +84,17 @@ mod imp {
             if v.get("ok").and_then(|b| b.as_bool()) == Some(true) {
                 return Ok(());
             }
-            let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("host error");
+            let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("J2534Host error");
+            if let Some(st) = v.get("status").and_then(|s| s.as_i64()) {
+                if st >= 0 {
+                    return Err(format!("{} (status 0x{:X})", err, st as u32));
+                }
+            }
             Err(err.to_string())
+        }
+
+        fn is_tx_full(v: &Value) -> bool {
+            v.get("full").and_then(|b| b.as_bool()) == Some(true)
         }
     }
 
@@ -124,7 +133,18 @@ mod imp {
             Self::require_ok(&resp)?;
             self.device_id = resp.get("device_id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             self.connected = true;
-            self.version_str = format!("J2534Host → {}", self.lib_path);
+            if let Ok(ver) = self.command("VERSION", 15_000) {
+                if ver.get("ok").and_then(|b| b.as_bool()) == Some(true) {
+                    let fw = ver.get("firmware").and_then(|v| v.as_str()).unwrap_or("?");
+                    let dll = ver.get("dll").and_then(|v| v.as_str()).unwrap_or("?");
+                    let api = ver.get("api").and_then(|v| v.as_str()).unwrap_or("?");
+                    self.version_str = format!("J2534Host FW:{} DLL:{} API:{}", fw, dll, api);
+                } else {
+                    self.version_str = format!("J2534Host → {}", self.lib_path);
+                }
+            } else {
+                self.version_str = format!("J2534Host → {}", self.lib_path);
+            }
             Ok(())
         }
 
@@ -199,9 +219,21 @@ mod imp {
                 let id = msg.read_id();
                 let payload = msg.payload();
                 let line = format!("WRITE {:X} {}", id, bytes_to_hex(payload));
-                let resp = self.command(&line, timeout_ms.max(1000))?;
-                Self::require_ok(&resp)?;
-                count += 1;
+                let mut attempts = 0u32;
+                while attempts < 8 {
+                    let resp = self.command(&line, timeout_ms.max(1000))?;
+                    if Self::is_tx_full(&resp) {
+                        attempts += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Self::require_ok(&resp)?;
+                    count += 1;
+                    break;
+                }
+                if attempts >= 8 {
+                    return Err("PassThru TX buffer full after retries (cable busy)".to_string());
+                }
             }
             Ok(count)
         }

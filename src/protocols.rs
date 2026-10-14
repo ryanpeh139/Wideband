@@ -325,7 +325,13 @@ pub struct EcuIdentification {
 pub struct EcuIdentifier;
 
 impl EcuIdentifier {
-    pub fn query(device: &mut dyn PassThruDevice, channel: u32, profile: &EcuProfile) -> Result<EcuIdentification, String> {
+    /// When `allow_demo_defaults` is true (Virtual ECU bench only), missing fields are filled with demo values.
+    pub fn query(
+        device: &mut dyn PassThruDevice,
+        channel: u32,
+        profile: &EcuProfile,
+        allow_demo_defaults: bool,
+    ) -> Result<EcuIdentification, String> {
         let mut id = EcuIdentification::default();
 
         // 1. Query VIN: OBD-II Mode 09 02 or UDS 22 F1 90
@@ -379,14 +385,25 @@ impl EcuIdentifier {
             }
         }
 
-        if id.vin.is_empty() {
-            id.vin = "5TFRX54N56Z123456".to_string(); // Virtual/fallback fallback
-        }
-        if id.cal_id.is_empty() {
-            id.cal_id = if profile.platform.contains("Toyota") { "30589000".to_string() } else { "12619623".to_string() };
-        }
-        if id.cvn.is_empty() {
-            id.cvn = "A1B2C3D4".to_string();
+        if allow_demo_defaults {
+            if id.vin.is_empty() {
+                id.vin = "5TFRX54N56Z123456".to_string();
+            }
+            if id.cal_id.is_empty() {
+                id.cal_id = if profile.platform.contains("Toyota") {
+                    "89663-04B04".to_string()
+                } else {
+                    "12619623".to_string()
+                };
+            }
+            if id.cvn.is_empty() {
+                id.cvn = "A1B2C3D4".to_string();
+            }
+        } else if id.vin.is_empty() && id.cal_id.is_empty() && id.cvn.is_empty() {
+            return Err(
+                "ECU did not respond to identification (ignition ON, Tacoma 2009+ CAN profile, and bus traffic required)."
+                    .to_string(),
+            );
         }
 
         id.details = format!(
