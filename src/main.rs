@@ -317,9 +317,9 @@ mod tests {
 
         // 1. Test ECU Identification
         let id = EcuIdentifier::query(&mut sim, channel, &prof, true).expect("ECU identify must succeed");
-        assert_eq!(id.vin, "5TFRX54N56Z123456");
-        assert_eq!(id.cal_id, "89663-04B04");
-        assert_eq!(id.cvn, "A1B2C3D4");
+        assert_eq!(id.vin, j2534::VIRTUAL_TACOMA_VIN);
+        assert_eq!(id.cal_id, j2534::VIRTUAL_TACOMA_CAL_ID);
+        assert_eq!(id.cvn, j2534::VIRTUAL_TACOMA_CVN_HEX);
 
         // 2. Test End-to-End Flash Sequence (Security -> Download 0x34 -> Transfer 0x36 -> Exit 0x37 -> Reset 0x11)
         let flash_data = vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22];
