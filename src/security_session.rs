@@ -100,8 +100,11 @@ mod tests {
     use crate::security_config::PlatformSecurity;
     use std::path::PathBuf;
 
-    fn install_test_security_config() {
+    /// Holds the global security-state lock for the whole test (other modules' tests swap it).
+    fn install_test_security_config() -> std::sync::MutexGuard<'static, ()> {
+        let guard = PlatformSecurity::test_serial_guard();
         PlatformSecurity::install(&PathBuf::from("tests/security-config-test.json"));
+        guard
     }
 
     fn open_tacoma_sim() -> (VirtualEcuSimulator, u32) {
@@ -113,7 +116,7 @@ mod tests {
 
     #[test]
     fn test_diagnostic_session_control_programming() {
-        install_test_security_config();
+        let _guard = install_test_security_config();
         let (mut sim, ch) = open_tacoma_sim();
         let prof = EcuProfile::tacoma_can();
         let mut client = UdsClient::for_profile(&mut sim, ch, &prof);
@@ -128,7 +131,7 @@ mod tests {
 
     #[test]
     fn test_security_access_happy_path_tacoma() {
-        install_test_security_config();
+        let _guard = install_test_security_config();
         PlatformSecurity::register_bench_keys_for_virtual();
         let (mut sim, ch) = open_tacoma_sim();
         let prof = EcuProfile::tacoma_can();
@@ -142,7 +145,7 @@ mod tests {
 
     #[test]
     fn test_security_access_fails_without_key_config() {
-        install_test_security_config();
+        let _guard = install_test_security_config();
         let prof = EcuProfile::tacoma_kline();
         let seed = [0x12, 0x34, 0x56, 0x78];
         let err = PlatformSecurity::compute_key(&seed, &prof).expect_err("fail-closed");
@@ -155,7 +158,7 @@ mod tests {
 
     #[test]
     fn test_security_access_fails_wrong_key() {
-        install_test_security_config();
+        let _guard = install_test_security_config();
         PlatformSecurity::register_bench_keys_for_virtual();
         let (mut sim, ch) = open_tacoma_sim();
         let prof = EcuProfile::tacoma_can();
@@ -173,7 +176,7 @@ mod tests {
 
     #[test]
     fn test_flash_download_blocked_without_unlock() {
-        install_test_security_config();
+        let _guard = install_test_security_config();
         let (mut sim, ch) = open_tacoma_sim();
         let prof = EcuProfile::tacoma_can();
         let mut client = UdsClient::for_profile(&mut sim, ch, &prof);
@@ -198,7 +201,7 @@ mod tests {
 
     #[test]
     fn test_read_session_transition() {
-        install_test_security_config();
+        let _guard = install_test_security_config();
         let layout = FlashLayoutMap::load("tests/flash-layout-test.json").expect("layout");
         let (mut sim, ch) = open_tacoma_sim();
         let prof = EcuProfile::tacoma_can();
