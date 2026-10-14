@@ -10,6 +10,7 @@ pub mod j2534_host;
 pub mod profile_pack;
 pub mod protocols;
 pub mod security_config;
+pub mod security_session;
 pub mod telemetry;
 pub mod surface_mesh;
 pub mod theme;

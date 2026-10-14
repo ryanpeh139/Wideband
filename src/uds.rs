@@ -156,37 +156,6 @@ impl UdsClient {
     }
 }
 
-pub struct ProgrammingSession;
-
-impl ProgrammingSession {
-    pub fn unlock(
-        client: &mut UdsClient,
-        device: &mut dyn PassThruDevice,
-        profile: &EcuProfile,
-    ) -> Result<(), String> {
-        client.tester_present(device, profile.diagnostic)?;
-        let session = profile.programming_session;
-        let (p2, p2_star) = client.diagnostic_session_control(device, session)?;
-        client.set_timers(p2, p2_star);
-
-        let seed_resp = client.request(device, &[0x27, 0x01], 0x67)?;
-        if seed_resp.len() < 2 || seed_resp[1] != 0x01 {
-            return Err("Security seed response invalid".to_string());
-        }
-        let seed = &seed_resp[2..];
-        if seed.iter().any(|&b| b != 0) {
-            let key = crate::security_config::PlatformSecurity::compute_key(seed, profile)?;
-            let mut key_req = vec![0x27, 0x02];
-            key_req.extend_from_slice(&key);
-            let key_resp = client.request(device, &key_req, 0x67)?;
-            if key_resp.len() < 2 || key_resp[1] != 0x02 {
-                return Err("Security key rejected".to_string());
-            }
-        }
-        Ok(())
-    }
-}
-
 fn format_field(size_bytes: usize, address_bytes: usize) -> u8 {
     (((size_bytes & 0x0F) << 4) | (address_bytes & 0x0F)) as u8
 }
