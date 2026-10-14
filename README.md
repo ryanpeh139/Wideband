@@ -1,0 +1,23 @@
+# Wideband
+
+Wideband is a Windows desktop app. Open `Wideband.exe`.
+
+Calibrate edits a sample definition file, `sample-definition.json`, beside the program. The file describes scalars, curves, and maps with units, axes, and a beginner, intermediate, or advanced level. Table tools add, scale, smooth, interpolate, and compare against the original sample. Trace highlights the nearest cell for an RPM and load you type.
+
+Log opens a CSV and draws it, evaluates a channel formula such as `lambda / target`, and can apply a volumetric-efficiency suggestion to the sample table.
+
+Logger reads `Logger.ini` from the vF Tuner install. Cable uses `J2534Host.exe`, a 32-bit helper, so the 64-bit app can load `esp32.dll`. Connect Cable opens the device, reads the version, and leaves the device id and channel id open. The Cable page selects a Toyota Tacoma or Chevrolet Silverado profile. Tacoma 2009+ uses ISO 15765 on 11-bit CAN at 500 kbps (`0x7E0` / `0x7E8`). Silverado 2007+ uses ISO 15765 on 29-bit CAN at 500 kbps (`0x18DA10F1` / `0x18DAF110`). Tacoma 2005–2008 uses ISO 14230 K-Line at 10400 baud. Silverado 1999–2007 uses J1850 VPW at 10400 baud. Tester present (service `0x3E`) is sent every 2 seconds while the channel is held. `SocketCanLink` is the Linux SocketCAN backend and refuses to open on Windows. `IsoTpLink` segments longer CAN messages: a single frame up to 7 data bytes, or a first frame, flow control with block size and STmin, and consecutive frames. Profiles lists the Toyota profile filenames. The profile bodies stay unread.
+
+`ExtendedSessionAccess` requests a diagnostic session (service 0x10) and then security access (service 0x27). UDS programming uses session `0x02`. KWP2000 programming uses session `0x85`. It sends the seed request, keeps the seed bytes from the response, passes them to `ComputeSecurityKey` when one is configured, and sends that key. Timeouts and negative responses stop the sequence. No key algorithm is included.
+
+`FlashDownload` sends Request Download (service 0x34) with the memory address and the uncompressed image length, then Transfer Data (service 0x36) in blocks, then Request Transfer Exit (service 0x37). Each block carries the next sequence counter, starting at 1 and wrapping after 255. The block size is the smaller of the caller's chunk, such as 256 or 1024, and the size the ECU reports. A progress callback receives the bytes acknowledged and the total.
+
+`VehicleLink` is the open cable. A response-pending negative response (`7F`, service, `78`) extends the read wait to at least 5 seconds while a sector is busy. Read ECU asks for an address and a length, confirms, then reads with service `0x23`. Write/Flash Calibration asks for a file and a hexadecimal address, confirms, then runs tester present, programming session `0x10`, security access `0x27`, download `0x34`, transfer `0x36`, exit `0x37`, and reset `0x11`. The progress bar and the communication log show the percent, the rate, and the service bytes. The channel stays open when the transfer ends. Disconnect closes it. A failed transfer does not close the channel by itself. No security-key algorithm and no checksum are included. K-Line and VPW frames that do not fit the bus are rejected before they are sent. A VPW download can name at most 65535 bytes.
+
+`MemoryImage` loads and saves a raw binary. It refuses `.enc` files and profiles whose first bytes are `VFTBLPE1`. `ScalarCodec` and `TableBinding` convert uint8, int8, uint16, int16, uint32, int32, and float32 values with endianness, an optional bit field, and `raw * factor + offset`. `MemoryDefinition` reads that shape from JSON. `RegionChecksum` computes CRC-16/CCITT-FALSE, CRC-16/MODBUS, or CRC-32/ISO-HDLC over a caller-specified range and can stamp that field before a file is saved or a transfer is queued.
+
+The calibrate view groups parameters by domain. Changed cells show green when the value rose and red when it fell. Shift+Up and Shift+Down step the selection. Shift+Left and Shift+Right scale it. A map draws as a color-scaled surface beside the grid.
+
+Wideband does not calculate an ECU security key, suppress trouble codes, or open the encrypted vF Tuner definitions.
+
+Set `XAI_API_KEY` before starting Wideband if you want the assistant to call Grok. Without that key, the assistant answers from the logger file.
