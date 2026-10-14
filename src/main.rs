@@ -15,6 +15,7 @@ pub mod security_config;
 pub mod security_session;
 pub mod telemetry;
 pub mod surface_mesh;
+pub mod simple_ux;
 pub mod tcm;
 pub mod theme;
 pub mod ui;
