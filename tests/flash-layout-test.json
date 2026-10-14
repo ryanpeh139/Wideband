@@ -1,0 +1,20 @@
+{
+  "profiles": {
+    "tacoma-can": {
+      "rom_origin": 65536,
+      "image_bytes": 4096,
+      "stock_read": {
+        "address": 65536,
+        "size": 256
+      },
+      "cal_flash_segments": [
+        {
+          "id": "cal-primary",
+          "label": "Calibration region",
+          "address": 65536,
+          "size": 64
+        }
+      ]
+    }
+  }
+}

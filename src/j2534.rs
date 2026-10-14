@@ -28,7 +28,7 @@ pub const DATA_RATE: u32 = 0x01;
 pub const LOOPBACK: u32 = 0x03;
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct PassThruMsg {
     pub protocol_id: u32,
     pub rx_status: u32,
@@ -213,6 +213,14 @@ pub trait PassThruDevice: Send + Sync {
     fn ioctl(&mut self, channel: u32, ioctl_id: u32, input: &[u8]) -> Result<Vec<u8>, String>;
     fn is_connected(&self) -> bool;
     fn firmware_version(&self) -> String;
+    fn channel_id(&self) -> u32 {
+        1
+    }
+    fn device_label(&self) -> String {
+        "unknown".to_string()
+    }
+    /// Host bridge uses FILTER during CONNECT; native uses this before filters.
+    fn set_connect_hints(&mut self, _extended: bool, _filter_id: u32, _filter_mask: u32) {}
 }
 
 /// In-memory loopback ECU simulator for bench testing without vehicle hardware
@@ -226,6 +234,8 @@ pub struct VirtualEcuSimulator {
     download_active: bool,
     transfer_offset: u32,
     received_bytes: Vec<u8>,
+    rx_assembly: Vec<u8>,
+    rx_expected_len: usize,
 }
 
 impl VirtualEcuSimulator {
@@ -240,6 +250,8 @@ impl VirtualEcuSimulator {
             download_active: false,
             transfer_offset: 0,
             received_bytes: Vec::new(),
+            rx_assembly: Vec::new(),
+            rx_expected_len: 0,
         }
     }
 
@@ -293,6 +305,46 @@ impl VirtualEcuSimulator {
                 vec![0x41, 0x24, (raw >> 8) as u8, (raw & 0xFF) as u8, 0x80, 0x00]
             }
             _ => vec![0x7F, 0x01, 0x12], // Sub-function not supported
+        }
+    }
+
+    fn enqueue_iso_tp_response(&mut self, rx_id: u32, resp_payload: &[u8]) {
+        let len = resp_payload.len();
+        if len <= 7 {
+            let mut b = vec![len as u8];
+            b.extend_from_slice(resp_payload);
+            while b.len() < 8 {
+                b.push(0xAA);
+            }
+            let mut resp_msg = PassThruMsg::new_can(rx_id, &b);
+            resp_msg.protocol_id = self.active_protocol;
+            self.rx_queue.push(resp_msg);
+            return;
+        }
+
+        let mut ff = vec![0x10 | ((len >> 8) as u8 & 0x0F), (len & 0xFF) as u8];
+        ff.extend_from_slice(&resp_payload[..6.min(len)]);
+        while ff.len() < 8 {
+            ff.push(0xAA);
+        }
+        let mut ff_msg = PassThruMsg::new_can(rx_id, &ff);
+        ff_msg.protocol_id = self.active_protocol;
+        self.rx_queue.push(ff_msg);
+
+        let mut offset = 6;
+        let mut seq = 1u8;
+        while offset < len {
+            let chunk = (len - offset).min(7);
+            let mut cf = vec![0x20 | (seq & 0x0F)];
+            cf.extend_from_slice(&resp_payload[offset..offset + chunk]);
+            while cf.len() < 8 {
+                cf.push(0xAA);
+            }
+            let mut cf_msg = PassThruMsg::new_can(rx_id, &cf);
+            cf_msg.protocol_id = self.active_protocol;
+            self.rx_queue.push(cf_msg);
+            offset += chunk;
+            seq = (seq + 1) & 0x0F;
         }
     }
 
@@ -420,6 +472,36 @@ impl VirtualEcuSimulator {
                 self.download_active = false;
                 vec![0x77]
             }
+            // 0x23: ReadMemoryByAddress (bench stock read)
+            0x23 => {
+                if req.len() < 3 {
+                    return vec![0x7F, 0x23, 0x13];
+                }
+                let fmt = req[1];
+                let addr_bytes = (fmt & 0x0F) as usize;
+                let size_bytes = ((fmt >> 4) & 0x0F) as usize;
+                let need = 2 + addr_bytes + size_bytes;
+                if req.len() < need {
+                    return vec![0x7F, 0x23, 0x13];
+                }
+                let mut addr = 0u64;
+                for i in 0..addr_bytes {
+                    addr = (addr << 8) | req[2 + i] as u64;
+                }
+                let mut count = 0u64;
+                for i in 0..size_bytes {
+                    count = (count << 8) | req[2 + addr_bytes + i] as u64;
+                }
+                if count == 0 || count > 4096 {
+                    return vec![0x7F, 0x23, 0x31];
+                }
+                let mut resp = vec![0x63];
+                for i in 0..count {
+                    let b = virtual_stock_byte((addr + i) as u32);
+                    resp.push(b);
+                }
+                resp
+            }
             // 0x11: ECUReset
             0x11 => {
                 self.unlocked_level1 = false;
@@ -429,6 +511,11 @@ impl VirtualEcuSimulator {
             _ => vec![0x7F, req[0], 0x11], // Service not supported
         }
     }
+}
+
+fn virtual_stock_byte(address: u32) -> u8 {
+    let a = address ^ 0xA5A5_0000;
+    ((a >> 8) ^ (a & 0xFF) ^ 0x5A) as u8
 }
 
 impl PassThruDevice for VirtualEcuSimulator {
@@ -469,39 +556,48 @@ impl PassThruDevice for VirtualEcuSimulator {
         }
         for msg in msgs {
             let req_payload = msg.payload();
-            let actual_req = if !req_payload.is_empty() && req_payload[0] <= 0x07 {
-                let len = req_payload[0] as usize;
+            if req_payload.is_empty() {
+                continue;
+            }
+            let pci = req_payload[0] >> 4;
+            let complete_req = if pci == 0x00 {
+                let len = (req_payload[0] & 0x0F) as usize;
                 if req_payload.len() >= 1 + len {
-                    &req_payload[1..1 + len]
+                    req_payload[1..1 + len].to_vec()
                 } else {
-                    &req_payload[1..]
+                    req_payload[1..].to_vec()
                 }
-            } else if req_payload.len() > 2 && (req_payload[0] & 0xF0) == 0x10 {
-                &req_payload[2..]
+            } else if pci == 0x01 {
+                self.rx_expected_len = (((req_payload[0] & 0x0F) as usize) << 8) | (req_payload[1] as usize);
+                self.rx_assembly.clear();
+                if req_payload.len() > 2 {
+                    self.rx_assembly.extend_from_slice(&req_payload[2..]);
+                }
+                let fc = vec![0x30, 0x00, 0x00, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA];
+                let mut fc_msg = PassThruMsg::new_can(0x7E8, &fc);
+                fc_msg.protocol_id = self.active_protocol;
+                self.rx_queue.push(fc_msg);
+                continue;
+            } else if pci == 0x02 {
+                if req_payload.len() > 1 {
+                    self.rx_assembly.extend_from_slice(&req_payload[1..]);
+                }
+                if self.rx_assembly.len() < self.rx_expected_len {
+                    continue;
+                }
+                self.rx_assembly.truncate(self.rx_expected_len);
+                self.rx_expected_len = 0;
+                self.rx_assembly.clone()
+            } else if pci == 0x03 {
+                continue;
             } else {
-                req_payload
+                req_payload.to_vec()
             };
 
-            let resp_payload = self.handle_uds_request(actual_req);
+            let resp_payload = self.handle_uds_request(&complete_req);
 
             if self.active_protocol == ISO15765 || self.active_protocol == CAN {
-                let rx_id = 0x7E8; // Standard OBD-II / UDS ECM response ID
-                let iso_tp_buf = if resp_payload.len() <= 7 {
-                    let mut b = vec![resp_payload.len() as u8];
-                    b.extend_from_slice(&resp_payload);
-                    while b.len() < 8 {
-                        b.push(0xAA);
-                    }
-                    b
-                } else {
-                    let mut b = vec![0x10 | ((resp_payload.len() >> 8) as u8 & 0x0F), (resp_payload.len() & 0xFF) as u8];
-                    b.extend_from_slice(&resp_payload);
-                    b
-                };
-
-                let mut resp_msg = PassThruMsg::new_can(rx_id, &iso_tp_buf);
-                resp_msg.protocol_id = self.active_protocol;
-                self.rx_queue.push(resp_msg);
+                self.enqueue_iso_tp_response(0x7E8, &resp_payload);
             } else if self.active_protocol == ISO14230 {
                 // KWP2000 framing
                 let mut resp_msg = PassThruMsg::default();
@@ -544,13 +640,82 @@ impl PassThruDevice for VirtualEcuSimulator {
     fn firmware_version(&self) -> String {
         "Wideband-Sim 2.4.0 (Rust native virtual loopback)".to_string()
     }
+
+    fn channel_id(&self) -> u32 {
+        self.channel_id
+    }
+
+    fn device_label(&self) -> String {
+        "virtual-ecu".to_string()
+    }
+}
+
+#[cfg(windows)]
+mod native_passthru {
+    use super::*;
+    use libloading::Library;
+    use std::ffi::c_void;
+    use std::ptr;
+
+    type PassThruOpenFn = unsafe extern "system" fn(*const u16, *mut u32) -> i32;
+    type PassThruCloseFn = unsafe extern "system" fn(u32) -> i32;
+    type PassThruConnectFn = unsafe extern "system" fn(u32, u32, u32, u32, *mut u32) -> i32;
+    type PassThruDisconnectFn = unsafe extern "system" fn(u32) -> i32;
+    type PassThruReadFn = unsafe extern "system" fn(u32, *mut PassThruMsg, *mut u32, u32) -> i32;
+    type PassThruWriteFn = unsafe extern "system" fn(u32, *mut PassThruMsg, *mut u32, u32) -> i32;
+    type PassThruStartFilterFn =
+        unsafe extern "system" fn(u32, u32, *mut PassThruMsg, *mut PassThruMsg, *mut PassThruMsg, *mut u32) -> i32;
+    type PassThruIoctlFn = unsafe extern "system" fn(u32, u32, *mut c_void, *mut c_void) -> i32;
+
+    pub struct NativeApi {
+        library: Library,
+        open: PassThruOpenFn,
+        close: PassThruCloseFn,
+        connect: PassThruConnectFn,
+        disconnect: PassThruDisconnectFn,
+        read: PassThruReadFn,
+        write: PassThruWriteFn,
+        start_filter: PassThruStartFilterFn,
+        ioctl: PassThruIoctlFn,
+    }
+
+    impl NativeApi {
+        pub fn load(path: &str) -> Result<Self, String> {
+            let library = unsafe { Library::new(path) }.map_err(|e| format!("LoadLibrary failed: {}", e))?;
+            unsafe {
+                Ok(Self {
+                    open: *library.get(b"PassThruOpen\0").map_err(|e| e.to_string())?,
+                    close: *library.get(b"PassThruClose\0").map_err(|e| e.to_string())?,
+                    connect: *library.get(b"PassThruConnect\0").map_err(|e| e.to_string())?,
+                    disconnect: *library.get(b"PassThruDisconnect\0").map_err(|e| e.to_string())?,
+                    read: *library.get(b"PassThruReadMsgs\0").map_err(|e| e.to_string())?,
+                    write: *library.get(b"PassThruWriteMsgs\0").map_err(|e| e.to_string())?,
+                    start_filter: *library.get(b"PassThruStartMsgFilter\0").map_err(|e| e.to_string())?,
+                    ioctl: *library.get(b"PassThruIoctl\0").map_err(|e| e.to_string())?,
+                    library,
+                })
+            }
+        }
+
+        pub fn open_device(&self) -> Result<u32, String> {
+            let mut device_id = 0u32;
+            let status = unsafe { self.open(ptr::null(), &mut device_id) };
+            if status != STATUS_NOERROR {
+                return Err(format!("PassThruOpen failed: {}", status));
+            }
+            Ok(device_id)
+        }
+    }
 }
 
 pub struct NativePassThruDevice {
     pub lib_path: String,
     pub device_id: u32,
+    pub channel_id: u32,
     pub connected: bool,
     pub version_str: String,
+    #[cfg(windows)]
+    api: Option<native_passthru::NativeApi>,
 }
 
 impl NativePassThruDevice {
@@ -558,8 +723,11 @@ impl NativePassThruDevice {
         Self {
             lib_path: path.to_string(),
             device_id: 0,
+            channel_id: 0,
             connected: false,
             version_str: "Unknown".to_string(),
+            #[cfg(windows)]
+            api: None,
         }
     }
 }
@@ -569,38 +737,171 @@ impl PassThruDevice for NativePassThruDevice {
         if !std::path::Path::new(&self.lib_path).exists() {
             return Err(format!("J2534 DLL not found: {}", self.lib_path));
         }
-        self.connected = true;
-        self.version_str = format!("PassThru loaded from {}", self.lib_path);
-        Ok(())
+        #[cfg(windows)]
+        {
+            let api = native_passthru::NativeApi::load(&self.lib_path)?;
+            self.device_id = api.open_device()?;
+            self.api = Some(api);
+            self.connected = true;
+            self.version_str = format!("J2534 PassThru ({})", self.lib_path);
+            return Ok(());
+        }
+        #[cfg(not(windows))]
+        {
+            Err("Native J2534 PassThru is only supported on Windows. Use Virtual ECU for bench.".to_string())
+        }
     }
 
     fn close(&mut self) -> Result<(), String> {
+        #[cfg(windows)]
+        if let Some(api) = &self.api {
+            if self.channel_id != 0 {
+                let _ = unsafe { api.disconnect(self.channel_id) };
+                self.channel_id = 0;
+            }
+            if self.device_id != 0 {
+                let _ = unsafe { api.close(self.device_id) };
+                self.device_id = 0;
+            }
+        }
         self.connected = false;
+        #[cfg(windows)]
+        {
+            self.api = None;
+        }
         Ok(())
     }
 
-    fn connect(&mut self, _protocol: u32, _flags: u32, _baud: u32) -> Result<u32, String> {
-        Ok(1)
+    fn connect(&mut self, protocol: u32, flags: u32, baud: u32) -> Result<u32, String> {
+        #[cfg(windows)]
+        {
+            let api = self.api.as_ref().ok_or("PassThru not open")?;
+            let mut channel_id = 0u32;
+            let status = unsafe { api.connect(self.device_id, protocol, flags, baud, &mut channel_id) };
+            if status != STATUS_NOERROR {
+                return Err(format!("PassThruConnect failed: {}", status));
+            }
+            self.channel_id = channel_id;
+            self.connected = true;
+            return Ok(channel_id);
+        }
+        #[cfg(not(windows))]
+        {
+            Err("Native J2534 connect requires Windows".to_string())
+        }
     }
 
-    fn disconnect(&mut self, _channel: u32) -> Result<(), String> {
+    fn disconnect(&mut self, channel: u32) -> Result<(), String> {
+        #[cfg(windows)]
+        if let Some(api) = &self.api {
+            let _ = unsafe { api.disconnect(channel) };
+        }
+        if self.channel_id == channel {
+            self.channel_id = 0;
+        }
         Ok(())
     }
 
-    fn read_msgs(&mut self, _channel: u32, _timeout_ms: u32) -> Result<Vec<PassThruMsg>, String> {
-        Ok(Vec::new())
+    fn read_msgs(&mut self, channel: u32, timeout_ms: u32) -> Result<Vec<PassThruMsg>, String> {
+        #[cfg(windows)]
+        {
+            let api = self.api.as_ref().ok_or("PassThru not open")?;
+            let mut msg = PassThruMsg::default();
+            let mut count: u32 = 1;
+            let status = unsafe { api.read(channel, &mut msg, &mut count, timeout_ms) };
+            if status != STATUS_NOERROR {
+                return Ok(Vec::new());
+            }
+            if count == 0 {
+                return Ok(Vec::new());
+            }
+            return Ok(vec![msg]);
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(Vec::new())
+        }
     }
 
-    fn write_msgs(&mut self, _channel: u32, msgs: &[PassThruMsg], _timeout_ms: u32) -> Result<u32, String> {
-        Ok(msgs.len() as u32)
+    fn write_msgs(&mut self, channel: u32, msgs: &[PassThruMsg], timeout_ms: u32) -> Result<u32, String> {
+        #[cfg(windows)]
+        {
+            let api = self.api.as_ref().ok_or("PassThru not open")?;
+            let mut written = 0u32;
+            for msg in msgs {
+                let mut one = *msg;
+                let mut count = 1u32;
+                let status = unsafe { api.write(channel, &mut one, &mut count, timeout_ms) };
+                if status != STATUS_NOERROR {
+                    return Err(format!("PassThruWriteMsgs failed: {}", status));
+                }
+                written += count;
+            }
+            return Ok(written);
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(msgs.len() as u32)
+        }
     }
 
-    fn start_filter(&mut self, _channel: u32, _filter_type: u32, _mask: &PassThruMsg, _pattern: &PassThruMsg, _flow_control: Option<&PassThruMsg>) -> Result<u32, String> {
-        Ok(1)
+    fn start_filter(
+        &mut self,
+        channel: u32,
+        filter_type: u32,
+        mask: &PassThruMsg,
+        pattern: &PassThruMsg,
+        flow_control: Option<&PassThruMsg>,
+    ) -> Result<u32, String> {
+        #[cfg(windows)]
+        {
+            let api = self.api.as_ref().ok_or("PassThru not open")?;
+            let mut mask_msg = *mask;
+            let mut pattern_msg = *pattern;
+            let mut flow_msg = flow_control.copied().unwrap_or_default();
+            let flow_ptr = if flow_control.is_some() {
+                &mut flow_msg as *mut PassThruMsg
+            } else {
+                std::ptr::null_mut()
+            };
+            let mut filter_id = 0u32;
+            let status = unsafe {
+                api.start_filter(channel, filter_type, &mut mask_msg, &mut pattern_msg, flow_ptr, &mut filter_id)
+            };
+            if status != STATUS_NOERROR {
+                return Err(format!("PassThruStartMsgFilter failed: {}", status));
+            }
+            Ok(filter_id)
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(1)
+        }
     }
 
-    fn ioctl(&mut self, _channel: u32, _ioctl_id: u32, _input: &[u8]) -> Result<Vec<u8>, String> {
-        Ok(vec![])
+    fn ioctl(&mut self, channel: u32, ioctl_id: u32, input: &[u8]) -> Result<Vec<u8>, String> {
+        #[cfg(windows)]
+        {
+            let api = self.api.as_ref().ok_or("PassThru not open")?;
+            let mut in_buf = input.to_vec();
+            let mut out_buf = vec![0u8; 256];
+            let status = unsafe {
+                api.ioctl(
+                    channel,
+                    ioctl_id,
+                    in_buf.as_mut_ptr() as *mut c_void,
+                    out_buf.as_mut_ptr() as *mut c_void,
+                )
+            };
+            if status != STATUS_NOERROR {
+                return Ok(vec![]);
+            }
+            return Ok(out_buf);
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(vec![])
+        }
     }
 
     fn is_connected(&self) -> bool {
@@ -610,12 +911,48 @@ impl PassThruDevice for NativePassThruDevice {
     fn firmware_version(&self) -> String {
         self.version_str.clone()
     }
+
+    fn channel_id(&self) -> u32 {
+        if self.channel_id != 0 {
+            self.channel_id
+        } else {
+            1
+        }
+    }
+
+    fn device_label(&self) -> String {
+        self.lib_path.clone()
+    }
+}
+
+/// Connect J2534 channel and install ISO-15765 filters when required.
+pub fn connect_for_profile(
+    device: &mut dyn PassThruDevice,
+    profile: &crate::protocols::EcuProfile,
+) -> Result<u32, String> {
+    use crate::protocols::VehicleBus;
+    device.set_connect_hints(profile.extended_id, profile.response_id, profile.filter_mask);
+    let channel = device.connect(profile.protocol_id, profile.connect_flags, profile.bitrate)?;
+    if profile.bus == VehicleBus::CanIsoTp {
+        let mut pass_mask = PassThruMsg::new_can(profile.filter_mask, &[]);
+        pass_mask.write_id(profile.filter_mask);
+        let mut pass_pat = PassThruMsg::new_can(profile.response_id, &[]);
+        pass_pat.write_id(profile.response_id);
+        device.start_filter(channel, PASS_FILTER, &pass_mask, &pass_pat, None)?;
+    }
+    Ok(channel)
 }
 
 pub fn create_device(info: &J2534DeviceInfo) -> Box<dyn PassThruDevice> {
     if info.is_virtual || info.library_path == "virtual" {
         Box::new(VirtualEcuSimulator::new())
     } else {
+        #[cfg(windows)]
+        {
+            if crate::j2534_host::HostPassThruDevice::host_available() {
+                return crate::j2534_host::create_host_device(&info.library_path);
+            }
+        }
         Box::new(NativePassThruDevice::new(&info.library_path))
     }
 }
