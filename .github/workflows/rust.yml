@@ -18,3 +18,11 @@ jobs:
         run: cargo build --locked
       - name: cargo test
         run: cargo test --locked
+      - name: Install Windows GNU target
+        run: rustup target add x86_64-pc-windows-gnu
+      - name: Install MinGW linker
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - name: cargo check (Windows GNU)
+        run: cargo check --locked --target x86_64-pc-windows-gnu
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc

@@ -90,6 +90,7 @@ pub struct WidebandApp {
     pub diag_snapshot: DiagnosticsSnapshot,
     pub diag_selected_dtc: usize,
     pub diag_last_error: String,
+    pub connection_last_error: String,
     pub header_vbatt: Option<f32>,
 
     // UI Workspace
@@ -164,6 +165,7 @@ impl WidebandApp {
             diag_snapshot: DiagnosticsSnapshot::default(),
             diag_selected_dtc: 0,
             diag_last_error: String::new(),
+            connection_last_error: String::new(),
             header_vbatt: None,
             active_tab: WorkspaceTab::Calibration,
         };
@@ -319,18 +321,29 @@ impl WidebandApp {
     }
 
     pub fn connect_cable(&mut self) {
+        self.connection_last_error.clear();
+        self.header_vbatt = None;
         if self.selected_device_idx >= self.devices.len() {
+            self.connection_last_error = "No cable device selected.".to_string();
             return;
         }
         let dev_info = self.devices[self.selected_device_idx].clone();
-        let dev_name = dev_info.name.clone();
         let is_virtual = dev_info.is_virtual;
+        let dev_name = dev_info.list_label();
         let transport = transport_hint_for_device(&dev_info);
 
+        if is_virtual {
+            self.log(
+                "Virtual ECU selected: responses are synthetic bench data, not your Tacoma on a real Pass-Thru cable.",
+            );
+        }
+
         if !is_virtual && !dev_info.exists {
+            self.connection_last_error =
+                format!("PassThru DLL not found: {}", dev_info.library_path);
             self.log(&format!(
-                "PassThru DLL not found: {}. Install the Mini-VCI or VXDIAG (Toyota) J2534 driver, then rescan devices.",
-                dev_info.library_path
+                "{}. Install the Mini-VCI or VXDIAG (Toyota) J2534 driver, then rescan devices.",
+                self.connection_last_error
             ));
             return;
         }
@@ -347,9 +360,11 @@ impl WidebandApp {
         let mut dev = create_device(&dev_info);
         match dev.open() {
             Err(e) => {
+                self.connection_last_error = e.clone();
                 self.log(&format!(
                     "Failed to open {}: {} (check USB, driver, and VX Manager / MVCI license if applicable)",
-                    dev_name, e
+                    dev_name,
+                    e
                 ));
                 return;
             }
@@ -372,6 +387,7 @@ impl WidebandApp {
                 prof.response_id
             )),
             Err(e) => {
+                self.connection_last_error = e.clone();
                 self.log(&format!("Channel setup failed: {}", e));
                 let _ = dev.close();
                 return;
@@ -385,6 +401,7 @@ impl WidebandApp {
         self.active_device_virtual = is_virtual;
         self.active_device = Some(dev);
         self.is_connected = true;
+        self.connection_last_error.clear();
     }
 
     pub fn disconnect_cable(&mut self) {
@@ -394,6 +411,13 @@ impl WidebandApp {
             self.header_vbatt = None;
             self.log("Cable disconnected.");
         }
+    }
+
+    fn selected_device_is_virtual(&self) -> bool {
+        self.devices
+            .get(self.selected_device_idx)
+            .map(|d| d.is_virtual)
+            .unwrap_or(true)
     }
 
     pub fn poll_telemetry(&mut self) {
@@ -412,6 +436,10 @@ impl WidebandApp {
         let now = Instant::now();
 
         if let Some(dev) = &mut self.active_device {
+            let ch = dev.channel_id();
+            if let Some(v) = read_pass_thru_vbatt(dev.as_mut(), ch) {
+                self.header_vbatt = Some(v);
+            }
             let prof = &self.profiles[self.selected_profile_idx];
             let due: Vec<(usize, Vec<u8>, String)> = {
                 let mut buf = self.telemetry.lock().unwrap();
@@ -627,13 +655,13 @@ impl WidebandApp {
         egui::ComboBox::from_id_salt("device_select")
             .width(device_combo_w)
             .selected_text(
-                egui::RichText::new(&self.devices[self.selected_device_idx].name)
+                egui::RichText::new(self.devices[self.selected_device_idx].list_label())
                     .size(11.0)
                     .color(MUTED),
             )
             .show_ui(ui, |ui| {
                 for (idx, dev) in self.devices.iter().enumerate() {
-                    ui.selectable_value(&mut self.selected_device_idx, idx, &dev.name);
+                    ui.selectable_value(&mut self.selected_device_idx, idx, dev.list_label());
                 }
             });
     }
@@ -724,23 +752,48 @@ impl WidebandApp {
                             .strong()
                             .color(status_color),
                     );
+                    if !self.is_connected && !self.connection_last_error.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("— {}", self.connection_last_error))
+                                .size(10.0)
+                                .color(Color32::from_rgb(0xF8, 0x51, 0x49)),
+                        );
+                    }
                 });
             });
 
+        if self.selected_device_is_virtual() {
+            ui.add_space(6.0);
+            egui::Frame::none()
+                .fill(Color32::from_rgb(255, 193, 7).gamma_multiply(0.12))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(255, 193, 7)))
+                .rounding(egui::Rounding::same(4.0))
+                .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("Virtual ECU — not a real OBD cable")
+                            .size(10.0)
+                            .strong()
+                            .color(Color32::from_rgb(255, 193, 7)),
+                    );
+                });
+        }
+
         ui.add_space(6.0);
 
-        let batt_label = if !self.is_connected {
-            "—".to_string()
+        let (batt_label, has_batt) = if !self.is_connected {
+            ("—".to_string(), false)
         } else {
             let tel_v = self.telemetry.lock().unwrap().value("vbatt");
             if tel_v > 1.0 {
-                format!("{:.1}V", tel_v)
+                (format!("{:.1}V", tel_v), true)
             } else if let Some(v) = self.header_vbatt {
-                format!("{:.1}V", v)
+                (format!("{:.1}V", v), true)
             } else {
-                "—".to_string()
+                ("—".to_string(), false)
             }
         };
+        let vbatt_color = if has_batt { ACCENT_CYAN } else { MUTED };
         egui::Frame::none()
             .fill(theme::WIDGET_BG)
             .stroke(Stroke::new(1.0, STROKE))
@@ -754,7 +807,7 @@ impl WidebandApp {
                             .size(12.0)
                             .strong()
                             .monospace()
-                            .color(ACCENT_CYAN),
+                            .color(vbatt_color),
                     );
                 });
             });

@@ -400,17 +400,13 @@ impl EcuIdentifier {
 
         if allow_demo_defaults {
             if id.vin.is_empty() {
-                id.vin = "5TFRX54N56Z123456".to_string();
+                id.vin = crate::j2534::VIRTUAL_TACOMA_VIN.to_string();
             }
             if id.cal_id.is_empty() {
-                id.cal_id = if profile.platform.contains("Toyota") {
-                    "89663-04B04".to_string()
-                } else {
-                    "12619623".to_string()
-                };
+                id.cal_id = crate::j2534::VIRTUAL_TACOMA_CAL_ID.to_string();
             }
             if id.cvn.is_empty() {
-                id.cvn = "A1B2C3D4".to_string();
+                id.cvn = crate::j2534::VIRTUAL_TACOMA_CVN_HEX.to_string();
             }
         } else if !field_errors.is_empty() {
             return Err(field_errors.join("; "));

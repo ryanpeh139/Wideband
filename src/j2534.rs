@@ -21,7 +21,7 @@ pub const GET_CONFIG: u32 = 1;
 pub const SET_CONFIG: u32 = 2;
 pub const READ_VBATT: u32 = 3;
 pub const FIVE_BAUD_INIT: u32 = 4;
-pub const FAST_INIT: u32 = 3; // ISO 14230 fast init ioctl
+pub const FAST_INIT: u32 = 5; // ISO 14230 fast init ioctl (SAE J2534-1; not READ_VBATT)
 pub const CLEAR_TX_BUFFER: u32 = 7;
 pub const CLEAR_RX_BUFFER: u32 = 8;
 
@@ -105,6 +105,11 @@ impl PassThruMsg {
     }
 }
 
+/// Bench Tacoma identifiers — obviously synthetic (VIN contains `VIRTUAL`).
+pub const VIRTUAL_TACOMA_VIN: &str = "5TFRX54N0VIRT0001";
+pub const VIRTUAL_TACOMA_CAL_ID: &str = "89663-VIRT01";
+pub const VIRTUAL_TACOMA_CVN_HEX: &str = "DEADBEEF";
+
 #[derive(Clone, Debug)]
 pub struct J2534DeviceInfo {
     pub name: String,
@@ -112,6 +117,35 @@ pub struct J2534DeviceInfo {
     pub library_path: String,
     pub is_virtual: bool,
     pub exists: bool,
+}
+
+impl J2534DeviceInfo {
+    /// Dropdown label: kind prefix + device name (+ missing DLL hint).
+    pub fn list_label(&self) -> String {
+        if self.is_virtual {
+            return "[Virtual] Offline loopback ECU (practice ladder)".to_string();
+        }
+        let kind = classify_pass_thru_kind(&self.name, &self.vendor, &self.library_path);
+        let missing = if !self.exists { " — DLL not found" } else { "" };
+        format!("[{}] {}{}", kind, self.name, missing)
+    }
+}
+
+fn classify_pass_thru_kind(name: &str, vendor: &str, library_path: &str) -> &'static str {
+    let hay = format!("{} {} {}", name, vendor, library_path).to_lowercase();
+    if hay.contains("mini") && (hay.contains("vci") || hay.contains("vxdiag") || hay.contains("xhorse")) {
+        "Mini-VCI J2534"
+    } else if hay.contains("vxdiag") || hay.contains("vcx") || hay.contains("nano") {
+        "VXDIAG / VCX Nano J2534"
+    } else if hay.contains("tactrix") || hay.contains("openport") {
+        "Tactrix J2534"
+    } else if hay.contains("scanmatik") || hay.contains("mongoose") {
+        "Scanmatik / Mongoose J2534"
+    } else if hay.contains("esp32") || hay.contains("vf tuner") {
+        "VF Tuner J2534"
+    } else {
+        "J2534 Pass-Thru"
+    }
 }
 
 pub struct J2534RegistryScanner;
@@ -337,6 +371,22 @@ pub trait PassThruDevice: Send + Sync {
     }
     /// Host bridge uses FILTER during CONNECT; native uses this before filters.
     fn set_connect_hints(&mut self, _extended: bool, _filter_id: u32, _filter_mask: u32) {}
+
+    /// Battery voltage from PassThru READ_VBATT ioctl (mV). None if unavailable.
+    fn read_vbatt_volts(&mut self) -> Option<f32> {
+        let ch = self.channel_id();
+        match self.ioctl(ch, READ_VBATT, &[]) {
+            Ok(out) if out.len() >= 4 => {
+                let mv = u32::from_le_bytes([out[0], out[1], out[2], out[3]]);
+                if mv >= 9_000 && mv <= 20_000 {
+                    Some(mv as f32 / 1000.0)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
 }
 
 /// In-memory loopback ECU simulator for bench testing without vehicle hardware
@@ -502,20 +552,17 @@ impl VirtualEcuSimulator {
                 if req.len() >= 2 {
                     match req[1] {
                         0x02 => {
-                            // VIN: "5TFRX54N56Z123456"
                             let mut resp = vec![0x49, 0x02, 0x01];
-                            resp.extend_from_slice(b"5TFRX54N56Z123456");
+                            resp.extend_from_slice(VIRTUAL_TACOMA_VIN.as_bytes());
                             resp
                         }
                         0x04 => {
-                            // Cal ID: "30589000\0"
                             let mut resp = vec![0x49, 0x04, 0x01];
-                            resp.extend_from_slice(b"30589000");
+                            resp.extend_from_slice(VIRTUAL_TACOMA_CAL_ID.as_bytes());
                             resp
                         }
                         0x06 => {
-                            // CVN: 0xA1B2C3D4
-                            vec![0x49, 0x06, 0x01, 0xA1, 0xB2, 0xC3, 0xD4]
+                            vec![0x49, 0x06, 0x01, 0xDE, 0xAD, 0xBE, 0xEF]
                         }
                         _ => vec![0x7F, 0x09, 0x12],
                     }
@@ -538,15 +585,13 @@ impl VirtualEcuSimulator {
                     let did = ((req[1] as u16) << 8) | (req[2] as u16);
                     match did {
                         0xF190 => {
-                            // VIN: 5TFRX54N56Z123456
                             let mut resp = vec![0x62, 0xF1, 0x90];
-                            resp.extend_from_slice(b"5TFRX54N56Z123456");
+                            resp.extend_from_slice(VIRTUAL_TACOMA_VIN.as_bytes());
                             resp
                         }
                         0xF181 => {
-                            // Toyota Cal ID: 89663-04B04 / 30589000
                             let mut resp = vec![0x62, 0xF1, 0x81];
-                            resp.extend_from_slice(b"89663-04B04");
+                            resp.extend_from_slice(VIRTUAL_TACOMA_CAL_ID.as_bytes());
                             resp
                         }
                         0x00C1 => {
@@ -797,6 +842,12 @@ impl PassThruDevice for VirtualEcuSimulator {
 
     fn ioctl(&mut self, _channel: u32, ioctl_id: u32, _input: &[u8]) -> Result<Vec<u8>, String> {
         match ioctl_id {
+            READ_VBATT => {
+                let elapsed = self.start_time.elapsed().as_secs_f32();
+                let vbatt = 13.2 + (elapsed * 0.2).sin().abs() * 0.8;
+                let mv = (vbatt * 1000.0) as u32;
+                Ok(mv.to_le_bytes().to_vec())
+            }
             FAST_INIT => Ok(vec![0xC1, 0xEA, 0x8F]), // KWP Key Bytes
             CLEAR_TX_BUFFER | CLEAR_RX_BUFFER => {
                 self.rx_queue.clear();
