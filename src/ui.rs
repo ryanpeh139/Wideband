@@ -145,7 +145,7 @@ impl WidebandApp {
             rom_path: None,
             xdf_path: None,
             telemetry: Arc::new(Mutex::new(
-                TelemetryBuffer::from_definition(&TelemetryChannelFile::load_default(), 5000),
+                TelemetryBuffer::from_definition(&TelemetryChannelFile::load_default(), None),
             )),
             trace_rpm: 2400.0,
             trace_map: 70.0,
@@ -441,10 +441,12 @@ impl WidebandApp {
                 self.header_vbatt = Some(v);
             }
             let prof = &self.profiles[self.selected_profile_idx];
-            let due: Vec<(usize, Vec<u8>, String)> = {
+            let poll_list: Vec<(usize, Vec<u8>, String)> = {
                 let mut buf = self.telemetry.lock().unwrap();
-                buf.scheduler
-                    .due_indices(&buf.channels, now)
+                let plan = buf.scheduler.plan(&buf.channels, now);
+                buf.scheduler.apply_budget_skips(&plan.budget_skipped, now);
+                let poll_list = plan
+                    .poll_indices
                     .into_iter()
                     .map(|idx| {
                         let ch = &buf.channels[idx];
@@ -454,24 +456,30 @@ impl WidebandApp {
                             ch.decode.clone(),
                         )
                     })
-                    .collect()
+                    .collect();
+                poll_list
             };
 
             let channel = dev.channel_id();
-            for (idx, req, decode_id) in due {
+            for (idx, req, decode_id) in poll_list {
+                let mut ok = false;
                 if let Ok(()) =
                     crate::protocols::IsoTpLink::send(dev.as_mut(), channel, prof.request_id, &req)
                 {
                     if let Ok(resp) = crate::protocols::IsoTpLink::receive(dev.as_mut(), channel, 10) {
                         if let Some(value) = decode_channel_value(&decode_id, &resp) {
                             let mut buf = self.telemetry.lock().unwrap();
-                            buf.set_channel_value(idx, value);
+                            buf.set_channel_value(idx, value, now);
                             buf.scheduler.mark_polled(idx, now);
+                            ok = true;
                         }
                     }
                 }
+                if !ok {
+                    let mut buf = self.telemetry.lock().unwrap();
+                    buf.bus_fail_count += 1;
+                }
             }
-
             {
                 let mut buf = self.telemetry.lock().unwrap();
                 self.trace_rpm = buf.value("rpm");
@@ -1300,7 +1308,7 @@ impl WidebandApp {
 
 impl WidebandApp {
     fn render_telemetry_tab(&mut self, ctx: &egui::Context) {
-        let (gauge_channels, recording, def_title) = {
+        let (gauge_channels, recording, def_title, stats_line, rate_rows) = {
             let buf = self.telemetry.lock().unwrap();
             let gauges: Vec<(String, String, String, [u8; 3])> = buf
                 .channels
@@ -1316,16 +1324,43 @@ impl WidebandApp {
                     )
                 })
                 .collect();
-            (gauges, buf.is_recording, buf.definition_title.clone())
+            let tick_ms = buf.scheduler.settings().tick_ms;
+            let budget = buf.scheduler.settings().max_requests_per_tick;
+            let stats_line = format!(
+                "Scheduler {} ms tick · {} req/tick · ring {} · drops ring {} rec {} skip {} bus {}",
+                tick_ms,
+                budget,
+                buf.max_capacity,
+                buf.ring_drop_count,
+                buf.record_drop_count,
+                buf.total_scheduler_skips(),
+                buf.bus_fail_count
+            );
+            let rate_rows: Vec<(String, f32, u64)> = buf
+                .channels
+                .iter()
+                .enumerate()
+                .map(|(i, ch)| {
+                    (
+                        ch.label.clone(),
+                        buf.channel_rates[i].hz,
+                        buf.scheduler.per_channel_budget_skips[i],
+                    )
+                })
+                .collect();
+            (gauges, buf.is_recording, buf.definition_title.clone(), stats_line, rate_rows)
         };
 
         egui::TopBottomPanel::top("gauge_strip").min_height(72.0).show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Export CSV").clicked() {
-                        let exported = self.telemetry.lock().unwrap().export_csv("datalog.csv").is_ok();
-                        if exported {
-                            self.log("Datalog exported successfully to datalog.csv");
+                        let path = "datalog.csv".to_string();
+                        let tele = Arc::clone(&self.telemetry);
+                        let has_data = tele.lock().map(|b| !b.frames.is_empty()).unwrap_or(false);
+                        if has_data {
+                            TelemetryBuffer::export_csv_async(path, tele);
+                            self.log("Datalog export started (background thread, datalog.csv).");
                         } else {
                             self.log("Export failed — start live polling or record first.");
                         }
@@ -1373,6 +1408,30 @@ impl WidebandApp {
                         .small()
                         .color(Color32::GRAY),
                 );
+            });
+            ui.label(egui::RichText::new(stats_line).size(11.0).monospace().color(MUTED));
+            ui.horizontal_wrapped(|ui| {
+                for (label, hz, skips) in &rate_rows {
+                    let color = if *skips > 0 {
+                        Color32::from_rgb(0xF8, 0x51, 0x49)
+                    } else {
+                        ACCENT_CYAN
+                    };
+                    ui.label(
+                        egui::RichText::new(format!("{} {:.1} Hz", label, hz))
+                            .size(10.0)
+                            .monospace()
+                            .color(color),
+                    );
+                    if *skips > 0 {
+                        ui.label(
+                            egui::RichText::new(format!("(-{})", skips))
+                                .size(10.0)
+                                .color(Color32::from_rgb(0xF8, 0x51, 0x49)),
+                        );
+                    }
+                    ui.add_space(8.0);
+                }
             });
             ui.add_space(4.0);
 
