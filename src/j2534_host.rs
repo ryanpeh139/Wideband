@@ -8,14 +8,21 @@ mod imp {
     use std::io::{BufRead, BufReader, Write};
     use std::path::{Path, PathBuf};
     use std::process::{Child, ChildStdin, Command, Stdio};
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
     use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// Floor for any host reply. READ itself is non-blocking in the host, so hitting this means
+    /// the host or vendor DLL is wedged — not that the bus is quiet.
+    const MIN_HOST_REPLY_MS: u32 = 5000;
 
     pub struct HostPassThruDevice {
         lib_path: String,
         host_path: PathBuf,
         child: Option<Child>,
         stdin: Option<ChildStdin>,
-        reader: Mutex<Option<BufReader<std::process::ChildStdout>>>,
+        /// Lines from the host's stdout, fed by a reader thread so replies can time out.
+        lines: Mutex<Option<Receiver<String>>>,
         device_id: u32,
         channel_id: u32,
         connected: bool,
@@ -34,7 +41,7 @@ mod imp {
                 host_path: Self::locate_host_exe(),
                 child: None,
                 stdin: None,
-                reader: Mutex::new(None),
+                lines: Mutex::new(None),
                 device_id: 0,
                 channel_id: 0,
                 connected: false,
@@ -75,20 +82,54 @@ mod imp {
             writeln!(stdin, "{}", line).map_err(|e| format!("host write failed: {}", e))?;
             stdin.flush().map_err(|e| e.to_string())?;
 
-            let mut guard = self.reader.lock().map_err(|_| "host reader lock")?;
-            let reader = guard.as_mut().ok_or("J2534Host stdout not open")?;
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
-            while std::time::Instant::now() < deadline {
-                let mut line_buf = String::new();
-                reader.read_line(&mut line_buf).map_err(|e| format!("host read failed: {}", e))?;
-                if let Some(start) = line_buf.find('{') {
-                    if let Some(end) = line_buf.rfind('}') {
-                        let json = &line_buf[start..=end];
-                        return Ok(serde_json::from_str(json).map_err(|e| e.to_string())?);
+            let wait = Duration::from_millis(timeout_ms.max(MIN_HOST_REPLY_MS) as u64);
+            let deadline = Instant::now() + wait;
+            let outcome = {
+                let guard = self.lines.lock().map_err(|_| "host reader lock")?;
+                let rx = guard.as_ref().ok_or("J2534Host stdout not open")?;
+                loop {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    match rx.recv_timeout(left) {
+                        Ok(line_buf) => {
+                            if let (Some(start), Some(end)) = (line_buf.find('{'), line_buf.rfind('}')) {
+                                if start <= end {
+                                    break Ok(line_buf[start..=end].to_string());
+                                }
+                            }
+                        }
+                        Err(RecvTimeoutError::Timeout) => {
+                            break Err(format!(
+                                "J2534Host did not answer within {} ms (host or PassThru DLL hung); session closed",
+                                wait.as_millis()
+                            ))
+                        }
+                        Err(RecvTimeoutError::Disconnected) => {
+                            break Err("J2534Host exited unexpectedly; session closed".to_string())
+                        }
                     }
                 }
+            };
+            match outcome {
+                Ok(json) => serde_json::from_str(&json).map_err(|e| e.to_string()),
+                Err(e) => {
+                    // A late reply would be read as the answer to the next command; drop the host.
+                    self.kill_host();
+                    Err(e)
+                }
             }
-            Err("J2534Host response timed out".to_string())
+        }
+
+        fn kill_host(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            self.stdin = None;
+            if let Ok(mut g) = self.lines.lock() {
+                *g = None;
+            }
+            self.connected = false;
+            self.channel_id = 0;
         }
 
         fn require_ok(v: &Value) -> Result<(), String> {
@@ -137,7 +178,25 @@ mod imp {
             let stdout = child.stdout.take().ok_or("host stdout missing")?;
             self.child = Some(child);
             self.stdin = Some(stdin);
-            *self.reader.lock().unwrap() = Some(BufReader::new(stdout));
+            let (tx, rx) = mpsc::channel::<String>();
+            std::thread::Builder::new()
+                .name("j2534host-stdout".into())
+                .spawn(move || {
+                    let mut reader = BufReader::new(stdout);
+                    loop {
+                        let mut line = String::new();
+                        match reader.read_line(&mut line) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                if tx.send(line).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                })
+                .map_err(|e| format!("failed to start host reader: {}", e))?;
+            *self.lines.lock().unwrap() = Some(rx);
 
             let quoted = if self.lib_path.contains(' ') {
                 format!("\"{}\"", self.lib_path)
@@ -166,15 +225,13 @@ mod imp {
         fn close(&mut self) -> Result<(), String> {
             if self.stdin.is_some() {
                 let _ = self.command("CLOSE", 3000);
-                let _ = self.command("QUIT", 1000);
+                // QUIT gets no reply (host just exits), so send it without waiting.
+                if let Some(stdin) = self.stdin.as_mut() {
+                    let _ = writeln!(stdin, "QUIT");
+                    let _ = stdin.flush();
+                }
             }
-            if let Some(mut child) = self.child.take() {
-                let _ = child.kill();
-            }
-            self.stdin = None;
-            *self.reader.lock().unwrap() = None;
-            self.connected = false;
-            self.channel_id = 0;
+            self.kill_host();
             Ok(())
         }
 

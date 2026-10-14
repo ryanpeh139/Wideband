@@ -1,6 +1,10 @@
 use crate::j2534::{PassThruDevice, PassThruMsg};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// ISO 15765-2 N_Bs / N_Cr: max gap between flow control / consecutive frames (1000 ms).
+/// Applied per frame, not to the whole message, so long `0x23` replies survive IPC latency.
+const N_FRAME_TIMEOUT_MS: u32 = 1000;
 
 #[derive(Clone, Debug)]
 pub struct IsoTpConfig {
@@ -94,9 +98,13 @@ impl IsoTpLink {
         Ok(())
     }
 
+    fn frame_gap(&self) -> Duration {
+        Duration::from_millis(self.config.timeout_ms.max(N_FRAME_TIMEOUT_MS) as u64)
+    }
+
     fn wait_flow_control(&self, device: &mut dyn PassThruDevice) -> Result<(u8, u8, u8), String> {
-        let deadline = Duration::from_millis(self.config.timeout_ms as u64);
-        let start = std::time::Instant::now();
+        let deadline = self.frame_gap();
+        let start = Instant::now();
         let mut waits = 0u32;
         while start.elapsed() < deadline {
             let msgs = device.read_msgs(self.channel, 50)?;
@@ -161,7 +169,7 @@ impl IsoTpLink {
                         assembled.extend_from_slice(&p[2..2 + take]);
                     }
                     let pending: Vec<PassThruMsg> = iter.collect();
-                    return self.receive_consecutive(device, assembled, len, start, deadline, pending);
+                    return self.receive_consecutive(device, assembled, len, pending);
                 }
             }
         }
@@ -173,10 +181,9 @@ impl IsoTpLink {
         device: &mut dyn PassThruDevice,
         mut assembled: Vec<u8>,
         total_len: usize,
-        start: std::time::Instant,
-        deadline: Duration,
         mut pending: Vec<PassThruMsg>,
     ) -> Result<Vec<u8>, String> {
+        let gap = self.frame_gap();
         let fc = vec![0x30, self.config.block_size, self.config.stmin_ms];
         let mut fc_buf = fc.clone();
         while fc_buf.len() < 8 {
@@ -185,7 +192,8 @@ impl IsoTpLink {
         device.write_msgs(self.channel, &[PassThruMsg::new_can(self.config.tx_id, &fc_buf)], self.config.timeout_ms)?;
 
         let mut expected_seq = 1u8;
-        while assembled.len() < total_len && start.elapsed() < deadline {
+        let mut last_frame = Instant::now();
+        while assembled.len() < total_len && last_frame.elapsed() < gap {
             if pending.is_empty() {
                 pending = device.read_msgs(self.channel, 50)?;
             }
@@ -213,6 +221,7 @@ impl IsoTpLink {
                     assembled.truncate(total_len);
                 }
                 expected_seq = (expected_seq + 1) & 0x0F;
+                last_frame = Instant::now();
             }
             if assembled.len() >= total_len {
                 assembled.truncate(total_len);
@@ -298,6 +307,9 @@ pub(crate) mod mock {
             Ok(out)
         }
         fn write_msgs(&mut self, _channel: u32, msgs: &[PassThruMsg], _timeout_ms: u32) -> Result<u32, String> {
+            if !self.connected {
+                return Err("disconnected".to_string());
+            }
             for msg in msgs {
                 self.tx_captured.push(msg.payload().to_vec());
             }
@@ -351,6 +363,79 @@ mod tests {
             dev.tx_captured.iter().any(|f| f[0] == 0x30),
             "flow control frame must be transmitted"
         );
+    }
+
+    /// Mimics J2534Host IPC: one frame per READ round trip, each round trip slow.
+    struct SlowCan(ScriptCan);
+
+    impl PassThruDevice for SlowCan {
+        fn open(&mut self) -> Result<(), String> {
+            self.0.open()
+        }
+        fn close(&mut self) -> Result<(), String> {
+            self.0.close()
+        }
+        fn connect(&mut self, p: u32, f: u32, b: u32) -> Result<u32, String> {
+            self.0.connect(p, f, b)
+        }
+        fn disconnect(&mut self, ch: u32) -> Result<(), String> {
+            self.0.disconnect(ch)
+        }
+        fn read_msgs(&mut self, ch: u32, t: u32) -> Result<Vec<PassThruMsg>, String> {
+            std::thread::sleep(Duration::from_millis(20));
+            self.0.read_msgs(ch, t)
+        }
+        fn write_msgs(&mut self, ch: u32, m: &[PassThruMsg], t: u32) -> Result<u32, String> {
+            self.0.write_msgs(ch, m, t)
+        }
+        fn start_filter(
+            &mut self,
+            ch: u32,
+            ft: u32,
+            mask: &PassThruMsg,
+            pat: &PassThruMsg,
+            fc: Option<&PassThruMsg>,
+        ) -> Result<u32, String> {
+            self.0.start_filter(ch, ft, mask, pat, fc)
+        }
+        fn ioctl(&mut self, ch: u32, id: u32, input: &[u8]) -> Result<Vec<u8>, String> {
+            self.0.ioctl(ch, id, input)
+        }
+        fn is_connected(&self) -> bool {
+            self.0.is_connected()
+        }
+        fn firmware_version(&self) -> String {
+            self.0.firmware_version()
+        }
+    }
+
+    #[test]
+    fn isotp_long_reply_survives_short_p2_over_slow_ipc() {
+        // 6 + 7*7 = 55 bytes over 8 frames at 20 ms each (~160 ms) with a 50 ms P2.
+        let mut inner = ScriptCan::new(0x7E0, 0x7E8);
+        let total = 55u8;
+        let mut ff = vec![0x10, total];
+        ff.extend((0..6).map(|i| i as u8));
+        inner.enqueue_rx(&ff);
+        let mut next = 6u8;
+        for seq in 1..=7u8 {
+            let mut cf = vec![0x20 | seq];
+            for _ in 0..7 {
+                cf.push(next);
+                next += 1;
+            }
+            inner.enqueue_rx(&cf);
+        }
+        let mut dev = SlowCan(inner);
+        let link = IsoTpLink::new(
+            1,
+            IsoTpConfig {
+                timeout_ms: 50,
+                ..IsoTpConfig::default()
+            },
+        );
+        let payload = link.receive(&mut dev).expect("per-frame timeout, not whole-message");
+        assert_eq!(payload, (0..total).collect::<Vec<u8>>());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! Parity with C# `VehicleLink` (2 s interval, skipped while flash/read owns the channel).
 
 use crate::j2534::PassThruDevice;
-use crate::protocols::EcuProfile;
+use crate::protocols::{DiagnosticProtocol, EcuProfile};
 use crate::uds::UdsClient;
 use std::time::{Duration, Instant};
 
@@ -66,7 +66,9 @@ impl IdleTesterPresent {
             && self.last_sent.elapsed() >= self.interval
     }
 
-    /// Non-blocking keepalive tick. Call from the UI frame loop (same thread as other I/O).
+    /// Keepalive tick from the UI frame loop. UDS sends `3E 80` (no response requested) so the
+    /// frame never waits on the ECU; only a cable write failure counts as `Failed`.
+    /// KWP has no suppress bit, so it still waits (short timers) for the `7E` reply.
     pub fn tick(
         &mut self,
         device: &mut dyn PassThruDevice,
@@ -81,8 +83,14 @@ impl IdleTesterPresent {
         self.last_sent = Instant::now();
         let channel = device.channel_id();
         let mut client = UdsClient::for_profile(device, channel, profile);
-        client.set_timers(2000, 5000);
-        match client.tester_present(device, profile.diagnostic) {
+        let result = match profile.diagnostic {
+            DiagnosticProtocol::Uds => client.tester_present_no_response(device),
+            DiagnosticProtocol::Kwp => {
+                client.set_timers(300, 300);
+                client.tester_present(device, profile.diagnostic)
+            }
+        };
+        match result {
             Ok(()) => IdleTesterOutcome::Sent,
             Err(_) => {
                 self.armed = false;
@@ -127,11 +135,13 @@ mod tests {
         keeper.arm_for_real_hardware();
         keeper.force_due();
         let mut dev = ScriptCan::new(0x7E0, 0x7E8);
-        dev.enqueue_rx(&[0x02, 0x7E, 0x00, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA]);
         let prof = EcuProfile::tacoma_can();
+        let started = Instant::now();
         let outcome = keeper.tick(&mut dev, &prof, true, false, false);
         assert_eq!(outcome, IdleTesterOutcome::Sent);
         assert!(keeper.is_armed());
+        assert!(started.elapsed() < Duration::from_millis(100), "UDS keepalive must not wait on the ECU");
+        assert_eq!(dev.tx_captured[0][..3], [0x02, 0x3E, 0x80]);
     }
 
     #[test]
@@ -140,7 +150,7 @@ mod tests {
         keeper.arm_for_real_hardware();
         keeper.force_due();
         let mut dev = ScriptCan::new(0x7E0, 0x7E8);
-        // No scripted RX → timeout / failure
+        dev.connected = false; // cable gone → write fails
         let prof = EcuProfile::tacoma_can();
         let outcome = keeper.tick(&mut dev, &prof, true, false, false);
         assert_eq!(outcome, IdleTesterOutcome::Failed);

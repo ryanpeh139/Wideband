@@ -18,6 +18,18 @@ pub fn exe_parent() -> Option<PathBuf> {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
 }
 
+/// Runtime config file next to `wideband.exe`, falling back to the working directory.
+/// Launching from a shortcut or another folder must still find the shipped JSON.
+pub fn beside_exe_or_cwd(file_name: &str) -> PathBuf {
+    if let Some(dir) = exe_parent() {
+        let beside = dir.join(file_name);
+        if beside.exists() {
+            return beside;
+        }
+    }
+    PathBuf::from(file_name)
+}
+
 fn extra_dirs_from_env(var: &str) -> Vec<PathBuf> {
     env::var(var)
         .ok()

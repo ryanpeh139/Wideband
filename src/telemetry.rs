@@ -121,7 +121,7 @@ impl TelemetryChannelFile {
     }
 
     pub fn default_path() -> PathBuf {
-        PathBuf::from("telemetry-channels.json")
+        crate::pack_paths::beside_exe_or_cwd("telemetry-channels.json")
     }
 
     pub fn load_default() -> Self {

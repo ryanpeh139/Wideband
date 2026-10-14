@@ -177,7 +177,7 @@ impl WidebandApp {
         let flash_layout = FlashLayoutMap::load(FlashLayoutMap::default_path())
             .unwrap_or_else(|e| {
                 eprintln!("flash-layout.json: {}", e);
-                FlashLayoutMap::load("tests/flash-layout-test.json").expect("flash layout fallback")
+                FlashLayoutMap::unavailable(e)
             });
         let flash_audit = FlashAuditLog::new(FlashAuditLog::default_path());
 
@@ -259,6 +259,12 @@ impl WidebandApp {
         let sec_note = PlatformSecurity::load_note();
         if !sec_note.is_empty() {
             app.log(&format!("Security config: {}", sec_note));
+        }
+        if let Some(err) = app.flash_layout.load_error().map(str::to_string) {
+            app.log(&format!(
+                "Flash layout unavailable ({}). Read Stock ROM and flash are disabled until flash-layout.json sits beside wideband.exe.",
+                err
+            ));
         }
 
         app.select_profile_id("tacoma-can");

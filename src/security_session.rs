@@ -40,7 +40,7 @@ impl ProgrammingSession {
         client.tester_present(device, profile.diagnostic)?;
         let (p2, p2_star) =
             client.diagnostic_session_control(device, profile.programming_session)?;
-        client.set_timers(p2, p2_star);
+        client.apply_server_timing(p2, p2_star);
         security_access(client, device, profile, level)
     }
 
@@ -52,7 +52,7 @@ impl ProgrammingSession {
     ) -> Result<(), String> {
         client.tester_present(device, profile.diagnostic)?;
         let (p2, p2_star) = client.diagnostic_session_control(device, profile.read_session)?;
-        client.set_timers(p2, p2_star);
+        client.apply_server_timing(p2, p2_star);
         Ok(())
     }
 }
