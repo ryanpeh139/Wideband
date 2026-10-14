@@ -1358,3 +1358,38 @@ pub fn transport_hint_for_device(info: &J2534DeviceInfo) -> &'static str {
     }
     "in-process PassThru (requires matching DLL bitness)"
 }
+
+pub fn j2534_host_exe_present() -> bool {
+    #[cfg(windows)]
+    {
+        return crate::j2534_host::HostPassThruDevice::host_available();
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// True on 64-bit Windows builds where vendor PassThru DLLs must load via `J2534Host.exe`.
+pub fn requires_j2534_host_bridge() -> bool {
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    {
+        true
+    }
+    #[cfg(not(all(windows, target_pointer_width = "64")))]
+    {
+        false
+    }
+}
+
+/// User-facing error when a real cable is selected but the x86 host helper is missing.
+pub fn missing_j2534_host_message() -> String {
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("J2534Host.exe")))
+        .unwrap_or_else(|| std::path::PathBuf::from("J2534Host.exe"));
+    format!(
+        "J2534Host.exe not found (expected {}). Mini-VCI and VXDIAG DLLs are 32-bit — build J2534Host.cs with /platform:x86 and copy J2534Host.exe beside wideband.exe.",
+        beside.display()
+    )
+}

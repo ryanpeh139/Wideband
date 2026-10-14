@@ -9,7 +9,7 @@ using System.Text;
 // Protocol 5 is CAN. Protocol 4 is ISO 14230. Protocol 1 is J1850 VPW.
 // CAN data starts with the id, big-endian, as SAE J2534-1 requires.
 // K-Line and VPW data is the frame. ISO 14230 can send FAST_INIT.
-// Commands: OPEN, CONNECT, INIT, FILTER, READ, WRITE, VERSION, CLOSE, QUIT.
+// Commands: OPEN, CONNECT, INIT, FILTER, READ, WRITE, IOCTL, VERSION, CLOSE, QUIT.
 // Programming voltage and periodic messages are not available.
 sealed class J2534Host
 {
@@ -20,6 +20,7 @@ sealed class J2534Host
     const uint Can29Bit = 0x100;
     const uint PassFilter = 1;
     // SAE J2534-1: FAST_INIT is 0x05. 0x03 is READ_VBATT.
+    const uint ReadVbatt = 0x03;
     const uint FastInit = 0x05;
     static readonly byte[] Zeros = new byte[MessageBytes];
 
@@ -144,6 +145,7 @@ sealed class J2534Host
             if (verb == "FILTER") return Filter(rest);
             if (verb == "READ") return Read();
             if (verb == "WRITE") return Write(rest);
+            if (verb == "IOCTL") return Ioctl(rest);
             if (verb == "VERSION") return Version();
             if (verb == "CLOSE")
             {
@@ -244,6 +246,37 @@ sealed class J2534Host
         channelId = id;
         channelOpen = true;
         return OkHandles();
+    }
+
+    string Ioctl(string rest)
+    {
+        if (!channelOpen) return Fail("The channel is not open.", -1);
+        if (ioctlFn == null) return Fail("The cable library is missing PassThruIoctl.", -1);
+        string[] parts = Parts(rest);
+        if (parts.Length < 1) return Fail("IOCTL needs an ioctl id.", -1);
+        uint ioctlId = ParseHex(parts[0]);
+        if (ioctlId == ReadVbatt)
+        {
+            IntPtr output = Marshal.AllocHGlobal(4);
+            try
+            {
+                int status = ioctlFn(channelId, ReadVbatt, IntPtr.Zero, output);
+                if (status != 0) return Fail(Describe(status), status);
+                uint mv = unchecked((uint)Marshal.ReadInt32(output));
+                var bytes = BitConverter.GetBytes(mv);
+                return "{\"ok\":true,\"data\":\"" + ToHex(bytes) + "\"}";
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(output);
+            }
+        }
+        if (ioctlId == FastInit)
+        {
+            string hex = parts.Length >= 2 ? parts[1].Replace(" ", "") : "";
+            return Init(hex);
+        }
+        return Fail("Unsupported IOCTL id for host bridge.", -1);
     }
 
     string Init(string rest)

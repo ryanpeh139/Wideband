@@ -12,8 +12,6 @@ use crate::flash_job::FlashJob;
 use crate::flash_layout::FlashLayoutMap;
 use crate::j2534::{connect_for_profile, PassThruDevice, READ_VBATT};
 use crate::transport::{TransportAvailability, TransportDevice, TransportRegistry};
-#[cfg(windows)]
-use crate::j2534_host::HostPassThruDevice;
 use crate::protocols::{EcuIdentification, EcuIdentifier, EcuProfile};
 use crate::tcm::{
     build_parameter_view, flash_blockers as tcm_flash_blockers, group_label, TcmIdentifier,
@@ -505,13 +503,15 @@ impl WidebandApp {
             return;
         }
 
-        #[cfg(windows)]
-        if dev_row.kind == crate::transport::TransportKind::UsbJ2534
-            && !HostPassThruDevice::host_available()
+        if !is_virtual
+            && dev_row.kind == crate::transport::TransportKind::UsbJ2534
+            && crate::j2534::requires_j2534_host_bridge()
+            && !crate::j2534::j2534_host_exe_present()
         {
-            self.log(
-                "J2534Host.exe is missing beside wideband.exe. Build it from J2534Host.cs (x86) — required for most 32-bit cable DLLs.",
-            );
+            let msg = crate::j2534::missing_j2534_host_message();
+            self.connection_last_error = msg.clone();
+            self.log(&msg);
+            return;
         }
 
         self.log(&format!("Opening {} via {}", dev_name, transport));
