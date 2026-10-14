@@ -21,7 +21,7 @@ impl FlashJob {
         audit: &FlashAuditLog,
         mut progress: impl FnMut(usize, usize),
     ) -> Result<StockReadResult, String> {
-        let spec = &layout.profile(&profile.id)?.stock_read;
+        let spec = &layout.profile(&profile.flash_layout_profile_id)?.stock_read;
         let mut client = UdsClient::for_profile(device, channel, profile);
         client.tester_present(device, profile.diagnostic)?;
         let (p2, p2_star) = client.diagnostic_session_control(device, profile.read_session)?;
@@ -46,7 +46,7 @@ impl FlashJob {
         );
         Ok(StockReadResult {
             bytes,
-            origin: layout.profile(&profile.id)?.rom_origin,
+            origin: layout.profile(&profile.flash_layout_profile_id)?.rom_origin,
         })
     }
 
@@ -62,13 +62,17 @@ impl FlashJob {
         mut progress: impl FnMut(f32, &str),
         require_production_security: bool,
     ) -> Result<(), String> {
-        if require_production_security && !crate::security_config::PlatformSecurity::security_key_configured_for_profile(&profile.id) {
+        if require_production_security
+            && !crate::security_config::PlatformSecurity::security_key_configured_for_profile(
+                &profile.security_profile_id,
+            )
+        {
             return Err(format!(
                 "Flash refused: no production security-config seed-key for {}. Configure security-config.json before writing to a real ECU.",
                 profile.name
             ));
         }
-        let segments = layout.cal_segments(&profile.id)?;
+        let segments = layout.cal_segments(&profile.flash_layout_profile_id)?;
         let mut client = UdsClient::for_profile(device, channel, profile);
         ProgrammingSession::unlock(&mut client, device, profile)?;
 

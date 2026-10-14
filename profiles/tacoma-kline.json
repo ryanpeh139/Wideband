@@ -1,0 +1,37 @@
+{
+  "pack_version": 1,
+  "id": "tacoma-kline",
+  "name": "Toyota Tacoma 2005-2008 (KWP2000 K-Line)",
+  "platform": "Toyota Tacoma",
+  "bus": "kline",
+  "diagnostic": "kwp",
+  "bitrate": 10400,
+  "j2534": {
+    "protocol": "iso14230",
+    "connect_flags": 512,
+    "extended_id": false
+  },
+  "can": {
+    "request_id": "0x12",
+    "response_id": "0xF1",
+    "filter_mask": "0xFF"
+  },
+  "kline": {
+    "tester": "0xF1",
+    "ecu": "0x10"
+  },
+  "memory": {
+    "max_chunk": 128,
+    "address_bytes": 3,
+    "size_bytes": 3
+  },
+  "sessions": {
+    "programming": "0x85",
+    "read": "0x81"
+  },
+  "refs": {
+    "security": "tacoma-kline",
+    "flash_layout": "tacoma-kline",
+    "checksum": "tacoma-kline"
+  }
+}

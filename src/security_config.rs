@@ -161,7 +161,7 @@ impl PlatformSecurity {
             return Ok(vec![0u8; seed.len()]);
         }
         let guard = state().lock().unwrap();
-        let id = canonical_profile(&profile.id);
+        let id = canonical_profile(&profile.security_profile_id);
         let kind = guard
             .profile_keys
             .get(&id)

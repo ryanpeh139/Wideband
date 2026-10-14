@@ -1,0 +1,37 @@
+{
+  "pack_version": 1,
+  "id": "silverado-vpw",
+  "name": "Chevrolet Silverado 1999-2007 (J1850 VPW)",
+  "platform": "Chevrolet Silverado",
+  "bus": "vpw",
+  "diagnostic": "uds",
+  "bitrate": 10400,
+  "j2534": {
+    "protocol": "j1850vpw",
+    "connect_flags": 0,
+    "extended_id": false
+  },
+  "can": {
+    "request_id": "0x6C",
+    "response_id": "0x6C",
+    "filter_mask": "0xFF"
+  },
+  "kline": {
+    "tester": "0xF1",
+    "ecu": "0x10"
+  },
+  "memory": {
+    "max_chunk": 64,
+    "address_bytes": 3,
+    "size_bytes": 2
+  },
+  "sessions": {
+    "programming": "0x02",
+    "read": "0x03"
+  },
+  "refs": {
+    "security": "silverado-vpw",
+    "flash_layout": "silverado-vpw",
+    "checksum": "silverado-vpw"
+  }
+}

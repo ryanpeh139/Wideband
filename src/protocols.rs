@@ -36,6 +36,12 @@ pub struct EcuProfile {
     pub size_bytes: usize,
     pub programming_session: u8,
     pub read_session: u8,
+    /// Row id in `security-config.json` (fail-closed; no keys in profile packs).
+    pub security_profile_id: String,
+    /// Profile key in `flash-layout.json`.
+    pub flash_layout_profile_id: String,
+    /// Profile id for checksum rows in `security-config.json`.
+    pub checksum_profile_id: String,
 }
 
 impl EcuProfile {
@@ -60,6 +66,9 @@ impl EcuProfile {
             size_bytes: 4,
             programming_session: 0x02,
             read_session: 0x03,
+            security_profile_id: "tacoma-can".to_string(),
+            flash_layout_profile_id: "tacoma-can".to_string(),
+            checksum_profile_id: "tacoma-can".to_string(),
         }
     }
 
@@ -84,6 +93,9 @@ impl EcuProfile {
             size_bytes: 3,
             programming_session: 0x85,
             read_session: 0x81,
+            security_profile_id: "tacoma-kline".to_string(),
+            flash_layout_profile_id: "tacoma-kline".to_string(),
+            checksum_profile_id: "tacoma-kline".to_string(),
         }
     }
 
@@ -108,6 +120,9 @@ impl EcuProfile {
             size_bytes: 4,
             programming_session: 0x02,
             read_session: 0x03,
+            security_profile_id: "silverado-can".to_string(),
+            flash_layout_profile_id: "silverado-can".to_string(),
+            checksum_profile_id: "silverado-can".to_string(),
         }
     }
 
@@ -132,10 +147,13 @@ impl EcuProfile {
             size_bytes: 2,
             programming_session: 0x02,
             read_session: 0x03,
+            security_profile_id: "silverado-vpw".to_string(),
+            flash_layout_profile_id: "silverado-vpw".to_string(),
+            checksum_profile_id: "silverado-vpw".to_string(),
         }
     }
 
-    pub fn all() -> Vec<Self> {
+    pub fn builtin_defaults() -> Vec<Self> {
         vec![
             Self::tacoma_can(),
             Self::tacoma_kline(),
@@ -143,6 +161,7 @@ impl EcuProfile {
             Self::silverado_vpw(),
         ]
     }
+
 }
 
 impl Default for VehicleBus {
