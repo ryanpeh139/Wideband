@@ -16,6 +16,35 @@ pub enum VehicleBus {
     Vpw,
 }
 
+/// Optional community plugin ids referenced by a profile or definition pack (fail-closed if missing).
+#[derive(Clone, Debug, Default)]
+pub struct PluginRefs {
+    pub checksum: Option<String>,
+    pub protocol: Option<String>,
+    pub patch: Option<String>,
+    pub manager: Option<String>,
+}
+
+impl PluginRefs {
+    pub fn required_ids(&self) -> Vec<String> {
+        let mut ids = Vec::new();
+        for slot in [
+            &self.checksum,
+            &self.protocol,
+            &self.patch,
+            &self.manager,
+        ] {
+            if let Some(id) = slot {
+                let trimmed = id.trim();
+                if !trimmed.is_empty() {
+                    ids.push(trimmed.to_string());
+                }
+            }
+        }
+        ids
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct EcuProfile {
     pub id: String,
@@ -43,6 +72,7 @@ pub struct EcuProfile {
     pub flash_layout_profile_id: String,
     /// Profile id for checksum rows in `security-config.json`.
     pub checksum_profile_id: String,
+    pub plugins: PluginRefs,
 }
 
 impl EcuProfile {
@@ -70,6 +100,7 @@ impl EcuProfile {
             security_profile_id: "tacoma-can".to_string(),
             flash_layout_profile_id: "tacoma-can".to_string(),
             checksum_profile_id: "tacoma-can".to_string(),
+            plugins: PluginRefs::default(),
         }
     }
 
@@ -97,6 +128,7 @@ impl EcuProfile {
             security_profile_id: "tacoma-kline".to_string(),
             flash_layout_profile_id: "tacoma-kline".to_string(),
             checksum_profile_id: "tacoma-kline".to_string(),
+            plugins: PluginRefs::default(),
         }
     }
 
@@ -124,6 +156,7 @@ impl EcuProfile {
             security_profile_id: "silverado-can".to_string(),
             flash_layout_profile_id: "silverado-can".to_string(),
             checksum_profile_id: "silverado-can".to_string(),
+            plugins: PluginRefs::default(),
         }
     }
 
@@ -151,6 +184,7 @@ impl EcuProfile {
             security_profile_id: "silverado-vpw".to_string(),
             flash_layout_profile_id: "silverado-vpw".to_string(),
             checksum_profile_id: "silverado-vpw".to_string(),
+            plugins: PluginRefs::default(),
         }
     }
 

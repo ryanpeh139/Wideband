@@ -10,6 +10,9 @@ pub mod flash_layout;
 pub mod isotp;
 pub mod j2534;
 pub mod j2534_host;
+pub mod definition_pack;
+pub mod pack_paths;
+pub mod plugin_host;
 pub mod profile_pack;
 pub mod protocols;
 pub mod security_config;
@@ -303,6 +306,7 @@ mod tests {
             security_profile_id: "unconfigured-test-profile".to_string(),
             flash_layout_profile_id: "unconfigured-test-profile".to_string(),
             checksum_profile_id: "unconfigured-test-profile".to_string(),
+            plugins: protocols::PluginRefs::default(),
         };
         let unconfigured = PlatformSecurity::compute_key(&seed, &unconfigured_profile);
         assert!(unconfigured.is_err());

@@ -2,7 +2,9 @@ use crate::audit_log::FlashAuditLog;
 use crate::cal_editor::{
     cell_changed, format_cell_display, param_matches_query, table_has_edits, FavoriteTables,
 };
+use crate::definition_pack::DefinitionPackCatalog;
 use crate::definitions::{RomImage, XdfDocument};
+use crate::plugin_host::PluginRegistry;
 use crate::diagnostics::{
     self, DiagnosticsSnapshot, DtcStatus, status_label,
 };
@@ -80,6 +82,9 @@ pub struct WidebandApp {
     pub rom_origin: i64,
     pub rom_path: Option<PathBuf>,
     pub xdf_path: Option<PathBuf>,
+    pub definition_catalog: DefinitionPackCatalog,
+    pub definition_pack_label: String,
+    pub plugin_registry: PluginRegistry,
 
     // Telemetry
     pub telemetry: Arc<Mutex<TelemetryBuffer>>,
@@ -125,6 +130,10 @@ impl WidebandApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply_motorsport_theme(&cc.egui_ctx);
         let devices = TransportRegistry::discover();
+        let plugin_registry = PluginRegistry::load_default();
+        if !plugin_registry.load_note.is_empty() {
+            eprintln!("plugins: {}", plugin_registry.load_note);
+        }
         let catalog = crate::profile_pack::ProfileCatalog::load_default();
         let profiles = catalog.profiles;
         if !catalog.load_note.is_empty() {
@@ -134,6 +143,10 @@ impl WidebandApp {
         let tcm_profiles = tcm_catalog.profiles;
         if !tcm_catalog.load_note.is_empty() {
             eprintln!("tcm profiles: {}", tcm_catalog.load_note);
+        }
+        let definition_catalog = DefinitionPackCatalog::load_default();
+        if !definition_catalog.load_note.is_empty() {
+            eprintln!("definition-packs: {}", definition_catalog.load_note);
         }
         let xdf = XdfDocument::sample();
         let tcm_param_view = build_parameter_view(&xdf);
@@ -178,6 +191,9 @@ impl WidebandApp {
             rom_origin: 0,
             rom_path: None,
             xdf_path: None,
+            definition_catalog,
+            definition_pack_label: String::new(),
+            plugin_registry,
             telemetry: Arc::new(Mutex::new(
                 TelemetryBuffer::from_definition(&TelemetryChannelFile::load_default(), None),
             )),
@@ -225,10 +241,52 @@ impl WidebandApp {
         }
 
         app.select_profile_id("tacoma-can");
+        app.sync_tcm_profile_to_ecm();
+        app.try_load_definition_pack_for_profile();
         if !app.simple_ux.wizard_open {
             app.connect_cable();
         }
         app
+    }
+
+    fn try_load_definition_pack_for_profile(&mut self) {
+        let profile_id = self.profiles[self.selected_profile_idx].id.clone();
+        self.definition_pack_label.clear();
+        let pack_meta = self
+            .definition_catalog
+            .best_for_profile(&profile_id)
+            .map(|pack| (pack.title.clone(), pack.id.clone()));
+        let xdf_path = self.definition_catalog.primary_xdf_path(&profile_id);
+        if let Some((title, id)) = pack_meta {
+            self.definition_pack_label = format!("Pack: {} ({})", title, id);
+            if let Some(path) = xdf_path {
+                self.load_xdf_from_path(path);
+                self.log(&format!(
+                    "Definition pack '{}' loaded primary XDF for {}",
+                    id,
+                    profile_id
+                ));
+            }
+        }
+    }
+
+    fn run_profile_plugin_hooks(&self, profile: &EcuProfile, image: &[u8], origin: i64) -> Result<(), String> {
+        if let Some(id) = &profile.plugins.checksum {
+            let msg = PluginRegistry::invoke_checksum_hook(id, &profile.id, image, origin)?;
+            if !msg.is_empty() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    fn set_selected_profile_idx(&mut self, idx: usize) {
+        if idx == self.selected_profile_idx {
+            return;
+        }
+        self.selected_profile_idx = idx;
+        self.sync_tcm_profile_to_ecm();
+        self.try_load_definition_pack_for_profile();
     }
 
     fn commit_table_edits(&mut self) {
@@ -336,6 +394,10 @@ impl WidebandApp {
         let mut image = self.active_rom.clone();
         match PlatformSecurity::stamp_image(&prof.checksum_profile_id, &mut image, self.rom_origin) {
             Ok(status) => {
+                if let Err(e) = self.run_profile_plugin_hooks(prof, &image, self.rom_origin) {
+                    self.log(&format!("Plugin checksum hook failed (fail-closed): {}", e));
+                    return;
+                }
                 self.checksum_status = status;
                 let nbytes = image.len();
                 match fs::write(&path, &image) {
@@ -857,17 +919,22 @@ impl WidebandApp {
 
     pub(crate) fn paint_profile_selector(&mut self, ui: &mut egui::Ui, width: f32) {
         ui.label(egui::RichText::new("Vehicle").size(11.0).color(MUTED));
-        let prev_ecm = self.selected_profile_idx;
+        let mut picked: Option<usize> = None;
         egui::ComboBox::from_id_salt("profile_select")
             .width(width)
             .selected_text(&self.profiles[self.selected_profile_idx].name)
             .show_ui(ui, |ui| {
                 for (idx, prof) in self.profiles.iter().enumerate() {
-                    ui.selectable_value(&mut self.selected_profile_idx, idx, &prof.name);
+                    if ui
+                        .selectable_label(self.selected_profile_idx == idx, &prof.name)
+                        .clicked()
+                    {
+                        picked = Some(idx);
+                    }
                 }
             });
-        if prev_ecm != self.selected_profile_idx {
-            self.sync_tcm_profile_to_ecm();
+        if let Some(idx) = picked {
+            self.set_selected_profile_idx(idx);
         }
     }
 
@@ -1391,6 +1458,13 @@ impl WidebandApp {
                                 .small()
                                 .color(MUTED),
                         );
+                        if !self.definition_pack_label.is_empty() {
+                            ui.label(
+                                egui::RichText::new(&self.definition_pack_label)
+                                    .small()
+                                    .color(ACCENT_CYAN),
+                            );
+                        }
                     }
                 });
                 ui.add_space(6.0);
@@ -2497,6 +2571,10 @@ impl WidebandApp {
                 return;
             }
         };
+        if let Err(e) = self.run_profile_plugin_hooks(&prof, &prepared, self.rom_origin) {
+            self.log(&format!("Flash blocked (plugin hook): {}", e));
+            return;
+        }
 
         self.log(&format!("Starting layout-driven cal flash for {}...", prof.name));
         self.is_flashing = true;

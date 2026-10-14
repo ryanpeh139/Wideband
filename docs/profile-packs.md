@@ -1,6 +1,8 @@
 # Versioned ECU profile packs
 
-Wideband loads vehicle **profile packs** from JSON files in a `profiles/` directory (next to `wideband.exe`, or `./profiles` when developing). Each pack describes bus wiring, diagnostic IDs, session types, and **references** into other config files — it never embeds seed-key masks or checksum secrets.
+Wideband loads vehicle **profile packs** from JSON files under `profiles/` (next to `wideband.exe`, `./profiles`, `~/.wideband/profiles`, or `WIDEBAND_PROFILE_DIRS`). Each pack describes bus wiring, diagnostic IDs, session types, and **references** into other config files — it never embeds seed-key masks or checksum secrets.
+
+Community **calibration definition packs** (XDF/A2L/INI) and native **plugins** are documented in [`community-packs-and-plugins.md`](community-packs-and-plugins.md).
 
 ## Layout
 

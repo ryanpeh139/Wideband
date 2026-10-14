@@ -225,6 +225,7 @@ impl TcmProfile {
             security_profile_id: self.security_profile_id.clone(),
             flash_layout_profile_id: self.flash_layout_profile_id.clone(),
             checksum_profile_id: self.checksum_profile_id.clone(),
+            plugins: crate::protocols::PluginRefs::default(),
         }
     }
 }

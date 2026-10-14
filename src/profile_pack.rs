@@ -1,5 +1,7 @@
 use crate::j2534::{ISO14230, ISO15765, J1850VPW};
-use crate::protocols::{DiagnosticProtocol, EcuProfile, VehicleBus};
+use crate::pack_paths::discover_profile_roots;
+use crate::plugin_host::PluginRegistry;
+use crate::protocols::{DiagnosticProtocol, EcuProfile, PluginRefs, VehicleBus};
 use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::fs;
@@ -28,25 +30,84 @@ const FORBIDDEN_ROOT_KEYS: &[&str] = &[
 pub struct ProfileCatalog {
     pub profiles: Vec<EcuProfile>,
     pub load_note: String,
-    pub pack_dir: PathBuf,
+    pub roots: Vec<PathBuf>,
 }
 
 impl ProfileCatalog {
     pub fn load_default() -> Self {
-        let dir = Self::discover_directory();
-        Self::load_from_directory(&dir)
+        Self::load_from_roots(&discover_profile_roots())
     }
 
     pub fn discover_directory() -> PathBuf {
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
-                let beside = parent.join("profiles");
-                if beside.is_dir() {
-                    return beside;
+        discover_profile_roots()
+            .into_iter()
+            .find(|p| p.is_dir())
+            .unwrap_or_else(|| PathBuf::from("profiles"))
+    }
+
+    pub fn load_from_roots(roots: &[PathBuf]) -> Self {
+        let mut profiles = Vec::new();
+        let mut errors = Vec::new();
+        let mut ids = BTreeSet::new();
+        let mut used_roots = Vec::new();
+
+        for dir in roots {
+            if !dir.is_dir() {
+                continue;
+            }
+            used_roots.push(dir.clone());
+            let partial = Self::load_from_directory(dir);
+            for profile in partial.profiles {
+                if ids.contains(&profile.id) {
+                    continue;
                 }
+                if let Err(e) = PluginRegistry::require_refs(&profile.plugins) {
+                    errors.push(format!("profile '{}': {}", profile.id, e));
+                    continue;
+                }
+                ids.insert(profile.id.clone());
+                profiles.push(profile);
+            }
+            if !partial.load_note.is_empty() && partial.load_note.contains("warnings") {
+                errors.push(partial.load_note);
             }
         }
-        PathBuf::from("profiles")
+
+        if profiles.is_empty() {
+            return Self {
+                profiles: EcuProfile::builtin_defaults(),
+                load_note: if errors.is_empty() {
+                    "No profile packs found; using built-in defaults.".to_string()
+                } else {
+                    format!(
+                        "Profile pack load failed; using built-in defaults. {}",
+                        errors.join(" | ")
+                    )
+                },
+                roots: used_roots,
+            };
+        }
+
+        profiles.sort_by(|a, b| a.name.cmp(&b.name));
+        let load_note = if errors.is_empty() {
+            format!(
+                "Loaded {} profile pack(s) from {} root(s).",
+                profiles.len(),
+                used_roots.len()
+            )
+        } else {
+            format!(
+                "Loaded {} profile pack(s) with warnings: {}",
+                profiles.len(),
+                errors.join(" | ")
+            )
+        };
+
+        Self {
+            profiles,
+            load_note,
+            roots: used_roots,
+        }
     }
 
     pub fn load_from_directory(dir: &Path) -> Self {
@@ -61,7 +122,7 @@ impl ProfileCatalog {
                     "Profile pack directory not found ({}); using built-in defaults.",
                     dir.display()
                 ),
-                pack_dir: dir.to_path_buf(),
+                roots: vec![dir.to_path_buf()],
             };
         }
 
@@ -79,7 +140,7 @@ impl ProfileCatalog {
                         dir.display(),
                         e
                     ),
-                    pack_dir: dir.to_path_buf(),
+                    roots: vec![dir.to_path_buf()],
                 };
             }
         };
@@ -87,12 +148,9 @@ impl ProfileCatalog {
 
         if paths.is_empty() {
             return Self {
-                profiles: EcuProfile::builtin_defaults(),
-                load_note: format!(
-                    "No profile packs in {}; using built-in defaults.",
-                    dir.display()
-                ),
-                pack_dir: dir.to_path_buf(),
+                profiles: Vec::new(),
+                load_note: format!("No profile packs in {}.", dir.display()),
+                roots: vec![dir.to_path_buf()],
             };
         }
 
@@ -116,17 +174,17 @@ impl ProfileCatalog {
 
         if profiles.is_empty() {
             return Self {
-                profiles: EcuProfile::builtin_defaults(),
+                profiles: Vec::new(),
                 load_note: if errors.is_empty() {
-                    format!("No valid profile packs in {}; using built-in defaults.", dir.display())
+                    format!("No valid profile packs in {}.", dir.display())
                 } else {
                     format!(
-                        "Profile pack load failed ({}); using built-in defaults. {}",
+                        "Profile pack load failed ({}): {}",
                         dir.display(),
                         errors.join(" | ")
                     )
                 },
-                pack_dir: dir.to_path_buf(),
+                roots: vec![dir.to_path_buf()],
             };
         }
 
@@ -146,7 +204,7 @@ impl ProfileCatalog {
         Self {
             profiles,
             load_note,
-            pack_dir: dir.to_path_buf(),
+            roots: vec![dir.to_path_buf()],
         }
     }
 }
@@ -217,6 +275,20 @@ struct ProfilePackFile {
     memory: MemorySection,
     sessions: SessionSection,
     refs: RefSection,
+    #[serde(default)]
+    plugins: PluginSection,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PluginSection {
+    #[serde(default)]
+    checksum: Option<String>,
+    #[serde(default)]
+    protocol: Option<String>,
+    #[serde(default)]
+    patch: Option<String>,
+    #[serde(default)]
+    manager: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -294,6 +366,12 @@ impl ProfilePackFile {
             security_profile_id: self.refs.security.trim().to_string(),
             flash_layout_profile_id: self.refs.flash_layout.trim().to_string(),
             checksum_profile_id: self.refs.checksum.trim().to_string(),
+            plugins: PluginRefs {
+                checksum: self.plugins.checksum,
+                protocol: self.plugins.protocol,
+                patch: self.plugins.patch,
+                manager: self.plugins.manager,
+            },
         })
     }
 }

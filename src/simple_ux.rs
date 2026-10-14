@@ -176,7 +176,7 @@ impl WidebandApp {
     }
 
     pub fn select_virtual_device(&mut self) {
-        if let Some(idx) = self.devices.iter().position(|d| d.is_virtual) {
+        if let Some(idx) = self.devices.iter().position(|d| d.is_virtual_bench()) {
             self.selected_device_idx = idx;
         }
     }
