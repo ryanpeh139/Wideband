@@ -103,8 +103,13 @@ pub struct WidebandApp {
     /// Scanner dashboard gauges (dashboard.json).
     pub dashboard: crate::gauges::Dashboard,
     pub dash_editing: bool,
+    /// Header row-1 group widths measured last frame (decides whether they share a row).
+    hdr_left_w: f32,
+    hdr_right_w: f32,
     /// Free-text notes saved inside the .wbtune file.
     pub tune_notes: String,
+    /// Calibration tool panel shown above the grid (one at a time).
+    cal_tool: Option<CalTool>,
     /// Live operating point on the selected table (separate from the edit selection).
     pub live_trace: live_trace::LiveTrace,
     pub math_amount: f64,
@@ -242,7 +247,10 @@ impl WidebandApp {
                     .unwrap_or_else(|_| crate::gauges::Dashboard::default_layout(&ids))
             },
             dash_editing: false,
+            hdr_left_w: 0.0,
+            hdr_right_w: 0.0,
             tune_notes: String::new(),
+            cal_tool: None,
             live_trace: live_trace::LiveTrace::default(),
             math_amount: 5.0,
             checksum_status: CHECKSUM_VALID.to_string(),
@@ -980,10 +988,8 @@ impl WidebandApp {
 
     fn render_studio_header(&mut self, ctx: &egui::Context, tier: theme::StudioHeaderTier) {
         use theme::StudioHeaderTier;
-        let compact_badge = tier != StudioHeaderTier::Wide;
-        let tabs_compact = tier != StudioHeaderTier::Wide;
-        let stacked = tier != StudioHeaderTier::Wide;
-        let header_h = if stacked { 112.0 } else { 76.0 };
+        let screen_w = ctx.screen_rect().width();
+        let compact_badge = tier != StudioHeaderTier::Wide || screen_w < 1500.0;
         let profile_combo_w = match tier {
             StudioHeaderTier::Compact => 130.0,
             StudioHeaderTier::Medium => 170.0,
@@ -992,47 +998,64 @@ impl WidebandApp {
         let device_combo_w = match tier {
             StudioHeaderTier::Compact => 110.0,
             StudioHeaderTier::Medium => 140.0,
-            StudioHeaderTier::Wide => 160.0,
+            StudioHeaderTier::Wide => 180.0,
         };
+        // Sized to its content (no exact_height): the old fixed 76/112 px panel clipped wrapped
+        // rows, which showed as a black bar and could push the whole workspace off-screen.
         egui::TopBottomPanel::top("header_bar")
-            .exact_height(header_h)
             .frame(theme::header_frame())
             .show(ctx, |ui| {
-                if stacked {
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
+                // Header text never wraps (a squeezed chip used to stack one letter per line).
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+
+                // Row 1: identity + status on the left, connection on the right. Whether the
+                // right group fits beside the left one is decided from last frame's measured
+                // widths, so the two groups can never draw on top of each other.
+                let fits = self.hdr_left_w > 0.0
+                    && ui.available_width() >= self.hdr_left_w + self.hdr_right_w + 24.0;
+                let row_h = 34.0;
+                ui.horizontal(|ui| {
+                    // Left group measured on its own so the fit test is stable frame to frame.
+                    let left = ui
+                        .horizontal(|ui| {
                             paint_studio_badge(ui, compact_badge);
                             ui.add_space(8.0);
                             self.paint_profile_selector(ui, profile_combo_w);
-                            self.paint_header_status_chips(ui);
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                self.paint_connect_controls(ui, device_combo_w);
-                            });
-                        });
-                        if !self.simple_ux.is_beginner() {
-                            self.paint_workspace_tabs(ui, tabs_compact);
-                        }
-                        ui.add_space(4.0);
-                        self.render_skill_and_practice_bar(ui);
-                    });
-                } else {
-                    ui.horizontal(|ui| {
-                        paint_studio_badge(ui, false);
-                        ui.add_space(12.0);
-                        self.paint_profile_selector(ui, profile_combo_w);
-                        ui.add_space(8.0);
-                        self.paint_header_status_chips(ui);
+                            ui.add_space(4.0);
+                            self.paint_header_status_chips(ui, screen_w < 1400.0);
+                        })
+                        .response;
+                    self.hdr_left_w = left.rect.width();
+                    if fits {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            self.paint_connect_controls(ui, device_combo_w);
-                            ui.add_space(10.0);
-                            if !self.simple_ux.is_beginner() {
-                                self.paint_workspace_tabs(ui, false);
-                            }
+                            let r = ui.horizontal(|ui| self.paint_connect_controls(ui, device_combo_w)).response;
+                            self.hdr_right_w = r.rect.width();
                         });
-                    });
-                    ui.add_space(2.0);
-                    self.render_skill_and_practice_bar(ui);
+                    }
+                });
+                if !fits {
+                    // Own row, right-aligned, fixed height (a bare right-to-left layout here
+                    // would claim all remaining height and push the tabs off-screen).
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), row_h),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let r = ui.horizontal(|ui| self.paint_connect_controls(ui, device_combo_w)).response;
+                            self.hdr_right_w = r.rect.width();
+                        },
+                    );
                 }
+                ui.add_space(4.0);
+
+                // Row 2: workspace tabs, then experience / practice controls; wraps as a unit
+                // so every tab stays visible at any width.
+                ui.horizontal_wrapped(|ui| {
+                    if !self.simple_ux.is_beginner() {
+                        self.paint_workspace_tabs(ui, tier != StudioHeaderTier::Wide);
+                        ui.separator();
+                    }
+                    self.render_skill_and_practice_bar(ui);
+                });
             });
     }
 
@@ -1122,14 +1145,11 @@ impl WidebandApp {
             (WorkspaceTab::Telemetry, "Telemetry"),
             (WorkspaceTab::Calibration, "Calibration"),
         ];
-        ui.horizontal_wrapped(|ui| {
-            for (tab, title) in tabs {
-                if studio_tab_button(ui, title, self.active_tab == tab, compact).clicked() {
-                    self.active_tab = tab;
-                }
-                ui.add_space(4.0);
+        for (tab, title) in tabs {
+            if studio_tab_button(ui, title, self.active_tab == tab, compact).clicked() {
+                self.active_tab = tab;
             }
-        });
+        }
     }
 
     fn paint_live_telemetry_card(&self, ui: &mut egui::Ui) {
@@ -1198,7 +1218,7 @@ impl WidebandApp {
             });
     }
 
-    fn paint_header_status_chips(&self, ui: &mut egui::Ui) {
+    fn paint_header_status_chips(&self, ui: &mut egui::Ui, narrow: bool) {
         let (status_text, status_color) = if self.is_connected {
             ("ONLINE", EMERALD)
         } else {
@@ -1219,11 +1239,16 @@ impl WidebandApp {
                             .color(status_color),
                     );
                     if !self.is_connected && !self.connection_last_error.is_empty() {
-                        ui.label(
-                            egui::RichText::new(format!("— {}", self.connection_last_error))
-                                .size(10.0)
-                                .color(Color32::from_rgb(0xF8, 0x51, 0x49)),
-                        );
+                        // Long errors are clipped in the header; the full text is on hover.
+                        let max = if narrow { 28 } else { 60 };
+                        let err = &self.connection_last_error;
+                        let short = if err.chars().count() > max {
+                            format!("— {}\u{2026}", err.chars().take(max).collect::<String>())
+                        } else {
+                            format!("— {}", err)
+                        };
+                        ui.label(egui::RichText::new(short).size(10.0).color(Color32::from_rgb(0xF8, 0x51, 0x49)))
+                            .on_hover_text(err.as_str());
                     }
                 });
             });
@@ -1237,11 +1262,12 @@ impl WidebandApp {
                 .inner_margin(egui::Margin::symmetric(8.0, 4.0))
                 .show(ui, |ui| {
                     ui.label(
-                        egui::RichText::new("Virtual ECU — not a real OBD cable")
+                        egui::RichText::new(if narrow { "Virtual ECU" } else { "Virtual ECU — not a real OBD cable" })
                             .size(10.0)
                             .strong()
                             .color(Color32::from_rgb(255, 193, 7)),
-                    );
+                    )
+                    .on_hover_text("Bench loopback simulator — not a real OBD cable");
                 });
         }
 
@@ -1309,6 +1335,9 @@ impl eframe::App for WidebandApp {
             }
         }
 
+        if self.simple_ux.wizard_open {
+            egui::CentralPanel::default().frame(theme::panel_frame()).show(ctx, |_| {});
+        }
         self.render_ux_overlays(ctx);
     }
 }
@@ -1599,7 +1628,7 @@ impl WidebandApp {
                     ui.add_space(4.0);
                 }
                 ui.horizontal_wrapped(|ui| {
-                    if !beginner_mode && ui.button("Open ROM (.bin / .cuw)").clicked() {
+                    if !beginner_mode && ui.button("Open ROM").on_hover_text("Open a .bin or .cuw image").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("ROM image", &["bin", "cuw"])
                             .pick_file()
@@ -1615,7 +1644,7 @@ impl WidebandApp {
                             self.load_xdf_from_path(path);
                         }
                     }
-                    if !beginner_mode && ui.button("Open Tune\u{2026}").on_hover_text("Open a .wbtune (ROM + definition + notes)").clicked() {
+                    if !beginner_mode && ui.button("Open Tune").on_hover_text("Open a .wbtune (ROM + definition + notes)").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("Wideband tune", &[crate::tune_file::EXTENSION])
                             .pick_file()
@@ -1623,7 +1652,7 @@ impl WidebandApp {
                             self.open_tune(path);
                         }
                     }
-                    if !beginner_mode && ui.button("Save Tune\u{2026}").on_hover_text("Save ROM + definition reference + vehicle + notes as .wbtune").clicked() {
+                    if !beginner_mode && ui.button("Save Tune").on_hover_text("Save ROM + definition reference + vehicle + notes as .wbtune").clicked() {
                         let mut dialog = rfd::FileDialog::new().add_filter("Wideband tune", &[crate::tune_file::EXTENSION]);
                         if let Some(p) = &self.rom_path {
                             if let Some(stem) = p.file_stem() {
@@ -1634,7 +1663,7 @@ impl WidebandApp {
                             self.save_tune(path);
                         }
                     }
-                    if !beginner_mode && ui.button("Compare ROM\u{2026}").on_hover_text("Open a second ROM to diff against (same XDF)").clicked() {
+                    if !beginner_mode && ui.button("Compare").on_hover_text("Open a second ROM to diff against (same XDF)").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("ROM image", &["bin", "cuw"])
                             .pick_file()
@@ -1681,17 +1710,37 @@ impl WidebandApp {
                     }
                 });
                 if !beginner_mode {
+                    // One toggle row instead of three stacked collapsible headers: only the open
+                    // tool takes vertical space, so the grid keeps room on small windows.
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new("Tools").small().color(MUTED));
+                        for (tool, label, tip) in [
+                            (CalTool::Histogram, "Histogram", "Scanner histogram: bin any logged channel into this table"),
+                            (CalTool::FuelCorrection, "Fuel correction", "VE / fuel correction from wideband + fuel trims"),
+                            (CalTool::Notes, "Tune notes", "Notes saved inside the .wbtune"),
+                        ] {
+                            let on = self.cal_tool == Some(tool);
+                            if ui.selectable_label(on, label).on_hover_text(tip).clicked() {
+                                self.cal_tool = if on { None } else { Some(tool) };
+                            }
+                        }
+                    });
+                }
+                if !beginner_mode {
                     self.render_compare_bar(ui);
-                    egui::CollapsingHeader::new(egui::RichText::new("Tune notes").small().color(MUTED))
-                        .id_salt("tune_notes")
-                        .show(ui, |ui| {
+                    match self.cal_tool {
+                        Some(CalTool::Notes) => {
                             ui.add(
                                 egui::TextEdit::multiline(&mut self.tune_notes)
                                     .desired_rows(3)
                                     .desired_width(f32::INFINITY)
                                     .hint_text("What changed, fuel used, mods, dyno numbers\u{2026} (saved in the .wbtune)"),
                             );
-                        });
+                        }
+                        Some(CalTool::Histogram) => self.render_histogram_panel(ui),
+                        Some(CalTool::FuelCorrection) => self.render_ve_correction_panel(ui),
+                        None => {}
+                    }
                 }
                 ui.add_space(6.0);
                 ui.separator();
@@ -1844,19 +1893,13 @@ impl WidebandApp {
                                 .color(ACCENT_CYAN),
                         );
                     } else {
-                        ui.label(
-                            egui::RichText::new("Type a value + Enter \u{00B7} + - * / step \u{00B7} arrows \u{00B7} Ctrl+C/V")
-                                .small()
-                                .color(MUTED),
+                        ui.label(egui::RichText::new("\u{2328}").color(MUTED)).on_hover_text(
+                            "Type a value + Enter to set the selection\n+ - * / : step, -step, +step %, -step %\nArrows move, Shift+arrows extend\nCtrl+C / Ctrl+V copy & paste (Excel)\nCtrl+Z / Ctrl+Y undo & redo",
                         );
                     }
                 });
 
                 self.handle_grid_keyboard(ui);
-                if !beginner_mode {
-                    self.render_histogram_panel(ui);
-                    self.render_ve_correction_panel(ui);
-                }
                 ui.add_space(8.0);
 
                 let grid_avail = ui.available_size();
@@ -2680,226 +2723,228 @@ fn read_pass_thru_vbatt(dev: &mut dyn PassThruDevice, channel: u32) -> Option<f3
 impl WidebandApp {
     fn render_transmission_tab(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading(
-                egui::RichText::new("Transmission Control Module (TCM)")
-                    .size(16.0)
-                    .color(Color32::WHITE),
-            );
-            ui.label(
-                egui::RichText::new(
-                    "Read-oriented TCM identify and definition-tagged shift / pressure / TCC views. Flash stays fail-closed until security-config and flash-layout are configured like ECM.",
-                )
-                .small()
-                .color(MUTED),
-            );
-            ui.separator();
-
-            let tcm = self.selected_tcm_profile().clone();
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new("TCM profile").size(11.0).color(MUTED));
-                egui::ComboBox::from_id_salt("tcm_profile_select")
-                    .width(280.0)
-                    .selected_text(&tcm.name)
-                    .show_ui(ui, |ui| {
-                        for (idx, prof) in self.tcm_profiles.iter().enumerate() {
-                            ui.selectable_value(&mut self.selected_tcm_profile_idx, idx, &prof.name);
-                        }
-                    });
-            });
-            ui.label(
-                egui::RichText::new(format!(
-                    "Paired ECM: {} · Family: {} · TX 0x{:X} / RX 0x{:X}",
-                    tcm.paired_ecm_profile_id,
-                    tcm.transmission_family,
-                    tcm.request_id,
-                    tcm.response_id
-                ))
-                .small()
-                .color(MUTED),
-            );
-            ui.add_space(8.0);
-
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .button(egui::RichText::new("Identify TCM").strong())
-                    .clicked()
-                {
-                    self.tcm_identify_error.clear();
-                    if let Some(dev) = &mut self.active_device {
-                        let allow_demo = self.active_device_virtual;
-                        let channel = dev.channel_id();
-                        match TcmIdentifier::query(dev.as_mut(), channel, &tcm, allow_demo) {
-                            Ok(id) => {
-                                let details = id.details.clone();
-                                self.tcm_id = id;
-                                self.log(&details);
-                            }
-                            Err(e) => {
-                                self.tcm_identify_error = e.clone();
-                                self.log(&format!("TCM identification failed: {}", e));
-                            }
-                        }
-                    } else {
-                        self.tcm_identify_error = "Connect cable first.".to_string();
-                    }
-                }
-
-                let virtual_ecu = self.cable_is_virtual();
-                let blockers = tcm_flash_blockers(&tcm, virtual_ecu, &self.flash_layout);
-                let flash_blocked = !blockers.is_empty();
-                if ui
-                    .add_enabled(
-                        !flash_blocked,
-                        egui::Button::new(
-                            egui::RichText::new("Flash TCM calibration")
-                                .strong()
-                                .color(Color32::from_rgb(255, 120, 80)),
-                        ),
-                    )
-                    .clicked()
-                {
-                    self.tcm_flash_confirm_open = true;
-                }
-            });
-
-            if !self.tcm_identify_error.is_empty() {
-                ui.label(
-                    egui::RichText::new(&self.tcm_identify_error)
-                        .small()
-                        .color(Color32::from_rgb(255, 152, 0)),
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ui.heading(
+                    egui::RichText::new("Transmission Control Module (TCM)")
+                        .size(16.0)
+                        .color(Color32::WHITE),
                 );
-            }
-
-            if !self.tcm_id.details.is_empty() {
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new(&self.tcm_id.details).monospace().color(TEXT));
-            }
-
-            if self.tcm_flash_confirm_open {
-                let virtual_ecu = self.cable_is_virtual();
-                let blockers = tcm_flash_blockers(&tcm, virtual_ecu, &self.flash_layout);
-                let mut confirm = false;
-                let mut cancel = false;
-                egui::Window::new("Confirm TCM calibration flash")
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                    .show(ctx, |ui| {
-                        ui.label(
-                            "TCM writes require the same security-config and checksum setup as ECM. This build keeps TCM flash gated until layout and bench validation are complete.",
-                        );
-                        ui.label(format!("TCM profile: {}", tcm.name));
-                        for reason in &blockers {
-                            ui.label(
-                                egui::RichText::new(format!("Blocked: {}", reason))
-                                    .color(Color32::from_rgb(255, 152, 0)),
-                            );
-                        }
-                        ui.horizontal(|ui| {
-                            if ui.button("Cancel").clicked() {
-                                cancel = true;
-                            }
-                            if ui
-                                .add_enabled(blockers.is_empty(), egui::Button::new("Flash"))
-                                .clicked()
-                            {
-                                confirm = true;
-                            }
-                        });
-                    });
-                if cancel {
-                    self.tcm_flash_confirm_open = false;
-                }
-                if confirm && blockers.is_empty() {
-                    self.tcm_flash_confirm_open = false;
-                    self.log("TCM flash refused: execution path not enabled in this milestone.");
-                }
-            }
-
-            ui.add_space(12.0);
-            ui.heading(egui::RichText::new("Shift / pressure / TCC (from XDF)").size(14.0).color(ACCENT_CYAN));
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} — {}",
-                    self.tcm_param_view.definition_title,
-                    self.tcm_param_view.note
-                ))
-                .small()
-                .color(MUTED),
-            );
-
-            for group in [
-                TcmParameterGroup::Shift,
-                TcmParameterGroup::Pressure,
-                TcmParameterGroup::Tcc,
-            ] {
-                let rows: Vec<_> = self
-                    .tcm_param_view
-                    .entries
-                    .iter()
-                    .filter(|e| e.group == group)
-                    .collect();
-                if rows.is_empty() {
-                    continue;
-                }
-                ui.add_space(8.0);
-                ui.collapsing(group_label(group), |ui| {
-                    TableBuilder::new(ui)
-                        .striped(true)
-                        .column(Column::auto().at_least(160.0))
-                        .column(Column::auto().at_least(64.0))
-                        .column(Column::remainder())
-                        .header(20.0, |mut row| {
-                            row.col(|ui| {
-                                ui.label(egui::RichText::new("Parameter").small().strong());
-                            });
-                            row.col(|ui| {
-                                ui.label(egui::RichText::new("Kind").small().strong());
-                            });
-                            row.col(|ui| {
-                                ui.label(egui::RichText::new("Summary").small().strong());
-                            });
-                        })
-                        .body(|mut body| {
-                            for entry in rows {
-                                body.row(22.0, |mut row| {
-                                    row.col(|ui| {
-                                        ui.label(egui::RichText::new(&entry.title).color(TEXT));
-                                    });
-                                    row.col(|ui| {
-                                        ui.label(
-                                            egui::RichText::new(entry.kind)
-                                                .small()
-                                                .color(MUTED),
-                                        );
-                                    });
-                                    row.col(|ui| {
-                                        ui.label(
-                                            egui::RichText::new(&entry.summary)
-                                                .small()
-                                                .color(MUTED),
-                                        );
-                                    });
-                                });
-                            }
-                        });
-                });
-            }
-
-            if self
-                .tcm_param_view
-                .entries
-                .iter()
-                .all(|e| e.group == TcmParameterGroup::Other)
-            {
                 ui.label(
                     egui::RichText::new(
-                        "Load a transmission XDF or rename tables with shift, pressure, or TCC keywords to populate this panel.",
+                        "Read-oriented TCM identify and definition-tagged shift / pressure / TCC views. Flash stays fail-closed until security-config and flash-layout are configured like ECM.",
                     )
                     .small()
                     .color(MUTED),
                 );
-            }
+                ui.separator();
+
+                let tcm = self.selected_tcm_profile().clone();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("TCM profile").size(11.0).color(MUTED));
+                    egui::ComboBox::from_id_salt("tcm_profile_select")
+                        .width(280.0)
+                        .selected_text(&tcm.name)
+                        .show_ui(ui, |ui| {
+                            for (idx, prof) in self.tcm_profiles.iter().enumerate() {
+                                ui.selectable_value(&mut self.selected_tcm_profile_idx, idx, &prof.name);
+                            }
+                        });
+                });
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Paired ECM: {} · Family: {} · TX 0x{:X} / RX 0x{:X}",
+                        tcm.paired_ecm_profile_id,
+                        tcm.transmission_family,
+                        tcm.request_id,
+                        tcm.response_id
+                    ))
+                    .small()
+                    .color(MUTED),
+                );
+                ui.add_space(8.0);
+
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .button(egui::RichText::new("Identify TCM").strong())
+                        .clicked()
+                    {
+                        self.tcm_identify_error.clear();
+                        if let Some(dev) = &mut self.active_device {
+                            let allow_demo = self.active_device_virtual;
+                            let channel = dev.channel_id();
+                            match TcmIdentifier::query(dev.as_mut(), channel, &tcm, allow_demo) {
+                                Ok(id) => {
+                                    let details = id.details.clone();
+                                    self.tcm_id = id;
+                                    self.log(&details);
+                                }
+                                Err(e) => {
+                                    self.tcm_identify_error = e.clone();
+                                    self.log(&format!("TCM identification failed: {}", e));
+                                }
+                            }
+                        } else {
+                            self.tcm_identify_error = "Connect cable first.".to_string();
+                        }
+                    }
+
+                    let virtual_ecu = self.cable_is_virtual();
+                    let blockers = tcm_flash_blockers(&tcm, virtual_ecu, &self.flash_layout);
+                    let flash_blocked = !blockers.is_empty();
+                    if ui
+                        .add_enabled(
+                            !flash_blocked,
+                            egui::Button::new(
+                                egui::RichText::new("Flash TCM calibration")
+                                    .strong()
+                                    .color(Color32::from_rgb(255, 120, 80)),
+                            ),
+                        )
+                        .clicked()
+                    {
+                        self.tcm_flash_confirm_open = true;
+                    }
+                });
+
+                if !self.tcm_identify_error.is_empty() {
+                    ui.label(
+                        egui::RichText::new(&self.tcm_identify_error)
+                            .small()
+                            .color(Color32::from_rgb(255, 152, 0)),
+                    );
+                }
+
+                if !self.tcm_id.details.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(&self.tcm_id.details).monospace().color(TEXT));
+                }
+
+                if self.tcm_flash_confirm_open {
+                    let virtual_ecu = self.cable_is_virtual();
+                    let blockers = tcm_flash_blockers(&tcm, virtual_ecu, &self.flash_layout);
+                    let mut confirm = false;
+                    let mut cancel = false;
+                    egui::Window::new("Confirm TCM calibration flash")
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                        .show(ctx, |ui| {
+                            ui.label(
+                                "TCM writes require the same security-config and checksum setup as ECM. This build keeps TCM flash gated until layout and bench validation are complete.",
+                            );
+                            ui.label(format!("TCM profile: {}", tcm.name));
+                            for reason in &blockers {
+                                ui.label(
+                                    egui::RichText::new(format!("Blocked: {}", reason))
+                                        .color(Color32::from_rgb(255, 152, 0)),
+                                );
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.button("Cancel").clicked() {
+                                    cancel = true;
+                                }
+                                if ui
+                                    .add_enabled(blockers.is_empty(), egui::Button::new("Flash"))
+                                    .clicked()
+                                {
+                                    confirm = true;
+                                }
+                            });
+                        });
+                    if cancel {
+                        self.tcm_flash_confirm_open = false;
+                    }
+                    if confirm && blockers.is_empty() {
+                        self.tcm_flash_confirm_open = false;
+                        self.log("TCM flash refused: execution path not enabled in this milestone.");
+                    }
+                }
+
+                ui.add_space(12.0);
+                ui.heading(egui::RichText::new("Shift / pressure / TCC (from XDF)").size(14.0).color(ACCENT_CYAN));
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} — {}",
+                        self.tcm_param_view.definition_title,
+                        self.tcm_param_view.note
+                    ))
+                    .small()
+                    .color(MUTED),
+                );
+
+                for group in [
+                    TcmParameterGroup::Shift,
+                    TcmParameterGroup::Pressure,
+                    TcmParameterGroup::Tcc,
+                ] {
+                    let rows: Vec<_> = self
+                        .tcm_param_view
+                        .entries
+                        .iter()
+                        .filter(|e| e.group == group)
+                        .collect();
+                    if rows.is_empty() {
+                        continue;
+                    }
+                    ui.add_space(8.0);
+                    ui.collapsing(group_label(group), |ui| {
+                        TableBuilder::new(ui)
+                            .striped(true)
+                            .column(Column::auto().at_least(160.0))
+                            .column(Column::auto().at_least(64.0))
+                            .column(Column::remainder())
+                            .header(20.0, |mut row| {
+                                row.col(|ui| {
+                                    ui.label(egui::RichText::new("Parameter").small().strong());
+                                });
+                                row.col(|ui| {
+                                    ui.label(egui::RichText::new("Kind").small().strong());
+                                });
+                                row.col(|ui| {
+                                    ui.label(egui::RichText::new("Summary").small().strong());
+                                });
+                            })
+                            .body(|mut body| {
+                                for entry in rows {
+                                    body.row(22.0, |mut row| {
+                                        row.col(|ui| {
+                                            ui.label(egui::RichText::new(&entry.title).color(TEXT));
+                                        });
+                                        row.col(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(entry.kind)
+                                                    .small()
+                                                    .color(MUTED),
+                                            );
+                                        });
+                                        row.col(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(&entry.summary)
+                                                    .small()
+                                                    .color(MUTED),
+                                            );
+                                        });
+                                    });
+                                }
+                            });
+                    });
+                }
+
+                if self
+                    .tcm_param_view
+                    .entries
+                    .iter()
+                    .all(|e| e.group == TcmParameterGroup::Other)
+                {
+                    ui.label(
+                        egui::RichText::new(
+                            "Load a transmission XDF or rename tables with shift, pressure, or TCC keywords to populate this panel.",
+                        )
+                        .small()
+                        .color(MUTED),
+                    );
+                }
+            });
         });
     }
 }
@@ -2911,147 +2956,149 @@ impl WidebandApp {
 impl WidebandApp {
     fn render_flash_tab(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading(egui::RichText::new("ECU Diagnostics & Laboratory Bench-Flashing").size(16.0).color(Color32::WHITE));
-            ui.label("Direct J2534 ISO 14229 / ISO 14230 flashing with seed-key handshake and checksum stamping.");
-            ui.separator();
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ui.heading(egui::RichText::new("ECU Diagnostics & Laboratory Bench-Flashing").size(16.0).color(Color32::WHITE));
+                ui.label("Direct J2534 ISO 14229 / ISO 14230 flashing with seed-key handshake and checksum stamping.");
+                ui.separator();
 
-            ui.horizontal_wrapped(|ui| {
-                if ui.button(egui::RichText::new("🔍 Identify ECU").strong()).clicked() {
-                    if let Some(dev) = &mut self.active_device {
-                        let prof = &self.profiles[self.selected_profile_idx];
-                        let allow_demo = self.active_device_virtual;
-                        let channel = dev.channel_id();
-                        match EcuIdentifier::query(dev.as_mut(), channel, prof, allow_demo) {
-                            Ok(id) => {
-                                self.ecu_id = id;
-                                self.log(&format!("ECU Identified: VIN={}, Cal ID={}, CVN={}", self.ecu_id.vin, self.ecu_id.cal_id, self.ecu_id.cvn));
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button(egui::RichText::new("🔍 Identify ECU").strong()).clicked() {
+                        if let Some(dev) = &mut self.active_device {
+                            let prof = &self.profiles[self.selected_profile_idx];
+                            let allow_demo = self.active_device_virtual;
+                            let channel = dev.channel_id();
+                            match EcuIdentifier::query(dev.as_mut(), channel, prof, allow_demo) {
+                                Ok(id) => {
+                                    self.ecu_id = id;
+                                    self.log(&format!("ECU Identified: VIN={}, Cal ID={}, CVN={}", self.ecu_id.vin, self.ecu_id.cal_id, self.ecu_id.cvn));
+                                }
+                                Err(e) => self.log(&format!("ECU identification failed: {}", e)),
                             }
-                            Err(e) => self.log(&format!("ECU identification failed: {}", e)),
+                        } else {
+                            self.log("Connect cable first.");
                         }
-                    } else {
-                        self.log("Connect cable first.");
+                    }
+
+                    if ui.button("Read Stock ROM (0x23)").clicked() {
+                        self.execute_stock_read();
+                    }
+
+                    let prof = &self.profiles[self.selected_profile_idx];
+                    let virtual_ecu = self.cable_is_virtual();
+                    let flash_blocked = !PlatformSecurity::flash_blockers(&prof.id, virtual_ecu).is_empty();
+                    let flash_btn = ui.add_enabled(
+                        !flash_blocked,
+                        egui::Button::new(
+                            egui::RichText::new("⚡ Flash Active Calibration")
+                                .strong()
+                                .color(Color32::from_rgb(255, 23, 68)),
+                        ),
+                    );
+                    if flash_btn.clicked() {
+                        self.flash_confirm_open = true;
+                    }
+                });
+
+                self.render_security_status_panel(ui);
+
+                if self.flash_confirm_open {
+                    let prof = self.profiles[self.selected_profile_idx].clone();
+                    let virtual_ecu = self.cable_is_virtual();
+                    let blockers = PlatformSecurity::flash_blockers(&prof.id, virtual_ecu);
+                    let segments = self
+                        .flash_layout
+                        .cal_segments(&prof.id)
+                        .unwrap_or_default();
+                    let mut confirm = false;
+                    let mut cancel = false;
+                    egui::Window::new("Confirm calibration flash")
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                        .show(ctx, |ui| {
+                            ui.label(
+                                "This writes calibration segments to the connected ECU. Verify vehicle, profile, and security-config before continuing.",
+                            );
+                            ui.separator();
+                            ui.label(format!("Profile: {}", prof.name));
+                            for seg in &segments {
+                                ui.label(format!(
+                                    "  • {} — {} bytes @ 0x{:X}",
+                                    seg.label,
+                                    seg.size,
+                                    seg.address
+                                ));
+                            }
+                            for reason in &blockers {
+                                ui.label(
+                                    egui::RichText::new(format!("Flash blocked: {}", reason))
+                                        .color(Color32::from_rgb(255, 152, 0)),
+                                );
+                            }
+                            if !self.active_device_virtual
+                                && !PlatformSecurity::security_key_configured_for_profile(&prof.id)
+                                && blockers.is_empty()
+                            {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Production security-config seed-key is not configured for this profile.",
+                                    )
+                                    .color(Color32::from_rgb(255, 152, 0)),
+                                );
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.button(egui::RichText::new("Cancel").strong()).clicked() {
+                                    cancel = true;
+                                }
+                                let write_enabled = blockers.is_empty();
+                                if ui
+                                    .add_enabled(
+                                        write_enabled,
+                                        egui::Button::new(
+                                            egui::RichText::new("Write calibration to ECU")
+                                                .strong()
+                                                .color(Color32::from_rgb(255, 23, 68)),
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    confirm = true;
+                                }
+                            });
+                        });
+                    if cancel {
+                        self.flash_confirm_open = false;
+                    }
+                    if confirm && blockers.is_empty() {
+                        self.flash_confirm_open = false;
+                        self.execute_flash_active();
                     }
                 }
+                ui.add_space(8.0);
+                ui.group(|ui| {
+                    ui.heading("Active ECU Metadata");
+                    ui.label(format!("Vehicle VIN:       {}", if self.ecu_id.vin.is_empty() { "Not queried" } else { &self.ecu_id.vin }));
+                    ui.label(format!("Calibration ID:    {}", if self.ecu_id.cal_id.is_empty() { "Not queried" } else { &self.ecu_id.cal_id }));
+                    ui.label(format!("Verification CVN:  {}", if self.ecu_id.cvn.is_empty() { "Not queried" } else { &self.ecu_id.cvn }));
+                });
 
-                if ui.button("Read Stock ROM (0x23)").clicked() {
-                    self.execute_stock_read();
+                ui.add_space(8.0);
+                ui.label(format!("Flash Transfer Progress: {:.0}%", self.transfer_progress * 100.0));
+                if !self.flash_status_detail.is_empty() {
+                    ui.label(egui::RichText::new(&self.flash_status_detail).small().color(MUTED));
                 }
+                ui.add(egui::ProgressBar::new(self.transfer_progress).animate(self.is_flashing));
 
-                let prof = &self.profiles[self.selected_profile_idx];
-                let virtual_ecu = self.cable_is_virtual();
-                let flash_blocked = !PlatformSecurity::flash_blockers(&prof.id, virtual_ecu).is_empty();
-                let flash_btn = ui.add_enabled(
-                    !flash_blocked,
-                    egui::Button::new(
-                        egui::RichText::new("⚡ Flash Active Calibration")
-                            .strong()
-                            .color(Color32::from_rgb(255, 23, 68)),
-                    ),
-                );
-                if flash_btn.clicked() {
-                    self.flash_confirm_open = true;
-                }
-            });
+                ui.add_space(12.0);
+                self.render_diagnostics_panel(ui);
 
-            self.render_security_status_panel(ui);
-
-            if self.flash_confirm_open {
-                let prof = self.profiles[self.selected_profile_idx].clone();
-                let virtual_ecu = self.cable_is_virtual();
-                let blockers = PlatformSecurity::flash_blockers(&prof.id, virtual_ecu);
-                let segments = self
-                    .flash_layout
-                    .cal_segments(&prof.id)
-                    .unwrap_or_default();
-                let mut confirm = false;
-                let mut cancel = false;
-                egui::Window::new("Confirm calibration flash")
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                    .show(ctx, |ui| {
-                        ui.label(
-                            "This writes calibration segments to the connected ECU. Verify vehicle, profile, and security-config before continuing.",
-                        );
-                        ui.separator();
-                        ui.label(format!("Profile: {}", prof.name));
-                        for seg in &segments {
-                            ui.label(format!(
-                                "  • {} — {} bytes @ 0x{:X}",
-                                seg.label,
-                                seg.size,
-                                seg.address
-                            ));
-                        }
-                        for reason in &blockers {
-                            ui.label(
-                                egui::RichText::new(format!("Flash blocked: {}", reason))
-                                    .color(Color32::from_rgb(255, 152, 0)),
-                            );
-                        }
-                        if !self.active_device_virtual
-                            && !PlatformSecurity::security_key_configured_for_profile(&prof.id)
-                            && blockers.is_empty()
-                        {
-                            ui.label(
-                                egui::RichText::new(
-                                    "Production security-config seed-key is not configured for this profile.",
-                                )
-                                .color(Color32::from_rgb(255, 152, 0)),
-                            );
-                        }
-                        ui.horizontal(|ui| {
-                            if ui.button(egui::RichText::new("Cancel").strong()).clicked() {
-                                cancel = true;
-                            }
-                            let write_enabled = blockers.is_empty();
-                            if ui
-                                .add_enabled(
-                                    write_enabled,
-                                    egui::Button::new(
-                                        egui::RichText::new("Write calibration to ECU")
-                                            .strong()
-                                            .color(Color32::from_rgb(255, 23, 68)),
-                                    ),
-                                )
-                                .clicked()
-                            {
-                                confirm = true;
-                            }
-                        });
-                    });
-                if cancel {
-                    self.flash_confirm_open = false;
-                }
-                if confirm && blockers.is_empty() {
-                    self.flash_confirm_open = false;
-                    self.execute_flash_active();
-                }
-            }
-            ui.add_space(8.0);
-            ui.group(|ui| {
-                ui.heading("Active ECU Metadata");
-                ui.label(format!("Vehicle VIN:       {}", if self.ecu_id.vin.is_empty() { "Not queried" } else { &self.ecu_id.vin }));
-                ui.label(format!("Calibration ID:    {}", if self.ecu_id.cal_id.is_empty() { "Not queried" } else { &self.ecu_id.cal_id }));
-                ui.label(format!("Verification CVN:  {}", if self.ecu_id.cvn.is_empty() { "Not queried" } else { &self.ecu_id.cvn }));
-            });
-
-            ui.add_space(8.0);
-            ui.label(format!("Flash Transfer Progress: {:.0}%", self.transfer_progress * 100.0));
-            if !self.flash_status_detail.is_empty() {
-                ui.label(egui::RichText::new(&self.flash_status_detail).small().color(MUTED));
-            }
-            ui.add(egui::ProgressBar::new(self.transfer_progress).animate(self.is_flashing));
-
-            ui.add_space(12.0);
-            self.render_diagnostics_panel(ui);
-
-            ui.add_space(8.0);
-            ui.heading("Communication & Flash Event Log");
-            egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
-                for line in &self.comm_log {
-                    ui.label(egui::RichText::new(line).monospace().small());
-                }
+                ui.add_space(8.0);
+                ui.heading("Communication & Flash Event Log");
+                egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                    for line in &self.comm_log {
+                        ui.label(egui::RichText::new(line).monospace().small());
+                    }
+                });
             });
         });
     }
@@ -3574,12 +3621,7 @@ impl WidebandApp {
             .map(|(i, t)| (i, t.title.clone()))
             .collect();
 
-        egui::CollapsingHeader::new(
-            egui::RichText::new("Log-based fuel correction (VE from wideband + trims)").strong().color(TEXT),
-        )
-        .id_salt("ve_corr_panel")
-        .default_open(false)
-        .show(ui, |ui| {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
             if !fuel_like {
                 ui.label(
                     egui::RichText::new(format!(
@@ -3959,10 +4001,7 @@ impl WidebandApp {
         };
         let imported = self.telemetry_playback.primary.as_ref().map(|l| (l.name.clone(), l.frames.len()));
 
-        egui::CollapsingHeader::new(egui::RichText::new("Scanner histogram (bin any channel into this table)").strong().color(TEXT))
-            .id_salt("hist_panel")
-            .default_open(false)
-            .show(ui, |ui| {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
                 let channel_combo = |ui: &mut egui::Ui, id: &str, value: &mut String| {
                     let shown = channels.iter().find(|(c, _)| c == value).map(|(_, l)| l.clone()).unwrap_or_else(|| value.clone());
                     egui::ComboBox::from_id_salt(id).selected_text(shown).width(170.0).show_ui(ui, |ui| {
@@ -4488,4 +4527,11 @@ impl WidebandApp {
             if t.cal_id.is_empty() { String::new() } else { format!(", cal {}", t.cal_id) },
         ));
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CalTool {
+    Histogram,
+    FuelCorrection,
+    Notes,
 }

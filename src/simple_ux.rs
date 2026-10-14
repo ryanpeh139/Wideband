@@ -422,7 +422,6 @@ impl WidebandApp {
 
     pub fn render_beginner_workspace(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("beginner_path")
-            .exact_height(36.0)
             .frame(theme::panel_frame())
             .show(ctx, |ui| {
                 self.render_beginner_path_strip(ui);

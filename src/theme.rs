@@ -159,7 +159,9 @@ pub fn side_panel_widths(ctx: &egui::Context) -> (f32, f32, f32) {
     let w = ctx.screen_rect().width().max(520.0);
     let default_w = (w * 0.20).clamp(170.0, 300.0);
     let min_w = 150.0;
-    let max_w = (w * 0.32).clamp(190.0, 360.0);
+    // Each side panel capped at ~26% so two of them always leave the centre (table grid)
+    // about half the window; widths remembered from a larger window are clamped to this.
+    let max_w = (w * 0.26).clamp(170.0, 360.0);
     (default_w, min_w, max_w)
 }
 
