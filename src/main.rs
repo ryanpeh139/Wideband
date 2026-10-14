@@ -1,4 +1,5 @@
 pub mod audit_log;
+pub mod cal_editor;
 pub mod definitions;
 pub mod flash_job;
 pub mod flash_layout;
@@ -46,7 +47,38 @@ mod tests {
     use protocols::{ChecksumEngine, EcuIdentifier, EcuProfile, FlashDownload};
     use security_config::PlatformSecurity;
     use std::path::PathBuf;
+    use cal_editor::{cell_changed, format_cell_display, param_matches_query, table_has_edits};
     use definitions::{CuwFile, ScaleEquation, XdfDocument};
+    use security_config::{CHECKSUM_UPDATED, CHECKSUM_VALID};
+
+    #[test]
+    fn test_cal_editor_delta_and_search() {
+        assert!(!cell_changed(10.0, 10.0));
+        assert!(cell_changed(10.1, 10.0));
+        assert_eq!(format_cell_display(12.5, 10.0), "12.5 (+2.5)");
+        assert_eq!(format_cell_display(10.0, 10.0), "10.0");
+        assert!(param_matches_query("ve", "VE Table", "", "ve_main", "%"));
+        assert!(!param_matches_query("spark", "VE Table", "", "ve_main", "%"));
+        let stock = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
+        let cur = vec![vec![1.0, 2.5], vec![3.0, 4.0]];
+        assert!(table_has_edits(&cur, &stock));
+    }
+
+    #[test]
+    fn test_checksum_badge_reflects_rom_state() {
+        install_test_security_config();
+        let mut rom = vec![0x10, 0x20, 0x30, 0x40, 0x00, 0x00, 0x00, 0x00];
+        let _ = ChecksumEngine::update_and_verify(&mut rom, "tacoma-can", 0);
+        assert_eq!(
+            PlatformSecurity::checksum_badge("tacoma-can", &rom, 0),
+            CHECKSUM_VALID
+        );
+        rom[0] = 0x11;
+        assert_eq!(
+            PlatformSecurity::checksum_badge("tacoma-can", &rom, 0),
+            CHECKSUM_UPDATED
+        );
+    }
 
     #[test]
     fn test_j2534_big_endian_frame_packing() {
