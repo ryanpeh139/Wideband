@@ -14,7 +14,7 @@
   Full path to your PassThru FunctionLibrary DLL (Mini-VCI / VXDIAG). When set, runs device_check.ps1.
 
 .EXAMPLE
-  .\scripts\Friday-CablePrep.ps1 -ReleaseDir .\target\release -DllPath "C:\Program Files (x86)\...\mvci.dll"
+  .\scripts\Friday-CablePrep.ps1 -ReleaseDir .\dist\windows-release -DllPath "C:\Program Files (x86)\...\mvci.dll"
 #>
 param(
     [string]$ReleaseDir = ".",

@@ -5,12 +5,13 @@
 .DESCRIPTION
   Output folder contains wideband.exe, J2534Host.exe, JSON configs, and profiles/.
   Run scripts\Friday-CablePrep.ps1 against that folder before truck day.
+  Staging defaults to <RepoRoot>\dist\windows-release (never cargo's target\release).
 
 .PARAMETER RepoRoot
   Wideband repository root (defaults to parent of this scripts folder).
 
 .PARAMETER OutDir
-  Staging directory (defaults to <RepoRoot>\target\release).
+  Staging directory (defaults to <RepoRoot>\dist\windows-release).
 
 .PARAMETER SkipCargo
   Skip `cargo build --release` (only rebuild/copy host + configs).
@@ -34,17 +35,40 @@ if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
 }
 
 if ([string]::IsNullOrWhiteSpace($OutDir)) {
-    $OutDir = Join-Path $RepoRoot "target\release"
-} else {
-    $OutDir = (Resolve-Path -LiteralPath $OutDir -ErrorAction SilentlyContinue)
-    if (-not $OutDir) {
-        New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-        $OutDir = (Resolve-Path $OutDir).Path
-    }
+    $OutDir = Join-Path $RepoRoot "dist\windows-release"
 }
+
+if (-not (Test-Path -LiteralPath $OutDir)) {
+    New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+}
+$OutDir = (Resolve-Path -LiteralPath $OutDir).Path
 
 function Write-Step($msg) {
     Write-Host ("==> " + $msg) -ForegroundColor Cyan
+}
+
+function Copy-ItemUnlessSamePath {
+    param(
+        [Parameter(Mandatory = $true)][string]$LiteralPath,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+    $srcFull = (Resolve-Path -LiteralPath $LiteralPath).Path
+    $dstFull = $null
+    if (Test-Path -LiteralPath $Destination) {
+        $dstFull = (Resolve-Path -LiteralPath $Destination).Path
+    } else {
+        $dstParent = Split-Path -Parent $Destination
+        if (-not [string]::IsNullOrWhiteSpace($dstParent) -and -not (Test-Path -LiteralPath $dstParent)) {
+            New-Item -ItemType Directory -Force -Path $dstParent | Out-Null
+        }
+        $leaf = Split-Path -Leaf $Destination
+        $dstFull = Join-Path ((Resolve-Path -LiteralPath (Split-Path -Parent $Destination)).Path) $leaf
+    }
+    if ([string]::Equals($srcFull, $dstFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-Host ("  skip copy (same path): " + $srcFull) -ForegroundColor DarkYellow
+        return
+    }
+    Copy-Item -LiteralPath $LiteralPath -Destination $Destination -Force
 }
 
 Write-Step "Repo: $RepoRoot"
@@ -88,7 +112,7 @@ if ($LASTEXITCODE -ne 0) { throw "J2534Host.exe --check-pack failed" }
 Write-Step "Copy configs and profiles"
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
-Copy-Item -LiteralPath $widebandSrc -Destination (Join-Path $OutDir "wideband.exe") -Force
+Copy-ItemUnlessSamePath -LiteralPath $widebandSrc -Destination (Join-Path $OutDir "wideband.exe")
 
 $configFiles = @(
     "security-config.json",
@@ -101,16 +125,25 @@ foreach ($name in $configFiles) {
     if (-not (Test-Path -LiteralPath $src)) {
         throw "Missing required file: $src"
     }
-    Copy-Item -LiteralPath $src -Destination (Join-Path $OutDir $name) -Force
+    Copy-ItemUnlessSamePath -LiteralPath $src -Destination (Join-Path $OutDir $name)
 }
 
 $profilesSrc = Join-Path $RepoRoot "profiles"
 $profilesDst = Join-Path $OutDir "profiles"
 if (Test-Path -LiteralPath $profilesSrc) {
+    $profilesSrcFull = (Resolve-Path -LiteralPath $profilesSrc).Path
+    $profilesDstFull = $null
     if (Test-Path -LiteralPath $profilesDst) {
-        Remove-Item -LiteralPath $profilesDst -Recurse -Force
+        $profilesDstFull = (Resolve-Path -LiteralPath $profilesDst).Path
     }
-    Copy-Item -LiteralPath $profilesSrc -Destination $profilesDst -Recurse -Force
+    if ($profilesDstFull -and [string]::Equals($profilesSrcFull, $profilesDstFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-Host ("  skip profiles copy (same path): " + $profilesSrcFull) -ForegroundColor DarkYellow
+    } else {
+        if (Test-Path -LiteralPath $profilesDst) {
+            Remove-Item -LiteralPath $profilesDst -Recurse -Force
+        }
+        Copy-Item -LiteralPath $profilesSrc -Destination $profilesDst -Recurse -Force
+    }
 } else {
     throw "profiles\ folder missing at $profilesSrc"
 }
@@ -119,6 +152,6 @@ Write-Host ""
 Write-Host "Windows release staged at:" -ForegroundColor Green
 Write-Host "  $OutDir"
 Write-Host ""
-Write-Host "Next: cd to that folder and run:" -ForegroundColor Yellow
-Write-Host "  .\..\..\scripts\Friday-CablePrep.ps1 -ReleaseDir `"$OutDir`""
+Write-Host "Next: from the repo root run:" -ForegroundColor Yellow
+Write-Host "  .\scripts\Friday-CablePrep.ps1 -ReleaseDir `"$OutDir`""
 Write-Host "  (or copy Friday-CablePrep.ps1 beside wideband.exe and run it there)"

@@ -1,4 +1,5 @@
 /target
+/dist
 /plugins/**/bin/*.so
 /plugins/**/bin/*.dll
 /plugins/**/bin/*.dylib

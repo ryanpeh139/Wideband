@@ -8,15 +8,15 @@ From the repo root on Windows:
 
 ```powershell
 .\scripts\Package-WindowsRelease.ps1
-.\scripts\Friday-CablePrep.ps1 -ReleaseDir .\target\release -DllPath "C:\path\to\your\PassThru.dll"
+.\scripts\Friday-CablePrep.ps1 -ReleaseDir .\dist\windows-release -DllPath "C:\path\to\your\PassThru.dll"
 ```
 
 `Package-WindowsRelease.ps1`:
 
-1. `cargo build --release`
+1. `cargo build --release` (binary lands in `target\release\`)
 2. Compiles `J2534Host.exe` with `csc.exe /platform:x86`
 3. Runs `J2534Host.exe --check-pack`
-4. Copies `wideband.exe`, JSON configs, `device_check.ps1`, and the full `profiles\` tree into `target\release\`
+4. Stages `wideband.exe`, JSON configs, `device_check.ps1`, and the full `profiles\` tree into `dist\windows-release\` (distinct from cargo's build output; same-path copies are skipped)
 
 `Friday-CablePrep.ps1` prints **PASS/FAIL** for each Friday blocker (host, configs, `profiles\tacoma-can.json`, registry J2534, optional DLL probe).
 
