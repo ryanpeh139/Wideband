@@ -1,12 +1,13 @@
 use crate::definitions::XdfDocument;
 use crate::j2534::{create_device, J2534DeviceInfo, J2534RegistryScanner, PassThruDevice};
 use crate::protocols::{ChecksumEngine, EcuIdentification, EcuIdentifier, EcuProfile, FlashDownload};
+use crate::surface_mesh;
 use crate::telemetry::TelemetryBuffer;
 use crate::theme::{
     self, paint_live_cell_glow, paint_studio_badge, studio_tab_button, ACCENT_CYAN, CARD_FILL,
     EMERALD, MUTED, STROKE, TEXT, heatmap_color,
 };
-use eframe::egui::{self, Color32, Pos2, Rect, Stroke, Vec2};
+use eframe::egui::{self, Color32, Pos2, Stroke, Vec2};
 use egui_extras::{Column, TableBuilder};
 use egui_plot::{Line, Plot, PlotPoints};
 use std::sync::{Arc, Mutex};
@@ -401,99 +402,147 @@ impl WidebandApp {
         // Left Parameter Tree
         egui::SidePanel::left("param_tree")
             .resizable(true)
-            .default_width(300.0)
-            .width_range(260.0..=380.0)
+            .default_width(260.0)
+            .width_range(200.0..=350.0)
             .frame(theme::panel_frame())
             .show(ctx, |ui| {
-                ui.add_space(2.0);
-                // Search input box with rounded corner and clean inset border
-                egui::Frame::none()
-                    .fill(theme::BG_FILL)
-                    .stroke(Stroke::new(1.0, STROKE))
-                    .rounding(egui::Rounding::same(4.0))
-                    .inner_margin(egui::Margin::symmetric(8.0, 5.0))
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("🔍").size(12.0).color(MUTED));
-                            let edit = egui::TextEdit::singleline(&mut self.search_query)
-                                .hint_text("Search parameters...")
-                                .frame(false)
-                                .desired_width(ui.available_width());
-                            ui.add(edit);
-                        });
-                    });
+                        ui.set_min_width(ui.available_width());
+                        ui.add_space(2.0);
+                        egui::Frame::none()
+                            .fill(theme::BG_FILL)
+                            .stroke(Stroke::new(1.0, STROKE))
+                            .rounding(egui::Rounding::same(4.0))
+                            .inner_margin(egui::Margin::symmetric(8.0, 5.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("🔍").size(12.0).color(MUTED));
+                                    let edit = egui::TextEdit::singleline(&mut self.search_query)
+                                        .hint_text("Search parameters...")
+                                        .frame(false)
+                                        .desired_width(ui.available_width());
+                                    ui.add(edit);
+                                });
+                            });
 
-                ui.add_space(6.0);
-                ui.separator();
-                ui.add_space(4.0);
-                ui.heading(egui::RichText::new("Calibration Tables").size(13.0).color(MUTED));
-                ui.add_space(4.0);
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.add_space(4.0);
 
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (idx, table) in self.xdf.tables.iter().enumerate() {
-                        if !self.search_query.is_empty()
-                            && !table.title.to_lowercase().contains(&self.search_query.to_lowercase())
-                        {
-                            continue;
-                        }
+                        egui::ScrollArea::both()
+                            .id_salt("param_tree_inner")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.heading(
+                                    egui::RichText::new("Calibration Tables").size(13.0).color(MUTED),
+                                );
+                                ui.add_space(4.0);
 
-                        let is_selected = self.selected_table_idx == idx;
-                        let badge = if table.y_axis.dim > 1 { "[3D]" } else { "[2D]" };
+                                for (idx, table) in self.xdf.tables.iter().enumerate() {
+                                    if !self.search_query.is_empty()
+                                        && !table
+                                            .title
+                                            .to_lowercase()
+                                            .contains(&self.search_query.to_lowercase())
+                                    {
+                                        continue;
+                                    }
 
-                        // 30px row height for breathing room
-                        ui.allocate_ui(Vec2::new(ui.available_width(), 30.0), |ui| {
-                            ui.horizontal_centered(|ui| {
-                                ui.add_space(2.0);
-                                ui.label(egui::RichText::new(badge).strong().color(ACCENT_CYAN));
-                                let title_color = if is_selected { TEXT } else { MUTED };
-                                if ui.selectable_label(is_selected, egui::RichText::new(&table.title).color(title_color)).clicked() {
-                                    self.selected_table_idx = idx;
-                                    self.active_cell = (0, 0);
+                                    let is_selected = self.selected_table_idx == idx;
+                                    let badge = if table.y_axis.dim > 1 { "[3D]" } else { "[2D]" };
+
+                                    ui.allocate_ui(Vec2::new(ui.available_width(), 30.0), |ui| {
+                                        ui.horizontal_centered(|ui| {
+                                            ui.add_space(2.0);
+                                            ui.label(
+                                                egui::RichText::new(badge).strong().color(ACCENT_CYAN),
+                                            );
+                                            let title_color = if is_selected { TEXT } else { MUTED };
+                                            if ui
+                                                .selectable_label(
+                                                    is_selected,
+                                                    egui::RichText::new(&table.title).color(title_color),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.selected_table_idx = idx;
+                                                self.active_cell = (0, 0);
+                                            }
+                                        });
+                                    });
+                                }
+
+                                ui.add_space(8.0);
+                                ui.separator();
+                                ui.add_space(4.0);
+                                ui.heading(
+                                    egui::RichText::new("Scalar Constants").size(13.0).color(MUTED),
+                                );
+                                ui.add_space(4.0);
+                                for c in &self.xdf.constants {
+                                    ui.allocate_ui(Vec2::new(ui.available_width(), 28.0), |ui| {
+                                        ui.horizontal_centered(|ui| {
+                                            ui.add_space(2.0);
+                                            ui.label(
+                                                egui::RichText::new("[1D]")
+                                                    .strong()
+                                                    .color(Color32::from_rgb(255, 193, 7)),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "{}: {:.0} {}",
+                                                    c.title, c.value, c.units
+                                                ))
+                                                .color(TEXT),
+                                            );
+                                        });
+                                    });
                                 }
                             });
-                        });
-                    }
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(4.0);
-                    ui.heading(egui::RichText::new("Scalar Constants").size(13.0).color(MUTED));
-                    ui.add_space(4.0);
-                    for c in &self.xdf.constants {
-                        ui.allocate_ui(Vec2::new(ui.available_width(), 28.0), |ui| {
-                            ui.horizontal_centered(|ui| {
-                                ui.add_space(2.0);
-                                ui.label(egui::RichText::new("[1D]").strong().color(Color32::from_rgb(255, 193, 7)));
-                                ui.label(
-                                    egui::RichText::new(format!("{}: {:.0} {}", c.title, c.value, c.units))
-                                        .color(TEXT),
-                                );
-                            });
-                        });
-                    }
-                });
+                    });
             });
 
         // Right 3D Isometric Surface Mesh
         egui::SidePanel::right("surface_mesh_panel")
             .resizable(true)
-            .default_width(380.0)
-            .width_range(320.0..=520.0)
+            .default_width(260.0)
+            .width_range(200.0..=350.0)
             .frame(theme::panel_frame())
             .show(ctx, |ui| {
                 ui.heading(egui::RichText::new("3D Surface Mesh").size(14.0).color(ACCENT_CYAN));
                 ui.label(egui::RichText::new("Drag to rotate pitch & yaw").small().color(MUTED));
                 ui.add_space(4.0);
 
-                let (response, painter) = ui.allocate_painter(Vec2::new(ui.available_width(), 310.0), egui::Sense::drag());
+                let avail = ui.available_size();
+                let telemetry_reserve = 128.0;
+                let mesh_size = Vec2::new(
+                    avail.x.max(120.0),
+                    (avail.y - telemetry_reserve).max(140.0),
+                );
+                let (response, painter) =
+                    ui.allocate_painter(mesh_size, egui::Sense::drag());
                 if response.dragged() {
                     self.mesh_yaw += response.drag_delta().x * 0.01;
                     self.mesh_pitch = (self.mesh_pitch + response.drag_delta().y * 0.01).clamp(0.1, 1.4);
                 }
 
-                self.render_3d_mesh(&painter, response.rect);
+                if !self.xdf.tables.is_empty() {
+                    let table = &self.xdf.tables[self.selected_table_idx];
+                    surface_mesh::paint_surface_mesh(
+                        &painter,
+                        response.rect,
+                        table,
+                        self.mesh_yaw,
+                        self.mesh_pitch,
+                        self.active_cell,
+                    );
+                } else {
+                    painter.rect_filled(response.rect, 4.0, theme::BG_FILL);
+                }
 
-                ui.add_space(12.0);
+                ui.add_space(8.0);
 
                 // Telemetry card styling: #11151C background, 1px #30363D border, bright cyan #00E5FF numbers
                 egui::Frame::none()
@@ -576,7 +625,7 @@ impl WidebandApp {
                 ui.separator();
                 ui.add_space(6.0);
 
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("Math Step:").strong().color(TEXT));
                     ui.add(egui::DragValue::new(&mut self.math_amount).speed(0.5).range(0.1..=100.0));
 
@@ -586,13 +635,12 @@ impl WidebandApp {
                     if ui.button("  -  ").clicked() {
                         self.run_table_math('-');
                     }
-                    if ui.button("  *  ").clicked() {
-                        self.run_table_math('*');
+                    if ui.button("  %  ").clicked() {
+                        self.run_table_math('%');
                     }
                     if ui.button("  =  ").clicked() {
                         self.run_table_math('=');
                     }
-                    ui.separator();
                     if ui.button("Interpolate Row").clicked() {
                         self.interpolate_active_row();
                     }
@@ -605,7 +653,12 @@ impl WidebandApp {
                 egui::ScrollArea::both()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        self.render_table_grid(ui);
+                        egui::ScrollArea::both()
+                            .id_salt("tune_grid_inner")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                self.render_table_grid(ui);
+                            });
                     });
             });
     }
@@ -712,83 +765,6 @@ impl WidebandApp {
             });
     }
 
-    fn render_3d_mesh(&self, painter: &egui::Painter, rect: Rect) {
-        painter.rect_filled(rect, 4.0, theme::BG_FILL);
-        painter.rect_stroke(rect, 4.0, Stroke::new(1.0, STROKE));
-
-        if self.xdf.tables.is_empty() {
-            return;
-        }
-
-        let table = &self.xdf.tables[self.selected_table_idx];
-        let rows = table.values.len();
-        let cols = table.values[0].len();
-
-        let mut min_val = f64::MAX;
-        let mut max_val = f64::MIN;
-        for r in 0..rows {
-            for c in 0..cols {
-                min_val = min_val.min(table.values[r][c]);
-                max_val = max_val.max(table.values[r][c]);
-            }
-        }
-
-        let center = rect.center();
-        let scale_x = (rect.width() * 0.35) / cols as f32;
-        let scale_y = (rect.height() * 0.35) / rows as f32;
-        let z_height = 80.0;
-
-        let cos_yaw = self.mesh_yaw.cos();
-        let sin_yaw = self.mesh_yaw.sin();
-        let cos_pitch = self.mesh_pitch.cos();
-        let sin_pitch = self.mesh_pitch.sin();
-
-        let project = |r: usize, c: usize| -> (Pos2, Color32) {
-            let x0 = (c as f32 - cols as f32 * 0.5) * scale_x;
-            let y0 = (r as f32 - rows as f32 * 0.5) * scale_y;
-            let val = table.values[r][c];
-            let norm_z = if max_val > min_val {
-                ((val - min_val) / (max_val - min_val)) as f32
-            } else {
-                0.5
-            };
-            let z0 = (norm_z - 0.5) * z_height;
-
-            // 3D rotation: Yaw around Z, Pitch around X
-            let rx = x0 * cos_yaw - y0 * sin_yaw;
-            let ry = x0 * sin_yaw + y0 * cos_yaw;
-            let rz = z0 * cos_pitch - ry * sin_pitch;
-
-            let screen_pos = Pos2::new(center.x + rx, center.y - rz);
-            let color = heatmap_color(val, min_val, max_val);
-            (screen_pos, color)
-        };
-
-        // Render quads and wireframe lines
-        for r in 0..rows - 1 {
-            for c in 0..cols - 1 {
-                let (p00, c00) = project(r, c);
-                let (p10, _) = project(r + 1, c);
-                let (p11, _) = project(r + 1, c + 1);
-                let (p01, _) = project(r, c + 1);
-
-                // Quad fill
-                painter.add(egui::Shape::convex_polygon(
-                    vec![p00, p10, p11, p01],
-                    Color32::from_rgba_unmultiplied(c00.r(), c00.g(), c00.b(), 180),
-                    Stroke::new(1.0_f32, Color32::from_rgb(20, 24, 30)),
-                ));
-            }
-        }
-
-        // Highlight active cell marker on 3D surface
-        let (r_active, c_active) = self.active_cell;
-        if r_active < rows && c_active < cols {
-            let (pos, _) = project(r_active, c_active);
-            painter.circle_filled(pos, 5.0, Color32::from_rgb(0, 229, 255));
-            painter.circle_stroke(pos, 8.0, Stroke::new(2.0_f32, Color32::WHITE));
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

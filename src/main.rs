@@ -2,6 +2,7 @@ pub mod definitions;
 pub mod j2534;
 pub mod protocols;
 pub mod telemetry;
+pub mod surface_mesh;
 pub mod theme;
 pub mod ui;
 
