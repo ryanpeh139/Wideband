@@ -3787,8 +3787,20 @@ dependencies = [
  "roxmltree",
  "serde",
  "serde_json",
+ "wideband-plugin-api",
  "winreg",
 ]
+
+[[package]]
+name = "wideband-noop"
+version = "0.1.0"
+dependencies = [
+ "wideband-plugin-api",
+]
+
+[[package]]
+name = "wideband-plugin-api"
+version = "0.1.0"
 
 [[package]]
 name = "widestring"

@@ -1,0 +1,9 @@
+[package]
+name = "wideband-plugin-api"
+version = "0.1.0"
+edition = "2021"
+description = "Stable C ABI for Wideband community plugins (cdylib)"
+
+[lib]
+name = "wideband_plugin_api"
+path = "src/lib.rs"

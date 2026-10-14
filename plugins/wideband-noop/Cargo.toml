@@ -1,0 +1,11 @@
+[package]
+name = "wideband-noop"
+version = "0.1.0"
+edition = "2021"
+description = "Sample no-op Wideband plugin (cdylib) for CI and pack authors"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wideband-plugin-api = { path = "../wideband-plugin-api" }

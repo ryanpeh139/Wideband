@@ -16,6 +16,11 @@ jobs:
           toolchain: 1.88.0
       - name: cargo build
         run: cargo build --locked
+      - name: Build sample plugin
+        run: |
+          cargo build -p wideband-noop --locked
+          mkdir -p plugins/wideband-noop/bin
+          cp target/debug/libwideband_noop.so plugins/wideband-noop/bin/
       - name: cargo test
         run: cargo test --locked -- --test-threads=1
       - name: Install Windows GNU target

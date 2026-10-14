@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<XDFFORMAT version="1.60">
+  <XDFHEADER>
+    <deftitle>Tacoma Bench VE Slice</deftitle>
+  </XDFHEADER>
+  <XDFTABLE uniqueid="ve_bench">
+    <title>Bench VE (2x2)</title>
+    <description>Synthetic Tacoma/Denso bench table for unit tests</description>
+    <XDFAXIS id="x">
+      <indexcount>2</indexcount>
+      <units>RPM</units>
+      <MATH equation="X * 100" />
+      <EMBEDDEDDATA mmedaddress="0x108" mmedelementsizebits="8" />
+    </XDFAXIS>
+    <XDFAXIS id="y">
+      <indexcount>2</indexcount>
+      <units>kPa</units>
+      <MATH equation="X * 10" />
+      <EMBEDDEDDATA mmedaddress="0x110" mmedelementsizebits="8" />
+    </XDFAXIS>
+    <XDFAXIS id="z">
+      <units>%</units>
+      <MATH equation="X" />
+      <EMBEDDEDDATA mmedaddress="0x100" mmedelementsizebits="8" />
+    </XDFAXIS>
+  </XDFTABLE>
+  <XDFCONSTANT uniqueid="rev_bench">
+    <title>Rev Limit</title>
+    <units>RPM</units>
+    <MATH equation="X * 32" />
+    <EMBEDDEDDATA mmedaddress="0x120" mmedelementsizebits="8" />
+  </XDFCONSTANT>
+  <XDFFLAG uniqueid="vvt_bench">
+    <title>VVT Enable</title>
+    <mask>0x01</mask>
+    <EMBEDDEDDATA mmedaddress="0x130" mmedelementsizebits="8" />
+  </XDFFLAG>
+</XDFFORMAT>

@@ -1,0 +1,5 @@
+{
+  "plugin_version": 1,
+  "id": "wideband-noop",
+  "library": "wideband_noop"
+}

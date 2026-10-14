@@ -1,0 +1,20 @@
+{
+  "pack_version": 1,
+  "id": "tacoma-can-bench",
+  "title": "Tacoma CAN bench calibration (community sample)",
+  "profile_ids": ["tacoma-can"],
+  "primary": "calibration",
+  "files": [
+    {
+      "id": "calibration",
+      "role": "xdf",
+      "path": "calibration.xdf"
+    },
+    {
+      "id": "logger",
+      "role": "ini",
+      "path": "logger.ini",
+      "optional": true
+    }
+  ]
+}

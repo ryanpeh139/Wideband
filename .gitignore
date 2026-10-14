@@ -1,4 +1,7 @@
 /target
+/plugins/**/bin/*.so
+/plugins/**/bin/*.dll
+/plugins/**/bin/*.dylib
 /mingw_compat
 *.pdb
 startup-error.txt
