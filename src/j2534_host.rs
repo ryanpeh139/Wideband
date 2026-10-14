@@ -3,7 +3,7 @@
 
 #[cfg(windows)]
 mod imp {
-    use super::super::j2534::{PassThruDevice, PassThruMsg};
+    use super::super::j2534::{PassThruDevice, PassThruMsg, CAN, ISO15765};
     use serde_json::Value;
     use std::io::{BufRead, BufReader, Write};
     use std::path::{Path, PathBuf};
@@ -24,6 +24,7 @@ mod imp {
         connect_extended: bool,
         connect_filter_id: u32,
         connect_filter_mask: u32,
+        active_protocol: u32,
     }
 
     impl HostPassThruDevice {
@@ -42,6 +43,7 @@ mod imp {
                 connect_extended: false,
                 connect_filter_id: 0x7E8,
                 connect_filter_mask: 0x7FF,
+                active_protocol: 5,
             }
         }
 
@@ -95,6 +97,10 @@ mod imp {
 
         fn is_tx_full(v: &Value) -> bool {
             v.get("full").and_then(|b| b.as_bool()) == Some(true)
+        }
+
+        fn is_can_protocol(&self) -> bool {
+            self.active_protocol == ISO15765 || self.active_protocol == CAN
         }
     }
 
@@ -175,6 +181,7 @@ mod imp {
             let resp = self.command(&line, 15_000)?;
             Self::require_ok(&resp)?;
             self.channel_id = resp.get("channel_id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            self.active_protocol = protocol;
             self.extended = self.connect_extended && protocol == 5;
             if protocol == 5 {
                 let filter_line = format!(
@@ -201,10 +208,13 @@ mod imp {
             if resp.get("empty").and_then(|v| v.as_bool()) == Some(true) {
                 return Ok(Vec::new());
             }
-            let id_hex = resp.get("id").and_then(|v| v.as_str()).unwrap_or("0");
-            let id = u32::from_str_radix(id_hex, 16).unwrap_or(0);
             let data_hex = resp.get("data").and_then(|v| v.as_str()).unwrap_or("");
             let payload = hex_to_bytes(data_hex);
+            if !self.is_can_protocol() {
+                return Ok(vec![PassThruMsg::new(self.active_protocol, &payload)]);
+            }
+            let id_hex = resp.get("id").and_then(|v| v.as_str()).unwrap_or("0");
+            let id = u32::from_str_radix(id_hex, 16).unwrap_or(0);
             let mut msg = PassThruMsg::new_can(id, &[]);
             msg.write_id(id);
             let len = payload.len().min(4124);
@@ -216,9 +226,18 @@ mod imp {
         fn write_msgs(&mut self, _channel: u32, msgs: &[PassThruMsg], timeout_ms: u32) -> Result<u32, String> {
             let mut count = 0u32;
             for msg in msgs {
-                let id = msg.read_id();
-                let payload = msg.payload();
-                let line = format!("WRITE {:X} {}", id, bytes_to_hex(payload));
+                let line = if self.is_can_protocol() {
+                    let id = msg.read_id();
+                    let payload = msg.payload();
+                    format!("WRITE {:X} {}", id, bytes_to_hex(payload))
+                } else {
+                    let raw = if msg.protocol_id == ISO15765 || msg.protocol_id == CAN {
+                        msg.payload()
+                    } else {
+                        &msg.data[..msg.data_size as usize]
+                    };
+                    format!("WRITE {}", bytes_to_hex(raw))
+                };
                 let mut attempts = 0u32;
                 while attempts < 8 {
                     let resp = self.command(&line, timeout_ms.max(1000))?;
@@ -251,6 +270,14 @@ mod imp {
 
         fn ioctl(&mut self, _channel: u32, _ioctl_id: u32, _input: &[u8]) -> Result<Vec<u8>, String> {
             Ok(vec![])
+        }
+
+        fn kline_fast_init(&mut self, _channel: u32, frame: &[u8]) -> Result<Vec<u8>, String> {
+            let line = format!("INIT {}", bytes_to_hex(frame));
+            let resp = self.command(&line, 15_000)?;
+            Self::require_ok(&resp)?;
+            let data_hex = resp.get("data").and_then(|v| v.as_str()).unwrap_or("");
+            Ok(hex_to_bytes(data_hex))
         }
 
         fn is_connected(&self) -> bool {

@@ -355,13 +355,6 @@ impl EcuIdentifier {
         let mut id = EcuIdentification::default();
         let mut field_errors: Vec<String> = Vec::new();
 
-        if profile.bus != VehicleBus::CanIsoTp {
-            return Err(format!(
-                "ECU identify over {} is not implemented yet — connect a CAN ISO-TP profile.",
-                profile.name
-            ));
-        }
-
         let mut client = UdsClient::for_profile(device, channel, profile);
 
         // 1. VIN: OBD Mode 09 02 or UDS 22 F1 90
