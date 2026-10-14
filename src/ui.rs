@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use crate::simple_ux::SimpleUxState;
+use crate::live_trace;
 use crate::surface_mesh;
 use crate::telemetry::{decode_channel_value, TelemetryBuffer, TelemetryChannelFile, TelemetryFrame};
 use crate::telemetry_playback::{
@@ -81,11 +82,15 @@ pub struct WidebandApp {
     pub favorites_path: PathBuf,
     pub favorites_only: bool,
     pub active_cell: (usize, usize),
+    /// Live operating point on the selected table (separate from the edit selection).
+    pub live_trace: live_trace::LiveTrace,
     pub math_amount: f64,
     pub checksum_status: String,
     pub active_rom: Vec<u8>,
     pub rom_origin: i64,
     pub rom_path: Option<PathBuf>,
+    /// `active_rom` holds a stock read from the ECU (no file path, but real data).
+    pub rom_from_ecu: bool,
     pub xdf_path: Option<PathBuf>,
     pub definition_catalog: DefinitionPackCatalog,
     pub definition_pack_label: String,
@@ -199,11 +204,13 @@ impl WidebandApp {
             favorites_path,
             favorites_only: false,
             active_cell: (0, 0),
+            live_trace: live_trace::LiveTrace::default(),
             math_amount: 5.0,
             checksum_status: CHECKSUM_VALID.to_string(),
             active_rom: rom,
             rom_origin: 0,
             rom_path: None,
+            rom_from_ecu: false,
             xdf_path: None,
             definition_catalog,
             definition_pack_label: String::new(),
@@ -328,6 +335,11 @@ impl WidebandApp {
         self.stock_flags = self.xdf.flags.iter().map(|f| f.is_set).collect();
     }
 
+    /// True while `active_rom` is still the startup 0xFF buffer (no file opened, no stock read).
+    pub(crate) fn rom_is_placeholder(&self) -> bool {
+        self.rom_path.is_none() && !self.rom_from_ecu
+    }
+
     pub(crate) fn refresh_checksum_badge(&mut self) {
         let prof = &self.profiles[self.selected_profile_idx];
         self.checksum_status =
@@ -398,6 +410,7 @@ impl WidebandApp {
                     self.tcm_param_view = build_parameter_view(&self.xdf);
                     self.selected_table_idx = 0;
                     self.active_cell = (0, 0);
+                    self.live_trace.clear();
                     let label = path.file_name().unwrap_or_default().to_string_lossy().to_string();
                     self.xdf_path = Some(path);
                     self.xdf.bind_from_rom(&self.active_rom, self.rom_origin);
@@ -614,6 +627,7 @@ impl WidebandApp {
 
     pub fn disconnect_cable(&mut self) {
         self.idle_tester_present.disarm();
+        self.live_trace.clear();
         if let Some(mut dev) = self.active_device.take() {
             let _ = dev.close();
             self.is_connected = false;
@@ -765,6 +779,13 @@ impl WidebandApp {
         if !self.is_connected || !self.live_poller_active || self.is_flashing {
             return;
         }
+        // The J2534Host bridge closes itself when the host/DLL hangs or exits; reflect that in
+        // the UI instead of polling a dead session forever.
+        if self.active_device.as_ref().map_or(false, |d| !d.is_connected()) {
+            self.log("Cable session lost (J2534Host closed or not responding). Reconnect to continue.");
+            self.disconnect_cable();
+            return;
+        }
 
         let tick = {
             let buf = self.telemetry.lock().unwrap();
@@ -821,36 +842,21 @@ impl WidebandApp {
                     buf.bus_fail_count += 1;
                 }
             }
-            {
+            let live_pos = {
                 let mut buf = self.telemetry.lock().unwrap();
                 self.trace_rpm = buf.value("rpm");
                 self.trace_map = buf.value("map");
                 buf.push_frame();
-            }
-
-            // Update tracked active cell in active table
-            if !self.xdf.tables.is_empty() {
-                let table = &self.xdf.tables[self.selected_table_idx];
-                let mut best_col = 0;
-                let mut min_diff_x = f32::MAX;
-                for (c, &lbl) in table.x_axis.labels.iter().enumerate() {
-                    let diff = (lbl as f32 - self.trace_rpm).abs();
-                    if diff < min_diff_x {
-                        min_diff_x = diff;
-                        best_col = c;
-                    }
-                }
-
-                let mut best_row = 0;
-                let mut min_diff_y = f32::MAX;
-                for (r, &lbl) in table.y_axis.labels.iter().enumerate() {
-                    let diff = (lbl as f32 - self.trace_map).abs();
-                    if diff < min_diff_y {
-                        min_diff_y = diff;
-                        best_row = r;
-                    }
-                }
-                self.active_cell = (best_row, best_col);
+                // Live operating point on the selected table. Deliberately NOT written to
+                // `active_cell`: that is the user's edit selection, and math ops write to it.
+                self.xdf
+                    .tables
+                    .get(self.selected_table_idx)
+                    .and_then(|t| live_trace::table_position(t, |id| buf.value(id)))
+            };
+            match live_pos {
+                Some(pos) => self.live_trace.push(pos, now),
+                None => self.live_trace.clear(),
             }
         }
     }
@@ -1074,6 +1080,9 @@ impl WidebandApp {
     }
 
     fn paint_live_telemetry_card(&self, ui: &mut egui::Ui) {
+        let live = self.is_connected && self.live_poller_active && !self.is_flashing;
+        let table = self.xdf.tables.get(self.selected_table_idx);
+        let live_pos = self.live_trace.current();
         egui::Frame::none()
             .fill(CARD_FILL)
             .stroke(Stroke::new(1.0, STROKE))
@@ -1081,44 +1090,46 @@ impl WidebandApp {
             .inner_margin(egui::Margin::symmetric(10.0, 8.0))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                ui.columns(2, |cols| {
-                    cols[0].label(
-                        egui::RichText::new("Live cell tracking")
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Live operating point")
                             .size(11.0)
                             .strong()
                             .color(MUTED),
                     );
-                    cols[1].with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(egui::RichText::new("● LIVE").size(11.0).strong().color(EMERALD));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (txt, col) = if live { ("\u{25CF} LIVE", EMERALD) } else { ("IDLE", MUTED) };
+                        ui.label(egui::RichText::new(txt).size(11.0).strong().color(col));
                     });
                 });
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new("Engine RPM").size(10.0).color(MUTED));
-                ui.label(
-                    egui::RichText::new(format!("{:.0}", self.trace_rpm))
-                        .size(14.0)
-                        .monospace()
-                        .strong()
-                        .color(ACCENT_CYAN),
-                );
-                ui.add_space(2.0);
-                ui.label(egui::RichText::new("MAP").size(10.0).color(MUTED));
-                ui.label(
-                    egui::RichText::new(format!("{:.1} kPa", self.trace_map))
-                        .size(14.0)
-                        .monospace()
-                        .strong()
-                        .color(ACCENT_CYAN),
-                );
-                ui.add_space(2.0);
-                ui.label(egui::RichText::new("Active tracked cell").size(10.0).color(MUTED));
-                ui.label(
-                    egui::RichText::new(format!("Row {}, Col {}", self.active_cell.0, self.active_cell.1))
-                        .size(12.0)
-                        .monospace()
-                        .strong()
-                        .color(ACCENT_CYAN),
-                );
+                ui.add_space(4.0);
+                let stat = |ui: &mut egui::Ui, name: &str, value: String, color: Color32| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(name).size(10.0).color(MUTED));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(egui::RichText::new(value).size(13.0).monospace().strong().color(color));
+                        });
+                    });
+                };
+                let dim = |v: String| if live { v } else { "--".to_string() };
+                stat(ui, "Engine RPM", dim(format!("{:.0}", self.trace_rpm)), ACCENT_CYAN);
+                stat(ui, "MAP", dim(format!("{:.1} kPa", self.trace_map)), ACCENT_CYAN);
+                let live_txt = match (live_pos, table) {
+                    (Some((r, c)), Some(t)) => {
+                        let (nr, nc) = live_trace::nearest_cell((r, c));
+                        let v = t.values.get(nr).and_then(|row| row.get(nc)).copied().unwrap_or(0.0);
+                        format!("R{:.1} C{:.1} = {:.1}", r, c, v)
+                    }
+                    _ if live => "axes not logged".to_string(),
+                    _ => "--".to_string(),
+                };
+                stat(ui, "Live cell", live_txt, EMERALD);
+                let (sr, sc) = self.active_cell;
+                let sel_val = table
+                    .and_then(|t| t.values.get(sr).and_then(|row| row.get(sc)).copied())
+                    .map(|v| format!(" = {:.1}", v))
+                    .unwrap_or_default();
+                stat(ui, "Selected (edit)", format!("R{} C{}{}", sr, sc, sel_val), ACCENT_CYAN);
             });
     }
 
@@ -1358,6 +1369,7 @@ impl WidebandApp {
                                                 .clicked()
                                             {
                                                 self.selected_table_idx = idx;
+                                                self.live_trace.clear();
                                                 self.active_cell = (0, 0);
                                             }
                                         });
@@ -1488,6 +1500,7 @@ impl WidebandApp {
                         self.mesh_zoom,
                         self.active_cell,
                         hover_cell,
+                        &self.live_trace.trail(Instant::now()),
                     );
                     if response.clicked() {
                         if let Some(cell) = hover_cell {
@@ -1585,6 +1598,24 @@ impl WidebandApp {
                 let table_desc = self.xdf.tables[self.selected_table_idx].description.clone();
                 let z_units = self.xdf.tables[self.selected_table_idx].z_units.clone();
 
+                if self.rom_is_placeholder() {
+                    egui::Frame::none()
+                        .fill(Color32::from_rgb(255, 152, 0).gamma_multiply(0.12))
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(255, 152, 0)))
+                        .rounding(egui::Rounding::same(4.0))
+                        .inner_margin(egui::Margin::symmetric(8.0, 5.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    "No ROM loaded - values and axes below are decoded from a blank (0xFF) buffer, not a calibration. Open a .bin/.cuw or Read Stock ROM.",
+                                )
+                                .small()
+                                .color(Color32::from_rgb(255, 196, 120)),
+                            );
+                        });
+                    ui.add_space(6.0);
+                }
+
                 ui.horizontal_wrapped(|ui| {
                     ui.heading(egui::RichText::new(&table_title).size(16.0).color(TEXT));
                     ui.label(egui::RichText::new(format!("({})", z_units)).color(ACCENT_CYAN));
@@ -1650,6 +1681,7 @@ impl WidebandApp {
         let y_labels = table.y_axis.labels.clone();
         let rows = table.values.len();
         let cols = table.values[0].len();
+        let live_cell = self.live_trace.current().map(live_trace::nearest_cell);
 
         // Calculate Min/Max for heatmap
         let mut min_val = f64::MAX;
@@ -1710,7 +1742,8 @@ impl WidebandApp {
                             let val = self.xdf.tables[self.selected_table_idx].values[r][c];
                             let stock_val = if r < stock.len() && c < stock[r].len() { stock[r][c] } else { val };
                             let is_delta = cell_changed(val, stock_val);
-                            let is_tracked = self.active_cell == (r, c);
+                            let is_selected = self.active_cell == (r, c);
+                            let is_live = live_cell == Some((r, c));
 
                             let bg_color = heatmap_color(val, min_val, max_val);
                             let text_color = Color32::from_rgb(0xFF, 0xFF, 0xFF);
@@ -1730,12 +1763,15 @@ impl WidebandApp {
                                     );
                                 }
 
-                                if is_tracked {
+                                if is_live {
+                                    theme::paint_operating_cell_glow(painter, rect);
+                                }
+                                if is_selected {
                                     paint_live_cell_glow(painter, rect);
                                 }
 
                                 let response = ui.selectable_label(
-                                    is_tracked,
+                                    is_selected,
                                     egui::RichText::new(cell_text)
                                         .monospace()
                                         .strong()
@@ -2986,6 +3022,7 @@ impl WidebandApp {
             match read_res {
                 Ok(stock) => {
                     self.active_rom = stock.bytes;
+                    self.rom_from_ecu = true;
                     self.rom_origin = stock.origin;
                     self.xdf.bind_from_rom(&self.active_rom, self.rom_origin);
                     self.refresh_stock_baseline();

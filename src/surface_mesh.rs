@@ -4,7 +4,7 @@
 //! of rotated space looking toward +Y, screen X = rotated X, screen up = rotated Z.
 
 use crate::definitions::XdfTable;
-use crate::theme::{heatmap_color, ACCENT_CYAN, BG_FILL, MUTED, STROKE, TEXT};
+use crate::theme::{heatmap_color, ACCENT_CYAN, BG_FILL, EMERALD, MUTED, STROKE, TEXT};
 use eframe::egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Shape, Stroke, Vec2};
 
 /// Max screen distance (px) from a vertex for hover / click picking.
@@ -320,6 +320,20 @@ impl<'a> MeshScene<'a> {
         display_z_norm(raw, self.z_soften)
     }
 
+    /// Surface point at a fractional `(row, col)`, bilinear like the ECU's own table lookup.
+    fn surface_point(&self, row: f32, col: f32) -> Vec3 {
+        let row = row.clamp(0.0, (self.rows - 1) as f32);
+        let col = col.clamp(0.0, (self.cols - 1) as f32);
+        let r0 = (row.floor() as usize).min(self.rows - 2);
+        let c0 = (col.floor() as usize).min(self.cols - 2);
+        let (tr, tc) = (row - r0 as f32, col - c0 as f32);
+        let z = |r, c| self.z_norm(r, c);
+        let top = z(r0, c0) * (1.0 - tc) + z(r0, c0 + 1) * tc;
+        let bot = z(r0 + 1, c0) * (1.0 - tc) + z(r0 + 1, c0 + 1) * tc;
+        let zn = top * (1.0 - tr) + bot * tr;
+        self.proj.model_point(col, row, zn, self.cols, self.rows)
+    }
+
     fn floor_z(&self) -> f32 {
         display_z_norm(0.0, self.z_soften)
     }
@@ -393,6 +407,7 @@ pub fn paint_surface_mesh(
     zoom: f32,
     active_cell: (usize, usize),
     hover_cell: Option<(usize, usize)>,
+    live_trail: &[((f32, f32), f32)],
 ) {
     painter.rect_filled(rect, 4.0, BG_FILL);
     painter.rect_stroke(rect, 4.0, Stroke::new(1.0, STROKE));
@@ -467,8 +482,9 @@ pub fn paint_surface_mesh(
     }
 
     // 3. Overlays.
+    let mut placed = Vec::new();
     for (anchor, label, color) in &axis_labels {
-        paint_axis_label(&clip, *anchor, label, *color);
+        paint_axis_label_avoiding(&clip, *anchor, label, *color, &mut placed);
     }
     if let Some(cell) = hover_cell {
         if cell != active_cell {
@@ -476,6 +492,7 @@ pub fn paint_surface_mesh(
         }
     }
     paint_cell_marker(&scene, &clip, active_cell, ACCENT_CYAN, true);
+    paint_live_trail(&scene, &clip, live_trail);
     paint_readout(&scene, &clip, rect, hover_cell.unwrap_or(active_cell), hover_cell.is_some());
 
     let mut badge = format!("{:.0}%", zoom * 100.0);
@@ -518,14 +535,42 @@ fn paint_floor_grid(scene: &MeshScene, painter: &Painter) {
 
 /// Boxed label, shifted so it stays fully inside the mesh viewport.
 fn paint_axis_label(painter: &Painter, anchor: Pos2, label: &str, color: Color32) {
+    paint_axis_label_avoiding(painter, anchor, label, color, &mut Vec::new());
+}
+
+/// Like [`paint_axis_label`], but nudged vertically off any rect in `placed` (then added to it),
+/// so axis labels that project to the same corner don't stack on top of each other.
+fn paint_axis_label_avoiding(
+    painter: &Painter,
+    anchor: Pos2,
+    label: &str,
+    color: Color32,
+    placed: &mut Vec<Rect>,
+) {
     let font = FontId::proportional(10.0);
     let galley = painter.layout_no_wrap(label.into(), font, color);
     let bounds = painter.clip_rect().shrink(4.0);
     let size = galley.size();
-    let x = anchor.x.min(bounds.right() - size.x).max(bounds.left());
-    let y = anchor.y.min(bounds.bottom() - size.y).max(bounds.top());
-    let anchor = Pos2::new(x, y);
+    let clamp = |p: Pos2| {
+        Pos2::new(
+            p.x.min(bounds.right() - size.x).max(bounds.left()),
+            p.y.min(bounds.bottom() - size.y).max(bounds.top()),
+        )
+    };
+    let base = clamp(anchor);
+    let mut anchor = base;
+    let step = size.y + 8.0;
+    for attempt in 0..6 {
+        let r = Rect::from_min_size(anchor, size).expand(3.0);
+        if !placed.iter().any(|p| p.intersects(r)) {
+            break;
+        }
+        // Alternate below / above the original spot: +1, -1, +2, -2, ...
+        let k = (attempt / 2 + 1) as f32 * if attempt % 2 == 0 { 1.0 } else { -1.0 };
+        anchor = clamp(base + Vec2::new(0.0, step * k));
+    }
     let rect = Rect::from_min_size(anchor, size).expand(3.0);
+    placed.push(rect);
     painter.rect_filled(rect, 2.0, BG_FILL.gamma_multiply(0.92));
     painter.rect_stroke(rect, 2.0, Stroke::new(1.0, STROKE.gamma_multiply(0.8)));
     painter.galley(anchor, galley, color);
@@ -611,6 +656,36 @@ fn paint_cell_marker(
     } else {
         painter.circle_stroke(pos, 5.5, Stroke::new(1.5, color));
     }
+}
+
+/// Live operating point: fading green trail riding the surface, bright head = now.
+/// Drawn over the mesh (an overlay like the cursor), lifted slightly so it never z-fights.
+fn paint_live_trail(scene: &MeshScene, painter: &Painter, trail: &[((f32, f32), f32)]) {
+    if trail.is_empty() {
+        return;
+    }
+    let lift = Vec3::new(0.0, 0.0, scene.proj.scale_z * 0.015);
+    let screen: Vec<(Pos2, f32)> = trail
+        .iter()
+        .map(|&((r, c), age)| {
+            let p = scene.surface_point(r, c);
+            let (s, _) = scene.proj.project(Vec3::new(p.x + lift.x, p.y + lift.y, p.z + lift.z));
+            (s, age)
+        })
+        .collect();
+    for w in screen.windows(2) {
+        let fade = 1.0 - w[1].1;
+        painter.line_segment(
+            [w[0].0, w[1].0],
+            Stroke::new(1.0 + 2.0 * fade, EMERALD.gamma_multiply(0.15 + 0.85 * fade)),
+        );
+    }
+    let (head, _) = *screen.last().unwrap();
+    let (r, c) = trail.last().unwrap().0;
+    let (base, _) = scene.proj.project(scene.floor_point(c, r));
+    painter.line_segment([base, head], Stroke::new(1.0, EMERALD.gamma_multiply(0.4)));
+    painter.circle_filled(head, 5.0, EMERALD);
+    painter.circle_stroke(head, 8.5, Stroke::new(1.5, EMERALD.gamma_multiply(0.5)));
 }
 
 /// Bottom-left readout: `X × Y → value` for the hovered (or selected) cell.
