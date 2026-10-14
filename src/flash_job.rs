@@ -60,7 +60,14 @@ impl FlashJob {
         device_label: &str,
         audit: &FlashAuditLog,
         mut progress: impl FnMut(f32, &str),
+        require_production_security: bool,
     ) -> Result<(), String> {
+        if require_production_security && !crate::security_config::PlatformSecurity::security_key_configured_for_profile(&profile.id) {
+            return Err(format!(
+                "Flash refused: no production security-config seed-key for {}. Configure security-config.json before writing to a real ECU.",
+                profile.name
+            ));
+        }
         let segments = layout.cal_segments(&profile.id)?;
         let mut client = UdsClient::for_profile(device, channel, profile);
         ProgrammingSession::unlock(&mut client, device, profile)?;

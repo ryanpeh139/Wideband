@@ -207,3 +207,26 @@ fn extended_wait(p2_star_ms: u32) -> u32 {
         p2_star_ms
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::isotp::mock::ScriptCan;
+    use crate::protocols::EcuProfile;
+
+    #[test]
+    fn uds_handles_response_pending_nrc() {
+        let mut dev = ScriptCan::new(0x7E0, 0x7E8);
+        dev.enqueue_rx(&[0x03, 0x7F, 0x10, 0x78, 0xAA, 0xAA, 0xAA, 0xAA]);
+        dev.enqueue_rx(&[0x06, 0x50, 0x03, 0x00, 0x32, 0x01, 0xF4, 0xAA]);
+
+        let prof = EcuProfile::tacoma_can();
+        let mut client = UdsClient::for_profile(&mut dev, 1, &prof);
+        client.set_timers(200, 200);
+        let (p2, p2_star) = client
+            .diagnostic_session_control(&mut dev, 0x03)
+            .expect("pending then positive");
+        assert_eq!(p2, 50);
+        assert_eq!(p2_star, 500);
+    }
+}

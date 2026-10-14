@@ -209,6 +209,9 @@ impl IsoTpLink {
                 let need = total_len - assembled.len();
                 let take = need.min(7).min(p.len() - 1);
                 assembled.extend_from_slice(&p[1..1 + take]);
+                if assembled.len() > total_len {
+                    assembled.truncate(total_len);
+                }
                 expected_seq = (expected_seq + 1) & 0x0F;
             }
             if assembled.len() >= total_len {
@@ -232,5 +235,141 @@ fn decode_stmin(stmin: u8) -> u8 {
         1
     } else {
         127
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod mock {
+    use super::*;
+    use crate::j2534::{PassThruDevice, PassThruMsg};
+    use std::collections::VecDeque;
+
+    pub struct ScriptCan {
+        pub tx_id: u32,
+        pub rx_id: u32,
+        pub connected: bool,
+        pub rx_script: VecDeque<Vec<u8>>,
+        pub tx_captured: Vec<Vec<u8>>,
+    }
+
+    impl ScriptCan {
+        pub fn new(tx_id: u32, rx_id: u32) -> Self {
+            Self {
+                tx_id,
+                rx_id,
+                connected: true,
+                rx_script: VecDeque::new(),
+                tx_captured: Vec::new(),
+            }
+        }
+
+        pub fn enqueue_rx(&mut self, payload: &[u8]) {
+            self.rx_script.push_back(payload.to_vec());
+        }
+    }
+
+    impl PassThruDevice for ScriptCan {
+        fn open(&mut self) -> Result<(), String> {
+            self.connected = true;
+            Ok(())
+        }
+        fn close(&mut self) -> Result<(), String> {
+            self.connected = false;
+            Ok(())
+        }
+        fn connect(&mut self, _protocol: u32, _flags: u32, _baud: u32) -> Result<u32, String> {
+            Ok(1)
+        }
+        fn disconnect(&mut self, _channel: u32) -> Result<(), String> {
+            Ok(())
+        }
+        fn read_msgs(&mut self, _channel: u32, _timeout_ms: u32) -> Result<Vec<PassThruMsg>, String> {
+            if !self.connected {
+                return Err("disconnected".to_string());
+            }
+            let mut out = Vec::new();
+            if let Some(p) = self.rx_script.pop_front() {
+                let mut buf = p;
+                while buf.len() < 8 {
+                    buf.push(0xAA);
+                }
+                out.push(PassThruMsg::new_can(self.rx_id, &buf));
+            }
+            Ok(out)
+        }
+        fn write_msgs(&mut self, _channel: u32, msgs: &[PassThruMsg], _timeout_ms: u32) -> Result<u32, String> {
+            for msg in msgs {
+                self.tx_captured.push(msg.payload().to_vec());
+            }
+            Ok(msgs.len() as u32)
+        }
+        fn start_filter(
+            &mut self,
+            _channel: u32,
+            _filter_type: u32,
+            _mask: &PassThruMsg,
+            _pattern: &PassThruMsg,
+            _flow_control: Option<&PassThruMsg>,
+        ) -> Result<u32, String> {
+            Ok(1)
+        }
+        fn ioctl(&mut self, _channel: u32, _ioctl_id: u32, _input: &[u8]) -> Result<Vec<u8>, String> {
+            Ok(vec![])
+        }
+        fn is_connected(&self) -> bool {
+            self.connected
+        }
+        fn firmware_version(&self) -> String {
+            "mock".to_string()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mock::ScriptCan;
+
+    #[test]
+    fn isotp_multiframe_receive_reassembles() {
+        let mut dev = ScriptCan::new(0x7E0, 0x7E8);
+        dev.enqueue_rx(&[0x10, 0x08, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        dev.enqueue_rx(&[0x21, 0x11, 0x22, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA]);
+
+        let link = IsoTpLink::new(
+            1,
+            IsoTpConfig {
+                tx_id: 0x7E0,
+                rx_id: 0x7E8,
+                timeout_ms: 500,
+                ..IsoTpConfig::default()
+            },
+        );
+        let payload = link.receive(&mut dev).expect("assemble");
+        assert_eq!(payload, vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22]);
+        assert!(
+            dev.tx_captured.iter().any(|f| f[0] == 0x30),
+            "flow control frame must be transmitted"
+        );
+    }
+
+    #[test]
+    fn isotp_multiframe_send_waits_for_flow_control() {
+        let mut dev = ScriptCan::new(0x7E0, 0x7E8);
+        dev.enqueue_rx(&[0x30, 0x00, 0x00, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA]);
+
+        let link = IsoTpLink::new(
+            1,
+            IsoTpConfig {
+                tx_id: 0x7E0,
+                rx_id: 0x7E8,
+                timeout_ms: 500,
+                ..IsoTpConfig::default()
+            },
+        );
+        let body: Vec<u8> = (0u8..12).collect();
+        link.send(&mut dev, &body).expect("send");
+        assert!(dev.tx_captured.first().map(|f| f[0] >> 4 == 0x01).unwrap_or(false));
+        assert!(dev.tx_captured.iter().any(|f| f[0] >> 4 == 0x02));
     }
 }

@@ -333,26 +333,37 @@ impl EcuIdentifier {
         allow_demo_defaults: bool,
     ) -> Result<EcuIdentification, String> {
         let mut id = EcuIdentification::default();
+        let mut field_errors: Vec<String> = Vec::new();
 
-        // 1. Query VIN: OBD-II Mode 09 02 or UDS 22 F1 90
+        if profile.bus != VehicleBus::CanIsoTp {
+            return Err(format!(
+                "ECU identify over {} is not implemented yet — connect a CAN ISO-TP profile.",
+                profile.name
+            ));
+        }
+
+        let mut client = UdsClient::for_profile(device, channel, profile);
+
+        // 1. VIN: OBD Mode 09 02 or UDS 22 F1 90
         let vin_req = if profile.diagnostic == DiagnosticProtocol::Kwp {
             vec![0x09, 0x02]
         } else {
             vec![0x22, 0xF1, 0x90]
         };
-
-        if profile.bus == VehicleBus::CanIsoTp {
-            let mut link = IsoTpSession::new(channel, iso_config(profile));
-            link.send(device, &vin_req)?;
-            if let Ok(resp) = link.receive(device) {
-                if resp.len() >= 3 && (resp[0] == 0x49 || resp[0] == 0x62) {
-                    let vin_bytes = &resp[3..];
-                    id.vin = String::from_utf8_lossy(vin_bytes).trim().to_string();
-                }
+        let vin_positive = if profile.diagnostic == DiagnosticProtocol::Kwp {
+            0x49
+        } else {
+            0x62
+        };
+        match client.request(device, &vin_req, vin_positive) {
+            Ok(resp) if resp.len() >= 4 => {
+                id.vin = String::from_utf8_lossy(&resp[3..]).trim().to_string();
             }
+            Ok(_) => field_errors.push("VIN: ECU response too short".to_string()),
+            Err(e) => field_errors.push(format!("VIN: {}", e)),
         }
 
-        // 2. Query Cal ID: OBD-II Mode 09 04 or UDS 22 F1 81 (Toyota) / 22 00 C1 (GM)
+        // 2. Cal ID
         let cal_req = if profile.diagnostic == DiagnosticProtocol::Kwp {
             vec![0x09, 0x04]
         } else if profile.platform.contains("Toyota") {
@@ -360,29 +371,31 @@ impl EcuIdentifier {
         } else {
             vec![0x22, 0x00, 0xC1]
         };
-
-        if profile.bus == VehicleBus::CanIsoTp {
-            let mut link = IsoTpSession::new(channel, iso_config(profile));
-            link.send(device, &cal_req)?;
-            if let Ok(resp) = link.receive(device) {
-                if resp.len() >= 3 && (resp[0] == 0x49 || resp[0] == 0x62) {
-                    let cal_bytes = &resp[3..];
-                    id.cal_id = String::from_utf8_lossy(cal_bytes).trim().to_string();
-                }
+        let cal_positive = if profile.diagnostic == DiagnosticProtocol::Kwp {
+            0x49
+        } else {
+            0x62
+        };
+        match client.request(device, &cal_req, cal_positive) {
+            Ok(resp) if resp.len() >= 4 => {
+                id.cal_id = String::from_utf8_lossy(&resp[3..]).trim().to_string();
             }
+            Ok(_) => field_errors.push("Calibration ID: ECU response too short".to_string()),
+            Err(e) => field_errors.push(format!("Calibration ID: {}", e)),
         }
 
-        // 3. Query CVN: OBD-II Mode 09 06
+        // 3. CVN (OBD Mode 09 06)
         let cvn_req = vec![0x09, 0x06];
-        if profile.bus == VehicleBus::CanIsoTp {
-            let mut link = IsoTpSession::new(channel, iso_config(profile));
-            link.send(device, &cvn_req)?;
-            if let Ok(resp) = link.receive(device) {
-                if resp.len() >= 3 && resp[0] == 0x49 {
-                    let cvn_bytes = &resp[3..];
-                    id.cvn = cvn_bytes.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join("");
-                }
+        match client.request(device, &cvn_req, 0x49) {
+            Ok(resp) if resp.len() >= 4 => {
+                id.cvn = resp[3..]
+                    .iter()
+                    .map(|b| format!("{:02X}", b))
+                    .collect::<Vec<_>>()
+                    .join("");
             }
+            Ok(_) => field_errors.push("CVN: ECU response too short".to_string()),
+            Err(e) => field_errors.push(format!("CVN: {}", e)),
         }
 
         if allow_demo_defaults {
@@ -399,6 +412,8 @@ impl EcuIdentifier {
             if id.cvn.is_empty() {
                 id.cvn = "A1B2C3D4".to_string();
             }
+        } else if !field_errors.is_empty() {
+            return Err(field_errors.join("; "));
         } else if id.vin.is_empty() && id.cal_id.is_empty() && id.cvn.is_empty() {
             return Err(
                 "ECU did not respond to identification (ignition ON, Tacoma 2009+ CAN profile, and bus traffic required)."
@@ -408,7 +423,10 @@ impl EcuIdentifier {
 
         id.details = format!(
             "ECU Identification: VIN: {}, Cal ID: {}, CVN: {} [{}]",
-            id.vin, id.cal_id, id.cvn, profile.name
+            if id.vin.is_empty() { "(none)" } else { &id.vin },
+            if id.cal_id.is_empty() { "(none)" } else { &id.cal_id },
+            if id.cvn.is_empty() { "(none)" } else { &id.cvn },
+            profile.name
         );
 
         Ok(id)
@@ -420,18 +438,6 @@ impl EcuIdentifier {
 // ---------------------------------------------------------------------------
 
 pub struct FlashDownload;
-
-fn iso_config(profile: &EcuProfile) -> IsoTpConfig {
-    IsoTpConfig {
-        tx_id: profile.request_id,
-        rx_id: profile.response_id,
-        pad_byte: 0xAA,
-        timeout_ms: 2000,
-        block_size: 0,
-        stmin_ms: 0,
-        max_flow_waits: 5,
-    }
-}
 
 impl FlashDownload {
     pub fn execute(

@@ -296,6 +296,7 @@ mod tests {
             "virtual-ecu",
             &audit,
             |_f, _d| {},
+            false,
         );
         assert!(flash.is_ok());
         let text = fs::read_to_string(&audit_path).expect("audit file");

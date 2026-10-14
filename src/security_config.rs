@@ -1,7 +1,7 @@
 use crate::protocols::{EcuProfile, SecurityKeys};
 // Keys are stored in PlatformState and dispatched here (fail-closed; no embedded production masks).
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -44,6 +44,8 @@ struct ChecksumEntry {
 
 struct PlatformState {
     profile_keys: HashMap<String, ProfileKeyKind>,
+    /// Profiles whose seed-key mapping was loaded from `security-config.json` (`configured: true`).
+    file_configured_profiles: HashSet<String>,
     checksums: Vec<ChecksumEntry>,
     load_note: String,
 }
@@ -52,6 +54,7 @@ impl PlatformState {
     fn empty() -> Self {
         Self {
             profile_keys: HashMap::new(),
+            file_configured_profiles: HashSet::new(),
             checksums: Vec::new(),
             load_note: String::new(),
         }
@@ -81,6 +84,7 @@ impl PlatformSecurity {
     pub fn install(path: &Path) {
         let mut guard = state().lock().unwrap();
         guard.profile_keys.clear();
+        guard.file_configured_profiles.clear();
         guard.checksums.clear();
         guard.load_note.clear();
         let result = (|| {
@@ -96,6 +100,7 @@ impl PlatformSecurity {
 
         if let Err(e) = result {
             guard.profile_keys.clear();
+            guard.file_configured_profiles.clear();
             guard.checksums.clear();
             guard.load_note = if e.is_empty() {
                 "The security config could not be read.".to_string()
@@ -107,6 +112,12 @@ impl PlatformSecurity {
 
     pub fn load_note() -> String {
         state().lock().unwrap().load_note.clone()
+    }
+
+    /// True when the profile has a production seed-key entry from `security-config.json` (not virtual-bench overlay).
+    pub fn security_key_configured_for_profile(profile_id: &str) -> bool {
+        let id = canonical_profile(profile_id);
+        state().lock().unwrap().file_configured_profiles.contains(&id)
     }
 
     /// Bench-only key registration for the virtual ECU loopback (mask 0). Not for production hardware.
@@ -669,6 +680,7 @@ fn read_profiles(
         };
         if let Some(kind) = kind {
             state.profile_keys.insert(id.clone(), kind);
+            state.file_configured_profiles.insert(id);
         } else if state.load_note.is_empty() {
             state.load_note = format!("No security key function is configured for {}.", id);
         }
