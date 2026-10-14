@@ -2041,7 +2041,6 @@ namespace Wideband
     {
         LogTable log;
         int hoverRow = -1;
-        int mouseX = -1;
         int mouseY = -1;
         bool isHovering = false;
 
@@ -2061,7 +2060,6 @@ namespace Wideband
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
-            mouseX = e.X;
             mouseY = e.Y;
             isHovering = true;
             if (log != null && log.Rows.Count > 1)

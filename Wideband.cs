@@ -319,14 +319,12 @@ namespace Wideband
     sealed class MainForm : Form
     {
         readonly List<Definition> definitions;
-        readonly string installPath;
         string dllPath;
         Dictionary<string, object> device;
         readonly Font ui;
         readonly Font titleFont;
         readonly Color ink = Color.FromArgb(23, 33, 28);
         readonly Color muted = Color.FromArgb(61, 74, 68);
-        readonly Color line = Color.FromArgb(195, 202, 196);
         readonly Color panel = Color.FromArgb(247, 248, 246);
         readonly Color accent = Color.FromArgb(12, 110, 74);
         readonly Color tint = Color.FromArgb(229, 242, 235);
@@ -379,7 +377,6 @@ namespace Wideband
 
         public MainForm(string installPath, List<Definition> definitions, List<string> profiles)
         {
-            this.installPath = installPath;
             this.definitions = definitions;
             this.dllPath = Path.Combine(installPath, "esp32.dll");
             ui = new Font("Bahnschrift", 11f, FontStyle.Regular, GraphicsUnit.Point);
