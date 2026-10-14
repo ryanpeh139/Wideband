@@ -1,6 +1,7 @@
 pub mod audit_log;
 pub mod cal_editor;
 pub mod definitions;
+pub mod diagnostics;
 pub mod flash_job;
 pub mod flash_layout;
 pub mod isotp;
@@ -320,5 +321,26 @@ mod tests {
 
         assert!(flash_result.is_ok(), "Flash sequence must complete without error");
         sim.close().expect("Simulator close must succeed");
+    }
+
+    #[test]
+    fn test_virtual_ecu_read_only_diagnostics() {
+        use diagnostics::{decode_dtc_bytes, DiagnosticsReader};
+
+        assert_eq!(decode_dtc_bytes(0x01, 0x71), "P0171");
+        assert_eq!(decode_dtc_bytes(0x03, 0x00), "P0300");
+
+        let mut sim = VirtualEcuSimulator::new();
+        sim.open().unwrap();
+        let channel = sim.connect(ISO15765, 0, 500000).unwrap();
+        let prof = EcuProfile::tacoma_can();
+
+        let snap = DiagnosticsReader::read(&mut sim, channel, &prof).expect("diagnostics read");
+        assert!(snap.mil_on);
+        assert!(snap.stored_dtcs.iter().any(|d| d.code == "P0171"));
+        assert!(snap.pending_dtcs.iter().any(|d| d.code == "P0300"));
+        assert!(!snap.readiness.monitors.is_empty());
+        assert!(!snap.freeze_frames.is_empty());
+        sim.close().unwrap();
     }
 }

@@ -360,11 +360,30 @@ impl VirtualEcuSimulator {
             // Mode 01: Current Powertrain Diagnostic Data
             0x01 => {
                 if req.len() >= 2 {
-                    self.generate_telemetry_pid(req[1])
+                    if req[1] == 0x01 {
+                        // MIL on, 1 stored DTC; catalyst incomplete, others complete (bench)
+                        vec![0x41, 0x01, 0x81, 0x07, 0xE5, 0x9D]
+                    } else {
+                        self.generate_telemetry_pid(req[1])
+                    }
                 } else {
                     vec![0x7F, 0x01, 0x13]
                 }
             }
+            // Mode 02: Freeze frame
+            0x02 => {
+                if req.len() >= 2 && req[1] == 0x02 {
+                    vec![
+                        0x42, 0x02, 0x01, 0x71, 0x0C, 0x1A, 0x20, 0x05, 0x58, 0x0E, 0x8A, 0x11, 0x2A,
+                    ]
+                } else {
+                    vec![0x7F, 0x02, 0x12]
+                }
+            }
+            // Mode 03: Stored DTCs
+            0x03 => vec![0x43, 0x01, 0x01, 0x71],
+            // Mode 07: Pending DTCs
+            0x07 => vec![0x47, 0x01, 0x03, 0x00],
             // Mode 09: Vehicle Info
             0x09 => {
                 if req.len() >= 2 {
@@ -523,6 +542,31 @@ impl VirtualEcuSimulator {
                 self.unlocked_level1 = false;
                 self.download_active = false;
                 vec![0x51, if req.len() > 1 { req[1] } else { 0x01 }]
+            }
+            // 0x14: ClearDiagnosticInformation — intentionally unsupported (read-only compliance)
+            0x14 => vec![0x7F, 0x14, 0x11],
+            // 0x19: ReadDTCInformation (UDS)
+            0x19 => {
+                if req.len() < 2 {
+                    return vec![0x7F, 0x19, 0x13];
+                }
+                match req[1] {
+                    0x02 => {
+                        // P0171 confirmed
+                        vec![0x59, 0x02, 0xFF, 0x01, 0x01, 0x71, 0x00, 0x09]
+                    }
+                    0x04 => {
+                        if req.len() >= 6 {
+                            vec![
+                                0x59, 0x04, req[2], req[3], req[5], 0x0C, 0x1A, 0x20, 0x05, 0x58, 0x0E,
+                                0x8A,
+                            ]
+                        } else {
+                            vec![0x7F, 0x19, 0x13]
+                        }
+                    }
+                    _ => vec![0x7F, 0x19, 0x12],
+                }
             }
             _ => vec![0x7F, req[0], 0x11], // Service not supported
         }
