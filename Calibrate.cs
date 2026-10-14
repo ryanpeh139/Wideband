@@ -481,6 +481,7 @@ namespace Wideband
         readonly CheckBox compare;
         readonly Label status;
         readonly Label note;
+        readonly Label checksumMark;
         TuneTable current;
         MemoryImage rom;
         long romOrigin;
@@ -503,11 +504,22 @@ namespace Wideband
 
             var tools = new FlowLayoutPanel();
             tools.Dock = DockStyle.Top;
-            tools.Height = 116;
+            tools.Height = 148;
             tools.WrapContents = true;
             tools.Controls.Add(MakeButton("Open ROM", OpenRomClicked));
             tools.Controls.Add(MakeButton("Open XDF", OpenXdfClicked));
             tools.Controls.Add(MakeButton("Save ROM", SaveRomClicked));
+            checksumMark = new Label();
+            checksumMark.AutoSize = true;
+            checksumMark.TextAlign = ContentAlignment.MiddleCenter;
+            checksumMark.Padding = new Padding(10, 6, 10, 6);
+            checksumMark.Margin = new Padding(8, 3, 4, 3);
+            checksumMark.AccessibleName = "Checksum indicator";
+            checksumMark.AccessibleRole = AccessibleRole.StaticText;
+            Font badgeFont = BadgeFont();
+            checksumMark.Font = badgeFont;
+            tools.Controls.Add(checksumMark);
+            SetMark("");
             level = new ComboBox();
             level.DropDownStyle = ComboBoxStyle.DropDownList;
             level.Width = 130;
@@ -600,6 +612,51 @@ namespace Wideband
             label.AutoSize = true;
             label.Padding = new Padding(0, 8, 0, 0);
             return label;
+        }
+
+        public string ChecksumText
+        {
+            get { return checksumMark.Text; }
+        }
+
+        static Font BadgeFont()
+        {
+            var face = new Font("Bahnschrift", 11f, FontStyle.Bold, GraphicsUnit.Point);
+            if (face.Name == "Bahnschrift") return face;
+            face.Dispose();
+            return new Font("Segoe UI", 11f, FontStyle.Bold, GraphicsUnit.Point);
+        }
+
+        void SetMark(string text)
+        {
+            checksumMark.Text = text == null ? "" : text;
+            if (checksumMark.Text == PlatformSecurityAndChecksum.ValidText)
+            {
+                checksumMark.BackColor = Color.FromArgb(214, 236, 214);
+                checksumMark.ForeColor = Color.FromArgb(12, 110, 74);
+            }
+            else if (checksumMark.Text == PlatformSecurityAndChecksum.UpdatedText)
+            {
+                checksumMark.BackColor = Color.FromArgb(244, 228, 196);
+                checksumMark.ForeColor = Color.FromArgb(90, 62, 18);
+            }
+            else
+            {
+                checksumMark.BackColor = Color.FromArgb(247, 248, 246);
+                checksumMark.ForeColor = Color.FromArgb(40, 44, 42);
+            }
+        }
+
+        void RefreshChecksum()
+        {
+            if (rom == null)
+            {
+                SetMark("");
+                return;
+            }
+            IChecksum checksum = PlatformSecurityAndChecksum.ChecksumFor(null, rom.Bytes, romOrigin);
+            if (checksum != null && checksum.Verify(rom.Bytes)) SetMark(PlatformSecurityAndChecksum.ValidText);
+            else SetMark("");
         }
 
         static Button MakeButton(string text, EventHandler click)
@@ -793,16 +850,30 @@ namespace Wideband
                 name = Path.GetFileNameWithoutExtension(romPath) + ".bin";
             dialog.FileName = name;
             if (dialog.ShowDialog(FindForm()) != DialogResult.OK) return;
-            try
+            try { SaveRomFile(dialog.FileName); }
+            catch (Exception ex) { status.Text = ex.Message; }
+        }
+
+        public void SaveRomFile(string path)
+        {
+            if (rom == null) throw new InvalidOperationException("Open a ROM before saving one.");
+            IChecksum checksum = PlatformSecurityAndChecksum.ChecksumFor(null, rom.Bytes, romOrigin);
+            if (checksum == null)
             {
-                rom.Save(dialog.FileName, null);
-                romPath = dialog.FileName;
-                status.Text = "Saved " + Path.GetFileName(dialog.FileName) + ".";
+                SetMark("");
+                throw new InvalidOperationException("No checksum range is configured.");
             }
-            catch (Exception ex)
+            byte[] before = (byte[])rom.Bytes.Clone();
+            rom.Save(path, checksum);
+            romPath = path;
+            if (romBacked && document != null)
             {
-                status.Text = ex.Message;
+                foreach (TuneTable table in document.Tables)
+                    if (table.Binding != null) table.Binding.ReadInto(rom.Bytes, table);
+                Bind();
             }
+            SetMark(PlatformSecurityAndChecksum.Mark(before, rom.Bytes));
+            status.Text = "Saved " + Path.GetFileName(path) + ". " + checksumMark.Text + ".";
         }
 
         public void OpenRomFile(string path)
@@ -814,6 +885,7 @@ namespace Wideband
             romPath = path;
             if (definition != null) BindLoaded();
             else status.Text = "Loaded ROM " + Path.GetFileName(path) + " (" + rom.Bytes.Length.ToString(CultureInfo.InvariantCulture) + " bytes). Open an XDF to fill the parameter tree.";
+            RefreshChecksum();
         }
 
         public void OpenDefinitionFile(string path)
@@ -841,10 +913,11 @@ namespace Wideband
             if (header.Length > 160) header = header.Substring(0, 160);
             note.Text = "ROM " + Path.GetFileName(romPath) + " (" + rom.Bytes.Length.ToString(CultureInfo.InvariantCulture)
                 + " bytes) with " + definition.Title + ". " + result.Document.Tables.Count.ToString(CultureInfo.InvariantCulture)
-                + " parameters. Edits stay in the ROM buffer until you save the ROM. Nothing is written to an ECU. " + header;
+                + " parameters. Edits stay in the ROM buffer until you save the ROM. Save ROM updates a configured checksum. Nothing is written to an ECU. " + header;
             FillList();
             if (result.Errors.Count > 0)
                 status.Text = result.Errors.Count.ToString(CultureInfo.InvariantCulture) + " parameters were skipped. " + result.Errors[0];
+            RefreshChecksum();
         }
 
         void Save(string message)
@@ -883,6 +956,7 @@ namespace Wideband
             }
             Bind();
             status.Text = message + " The ROM buffer was updated.";
+            RefreshChecksum();
         }
 
         void Trace()

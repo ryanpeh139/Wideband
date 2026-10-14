@@ -498,7 +498,7 @@ namespace Wideband
             var cableCopy = new Label();
             cableCopy.Dock = DockStyle.Top;
             cableCopy.Height = 120;
-            cableCopy.Text = "Connect Cable opens the J2534 device, reads the firmware version, and leaves the channel open. Tester present (0x3E) is sent every 2 seconds. Tacoma 2009+ and Silverado 2007+ use ISO 15765 on CAN at 500 kbps. Tacoma 2005-2008 uses ISO 14230 K-Line at 10400 baud. Silverado 1999-2007 uses J1850 VPW at 10400 baud. Read ECU uses service 0x23. Write sends session 0x10, security 0x27, download 0x34, transfer 0x36, exit 0x37, and reset 0x11 after confirmation. No security key and no checksum are built in.";
+            cableCopy.Text = "Connect Cable opens the J2534 device, reads the firmware version, and leaves the channel open. Tester present (0x3E) is sent every 2 seconds. Tacoma 2009+ and Silverado 2007+ use ISO 15765 on CAN at 500 kbps. Tacoma 2005-2008 uses ISO 14230 K-Line at 10400 baud. Silverado 1999-2007 uses J1850 VPW at 10400 baud. Read ECU uses service 0x23. Write sends session 0x10, security 0x27, download 0x34, transfer 0x36, exit 0x37, and reset 0x11 after confirmation. Security keys and checksum ranges are read from security-config.json. Nothing is sent when that entry is not configured.";
             platformBox = new ComboBox();
             platformBox.DropDownStyle = ComboBoxStyle.DropDownList;
             platformBox.Width = 180;
@@ -604,6 +604,8 @@ namespace Wideband
             FillProtocols();
             VehicleLink.Current.Noted += HoldNoted;
             VehicleLink.Current.Traced += CableTraced;
+            if (PlatformSecurityAndChecksum.LoadNote.Length > 0)
+                AppendLog(PlatformSecurityAndChecksum.LoadNote);
             cableView.Controls.Add(cableLog);
             cableView.Controls.Add(progressLabel);
             cableView.Controls.Add(transferProgress);
@@ -1138,7 +1140,7 @@ namespace Wideband
                 DialogResult confirm = MessageBox.Show(this,
                     "Write " + image.Length.ToString(CultureInfo.InvariantCulture) + " bytes to address 0x" + address.ToString("X")
                     + " on " + profile.Name + "? This sends session 0x" + profile.ProgrammingSession.ToString("X2")
-                    + ", security access, download 0x34, transfer 0x36, exit 0x37, and reset 0x11. No security key is built in. No checksum is applied.",
+                    + ", security access, download 0x34, transfer 0x36, exit 0x37, and reset 0x11. The security key and the checksum come from security-config.json. A missing entry stops the transfer before a key or a download is sent.",
                     "Write calibration",
                     MessageBoxButtons.OKCancel,
                     MessageBoxIcon.Warning);
@@ -1177,7 +1179,7 @@ namespace Wideband
                         if (ok) transferProgress.Value = 100;
                         cableStatus.BackColor = ok ? tint : Color.FromArgb(243, 228, 225);
                         cableStatus.Text = ok
-                            ? "Transfer finished. The ECU was reset. The cable channel is still open. No checksum function is configured."
+                            ? "Transfer finished. The ECU was reset. The cable channel is still open. The image checksum was checked and corrected before the download."
                             : (result == null || result.Error.Length == 0 ? "The transfer stopped." : result.Error);
                         AppendLog(cableStatus.Text);
                         bool held = VehicleLink.Current.IsConnected;
@@ -1256,6 +1258,7 @@ namespace Wideband
                 List<string> profiles = Catalog.LoadProfiles(Path.Combine(install, "ToyotaProfiles"));
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
+                PlatformSecurityAndChecksum.Install(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "security-config.json"));
                 Application.Run(new MainForm(install, definitions, profiles));
             }
             catch (Exception ex)

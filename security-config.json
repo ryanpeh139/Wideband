@@ -1,0 +1,60 @@
+{
+  "profiles": {
+    "tacoma-can": {
+      "algorithm": "denso32",
+      "mask": "0x00000000",
+      "generation": "",
+      "endian": "big",
+      "configured": false
+    },
+    "tacoma-kline": {
+      "algorithm": "denso32",
+      "mask": "0x00000000",
+      "generation": "",
+      "endian": "big",
+      "configured": false
+    },
+    "silverado-can": {
+      "algorithm": "gm",
+      "keyId": "",
+      "configured": false
+    },
+    "silverado-vpw": {
+      "algorithm": "gm",
+      "keyId": "",
+      "configured": false
+    }
+  },
+  "densoGenerations": [
+    {
+      "id": "example",
+      "mask": "0x00000000",
+      "endian": "big",
+      "configured": false
+    }
+  ],
+  "gmKeys": [
+    {
+      "id": "example",
+      "bits": 16,
+      "rotate": 1,
+      "direction": "left",
+      "xor": "0x0000",
+      "add": 0,
+      "endian": "big",
+      "configured": false
+    }
+  ],
+  "checksums": [
+    {
+      "id": "example",
+      "profile": "",
+      "algorithm": "crc32",
+      "start": "0x0",
+      "end": "0x0",
+      "store": "0x0",
+      "endian": "big",
+      "configured": false
+    }
+  ]
+}

@@ -5,7 +5,7 @@ namespace Wideband
 {
     // One open cable. Device and channel ids stay valid until Disconnect.
     // TesterPresent runs every two seconds unless a transfer owns the channel.
-    // The security key comes only from ComputeKey. This file does not calculate one.
+    // The security key comes from ComputeKey or security-config.json. This file does not embed a mask.
     sealed class ConfiguredKey : ISecurityKey
     {
         readonly ComputeSecurityKey compute;
@@ -203,10 +203,12 @@ namespace Wideband
             EcuProfile selected = BeginWork(address, image.Length, chunkBytes, true, out link);
             try
             {
+                PreparedImage prepared = PlatformSecurityAndChecksum.PrepareForFlash(selected.Id, selected.Name, image, address);
                 var plan = new FlashPlan();
                 plan.Address = address;
-                plan.Image = image;
+                plan.Image = prepared.Bytes;
                 plan.Keys = KeysFor(selected);
+                plan.Checksum = prepared.Checksum;
                 plan.ProgrammingSession = true;
                 plan.SessionType = selected.ProgrammingSession;
                 plan.Diagnostic = selected.Diagnostic;
@@ -299,8 +301,7 @@ namespace Wideband
             EcuProfile current = selected;
             return new ConfiguredKey(delegate (byte[] seed)
             {
-                if (local != null) return local(seed, current);
-                return SecurityKeys.Compute(seed, current);
+                return PlatformSecurityAndChecksum.Reveal(seed, current, local, Trace);
             });
         }
 
