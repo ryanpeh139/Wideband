@@ -1389,7 +1389,7 @@ pub fn missing_j2534_host_message() -> String {
         .and_then(|p| p.parent().map(|d| d.join("J2534Host.exe")))
         .unwrap_or_else(|| std::path::PathBuf::from("J2534Host.exe"));
     format!(
-        "J2534Host.exe not found (expected {}). Mini-VCI and VXDIAG DLLs are 32-bit — build J2534Host.cs with /platform:x86 and copy J2534Host.exe beside wideband.exe.",
+        "J2534Host.exe not found (expected {}). Mini-VCI and VXDIAG DLLs are 32-bit — run scripts\\Package-WindowsRelease.ps1 or build J2534Host.cs with /platform:x86, then scripts\\Friday-CablePrep.ps1 before connect.",
         beside.display()
     )
 }

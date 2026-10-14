@@ -17,7 +17,7 @@ Run the binary as `wideband` (or `target/debug/wideband` / `target/release/wideb
 
 **Community definitions & plugins:** calibration packs under [`definition-packs/`](definition-packs/), native [`plugins/`](plugins/) (`cdylib`), and optional user paths — see [`docs/community-packs-and-plugins.md`](docs/community-packs-and-plugins.md).
 
-**2017 Tacoma + Mini-VCI or VXDIAG VCX Nano (Toyota):** see [`docs/tacoma-can-j2534-bring-up.md`](docs/tacoma-can-j2534-bring-up.md). Place **`J2534Host.exe`** (32-bit, from `J2534Host.cs`) next to **`wideband.exe`** on Windows.
+**2017 Tacoma + Mini-VCI or VXDIAG VCX Nano (Toyota):** see [`docs/tacoma-can-j2534-bring-up.md`](docs/tacoma-can-j2534-bring-up.md). On Windows, run [`scripts/Package-WindowsRelease.ps1`](scripts/Package-WindowsRelease.ps1) then [`scripts/Friday-CablePrep.ps1`](scripts/Friday-CablePrep.ps1) — details in [`docs/windows-release-packaging.md`](docs/windows-release-packaging.md). Place **`J2534Host.exe`** (32-bit) next to **`wideband.exe`**.
 
 The legacy C# WinForms tree (`Wideband.cs`, `Calibrate.cs`, …) remains for reference and Windows-only `csc.exe` handoff; new UI work targets Rust.
 

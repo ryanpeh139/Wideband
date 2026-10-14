@@ -462,6 +462,20 @@ impl WidebandApp {
         ));
     }
 
+    fn friendly_connect_open_error(raw: &str) -> String {
+        let lower = raw.to_lowercase();
+        if lower.contains("j2534host.exe not found") || lower.contains("j2534host.exe is missing") {
+            return crate::j2534::missing_j2534_host_message();
+        }
+        if lower.contains("could not load") || lower.contains("loadlibrary") {
+            return format!(
+                "{} — If this is a clone cable DLL, run device_check.ps1 -DllPath \"<FunctionLibrary>\" and scripts\\Friday-CablePrep.ps1 before connect.",
+                raw
+            );
+        }
+        raw.to_string()
+    }
+
     pub fn connect_cable(&mut self) {
         self.connection_last_error.clear();
         self.header_vbatt = None;
@@ -519,26 +533,26 @@ impl WidebandApp {
         let mut dev = match dev_row.open_pass_thru() {
             Ok(d) => d,
             Err(e) => {
-                self.connection_last_error = e.clone();
+                self.connection_last_error = Self::friendly_connect_open_error(&e);
                 self.devices[self.selected_device_idx].availability =
-                    TransportAvailability::Error(e.clone());
+                    TransportAvailability::Error(self.connection_last_error.clone());
                 self.log(&format!(
                     "Failed to open {}: {} (check USB, driver, pairing, or gateway)",
                     dev_name,
-                    e
+                    self.connection_last_error
                 ));
                 return;
             }
         };
         match dev.open() {
             Err(e) => {
-                self.connection_last_error = e.clone();
+                self.connection_last_error = Self::friendly_connect_open_error(&e);
                 self.devices[self.selected_device_idx].availability =
-                    TransportAvailability::Error(e.clone());
+                    TransportAvailability::Error(self.connection_last_error.clone());
                 self.log(&format!(
                     "Failed to open {}: {} (check USB, driver, and VX Manager / MVCI license if applicable)",
                     dev_name,
-                    e
+                    self.connection_last_error
                 ));
                 return;
             }

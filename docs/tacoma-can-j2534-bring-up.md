@@ -11,6 +11,8 @@ Supported consumer cables (Windows, 32-bit PassThru DLL):
 
 Wideband discovers devices from `PassThruSupport.04.04` registry keys and common DLL paths. Place **`J2534Host.exe`** (32-bit, built from `J2534Host.cs`) beside **`wideband.exe`** — the Rust app talks to the cable through that host on 64-bit Windows.
 
+**Stage a cable-ready folder:** `.\scripts\Package-WindowsRelease.ps1` then `.\scripts\Friday-CablePrep.ps1 -ReleaseDir .\target\release -DllPath "<your PassThru DLL>"` — see [windows-release-packaging.md](./windows-release-packaging.md).
+
 ## Prerequisites
 
 - Windows 10/11 x64, `cargo build --release`

@@ -554,6 +554,7 @@ impl WidebandApp {
                         ui.heading("Cable & driver");
                         ui.label("• Windows: install your adapter’s SAE J2534 Pass-Thru driver (Mini-VCI, VXDIAG Toyota, Tactrix, etc.).");
                         ui.label("• Place J2534Host.exe (x86) beside wideband.exe for 32-bit DLLs.");
+                        ui.label("• Before truck day: run scripts\\Friday-CablePrep.ps1 (PASS/FAIL) and device_check.ps1 on your PassThru DLL.");
                         ui.label("• No cable yet? Use Virtual ECU practice from the header anytime.");
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
