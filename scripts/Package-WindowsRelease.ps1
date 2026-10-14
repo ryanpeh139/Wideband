@@ -63,7 +63,7 @@ if (-not $SkipCargo) {
 
 $widebandSrc = Join-Path $RepoRoot "target\release\wideband.exe"
 if (-not (Test-Path -LiteralPath $widebandSrc)) {
-    throw "wideband.exe not found at $widebandSrc — run without -SkipCargo or build manually."
+    throw "wideband.exe not found at $widebandSrc - run without -SkipCargo or build manually."
 }
 
 Write-Step "Build J2534Host.exe (x86)"
@@ -74,7 +74,7 @@ if (-not (Test-Path -LiteralPath $hostCs)) {
 
 $csc32 = Join-Path $env:WINDIR "Microsoft.NET\Framework\v4.0.30319\csc.exe"
 if (-not (Test-Path -LiteralPath $csc32)) {
-    throw "32-bit csc.exe not found at $csc32 — install .NET Framework 4.x developer pack."
+    throw "32-bit csc.exe not found at $csc32 - install .NET Framework 4.x developer pack."
 }
 
 $hostOut = Join-Path $OutDir "J2534Host.exe"
