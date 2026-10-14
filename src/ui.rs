@@ -103,6 +103,8 @@ pub struct WidebandApp {
     /// Scanner dashboard gauges (dashboard.json).
     pub dashboard: crate::gauges::Dashboard,
     pub dash_editing: bool,
+    /// Free-text notes saved inside the .wbtune file.
+    pub tune_notes: String,
     /// Live operating point on the selected table (separate from the edit selection).
     pub live_trace: live_trace::LiveTrace,
     pub math_amount: f64,
@@ -240,6 +242,7 @@ impl WidebandApp {
                     .unwrap_or_else(|_| crate::gauges::Dashboard::default_layout(&ids))
             },
             dash_editing: false,
+            tune_notes: String::new(),
             live_trace: live_trace::LiveTrace::default(),
             math_amount: 5.0,
             checksum_status: CHECKSUM_VALID.to_string(),
@@ -1612,6 +1615,25 @@ impl WidebandApp {
                             self.load_xdf_from_path(path);
                         }
                     }
+                    if !beginner_mode && ui.button("Open Tune\u{2026}").on_hover_text("Open a .wbtune (ROM + definition + notes)").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Wideband tune", &[crate::tune_file::EXTENSION])
+                            .pick_file()
+                        {
+                            self.open_tune(path);
+                        }
+                    }
+                    if !beginner_mode && ui.button("Save Tune\u{2026}").on_hover_text("Save ROM + definition reference + vehicle + notes as .wbtune").clicked() {
+                        let mut dialog = rfd::FileDialog::new().add_filter("Wideband tune", &[crate::tune_file::EXTENSION]);
+                        if let Some(p) = &self.rom_path {
+                            if let Some(stem) = p.file_stem() {
+                                dialog = dialog.set_file_name(format!("{}.{}", stem.to_string_lossy(), crate::tune_file::EXTENSION));
+                            }
+                        }
+                        if let Some(path) = dialog.save_file() {
+                            self.save_tune(path);
+                        }
+                    }
                     if !beginner_mode && ui.button("Compare ROM\u{2026}").on_hover_text("Open a second ROM to diff against (same XDF)").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("ROM image", &["bin", "cuw"])
@@ -1660,6 +1682,16 @@ impl WidebandApp {
                 });
                 if !beginner_mode {
                     self.render_compare_bar(ui);
+                    egui::CollapsingHeader::new(egui::RichText::new("Tune notes").small().color(MUTED))
+                        .id_salt("tune_notes")
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut self.tune_notes)
+                                    .desired_rows(3)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text("What changed, fuel used, mods, dyno numbers\u{2026} (saved in the .wbtune)"),
+                            );
+                        });
                 }
                 ui.add_space(6.0);
                 ui.separator();
@@ -4370,5 +4402,90 @@ impl WidebandApp {
         if let Some(i) = remove {
             self.dashboard.gauges.remove(i);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// .wbtune tune files
+// ---------------------------------------------------------------------------
+
+impl WidebandApp {
+    fn save_tune(&mut self, path: PathBuf) {
+        // Same as Save ROM: make sure every edit is in the image before it's captured.
+        self.xdf.write_all_tables_to_rom(&mut self.active_rom, self.rom_origin);
+        self.xdf.write_all_constants_to_rom(&mut self.active_rom, self.rom_origin);
+        for flag in &self.xdf.flags {
+            self.xdf.write_flag_to_rom(&mut self.active_rom, self.rom_origin, flag);
+        }
+        let prof_id = self.profiles[self.selected_profile_idx].id.clone();
+        let input = crate::tune_file::SaveInput {
+            profile_id: &prof_id,
+            vin: &self.ecu_id.vin,
+            cal_id: &self.ecu_id.cal_id,
+            notes: &self.tune_notes,
+            rom: &self.active_rom,
+            rom_origin: self.rom_origin,
+            xdf_path: self.xdf_path.as_deref(),
+            xdf_title: &self.xdf.title,
+        };
+        match crate::tune_file::save(&path, &input) {
+            Ok(()) => {
+                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                if self.xdf_path.is_none() {
+                    self.log(&format!(
+                        "Saved tune {} (definition came from a profile pack, so it isn't referenced; reopen with the same pack)",
+                        name
+                    ));
+                } else {
+                    self.log(&format!("Saved tune {}", name));
+                }
+            }
+            Err(e) => self.log(&format!("Save tune failed: {}", e)),
+        }
+    }
+
+    fn open_tune(&mut self, path: PathBuf) {
+        let opened = match crate::tune_file::open(&path) {
+            Ok(o) => o,
+            Err(e) => return self.log(&format!("Open tune failed: {}", e)),
+        };
+        let t = &opened.tune;
+        if self.profile_index_for_id(&t.profile_id).is_some() {
+            self.select_profile_id(&t.profile_id);
+        } else {
+            self.log(&format!("Tune was saved for profile '{}', which isn't installed", t.profile_id));
+        }
+        match &opened.xdf {
+            crate::tune_file::XdfStatus::Match(p) => self.load_xdf_from_path(p.clone()),
+            crate::tune_file::XdfStatus::Changed(p) => {
+                self.log(&format!(
+                    "Warning: {} changed since this tune was saved; table addresses or scaling may differ",
+                    p.display()
+                ));
+                self.load_xdf_from_path(p.clone());
+            }
+            crate::tune_file::XdfStatus::Missing => self.log(&format!(
+                "Definition \"{}\" not found; open the matching XDF to edit this tune",
+                t.xdf_title
+            )),
+        }
+        self.active_rom = opened.rom;
+        self.rom_origin = t.rom_origin;
+        self.rom_path = Some(path.clone());
+        self.rom_from_ecu = false;
+        self.tune_notes = t.notes.clone();
+        self.compare = None;
+        self.diff_vs_compare = false;
+        self.xdf.bind_from_rom(&self.active_rom, self.rom_origin);
+        self.refresh_stock_baseline();
+        self.table_undo.clear();
+        self.refresh_checksum_badge();
+        self.log(&format!(
+            "Opened tune {} (saved {}{}{})",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            t.saved_utc,
+            if t.vin.is_empty() { String::new() } else { format!(", VIN {}", t.vin) },
+            if t.cal_id.is_empty() { String::new() } else { format!(", cal {}", t.cal_id) },
+        ));
     }
 }

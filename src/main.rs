@@ -34,6 +34,7 @@ pub mod tcm;
 pub mod tester_present;
 pub mod theme;
 pub mod transport;
+pub mod tune_file;
 pub mod ui;
 pub mod uds;
 pub mod ve_correction;
