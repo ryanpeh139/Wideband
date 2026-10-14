@@ -204,6 +204,9 @@ pub struct XdfAxis {
     pub units: String,
     pub equation: ScaleEquation,
     pub labels: Vec<f64>,
+    /// Breakpoints live in the ROM at `address` (XDF EMBEDDEDDATA, no static LABELs):
+    /// re-read on every ROM bind so a newly opened ROM shows its own RPM/load axes.
+    pub rom_backed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -287,11 +290,12 @@ impl XdfDocument {
     /// Load engineering values from a ROM image using XDF addresses.
     pub fn bind_from_rom(&mut self, rom: &[u8], origin: i64) {
         for table in &mut self.tables {
-            if labels_look_like_placeholders(&table.x_axis.labels) {
-                read_axis_labels_from_rom(rom, origin, &mut table.x_axis);
-            }
-            if labels_look_like_placeholders(&table.y_axis.labels) {
-                read_axis_labels_from_rom(rom, origin, &mut table.y_axis);
+            // ROM-backed axes are re-read on every bind; the old placeholder-only check meant the
+            // startup 0xFF mock ROM froze axes at 255*scale and a real ROM never replaced them.
+            for axis in [&mut table.x_axis, &mut table.y_axis] {
+                if axis.rom_backed || labels_look_like_placeholders(&axis.labels) {
+                    read_axis_labels_from_rom(rom, origin, axis);
+                }
             }
             read_table_from_rom(rom, origin, table);
         }
@@ -354,6 +358,7 @@ impl XdfDocument {
             units: "RPM".to_string(),
             equation: ScaleEquation::parse("X"),
             labels: Vec::new(),
+            rom_backed: false,
         };
         let mut y_axis = XdfAxis {
             id: 'y',
@@ -362,6 +367,7 @@ impl XdfDocument {
             units: "MAP (kPa)".to_string(),
             equation: ScaleEquation::parse("X"),
             labels: Vec::new(),
+            rom_backed: false,
         };
         let mut z_equation = ScaleEquation::parse("X");
         let mut z_units = "VE %".to_string();
@@ -378,6 +384,7 @@ impl XdfDocument {
 
             let addr = embedded_address(&axis_node).unwrap_or(0);
             let labels = parse_axis_labels(&axis_node, dim);
+            let has_static_labels = axis_node.children().any(|n| n.has_tag_name("LABEL"));
 
             let axis = XdfAxis {
                 id: axis_id.chars().next().unwrap_or('x'),
@@ -386,6 +393,7 @@ impl XdfDocument {
                 units: units.clone(),
                 equation: ScaleEquation::parse(eq_str),
                 labels,
+                rom_backed: addr != 0 && !has_static_labels,
             };
 
             match axis_id {
@@ -524,6 +532,7 @@ impl XdfDocument {
                 units: "RPM".to_string(),
                 equation: ScaleEquation::parse("X"),
                 labels: x_rpm,
+                rom_backed: false,
             },
             y_axis: XdfAxis {
                 id: 'y',
@@ -532,6 +541,7 @@ impl XdfDocument {
                 units: "MAP (kPa)".to_string(),
                 equation: ScaleEquation::parse("X"),
                 labels: y_map,
+                rom_backed: false,
             },
             z_equation: ScaleEquation::parse("X * 0.1"),
             z_units: "%".to_string(),
@@ -563,6 +573,7 @@ impl XdfDocument {
                 units: "RPM".to_string(),
                 equation: ScaleEquation::parse("X"),
                 labels: spark_rpm,
+                rom_backed: false,
             },
             y_axis: XdfAxis {
                 id: 'y',
@@ -571,6 +582,7 @@ impl XdfDocument {
                 units: "Load %".to_string(),
                 equation: ScaleEquation::parse("X"),
                 labels: spark_load,
+                rom_backed: false,
             },
             z_equation: ScaleEquation::parse("X * 0.25"),
             z_units: "deg BTDC".to_string(),
@@ -607,6 +619,7 @@ impl XdfDocument {
                 units: "RPM".to_string(),
                 equation: ScaleEquation::parse("X"),
                 labels: lambda_rpm,
+                rom_backed: false,
             },
             y_axis: XdfAxis {
                 id: 'y',
@@ -615,6 +628,7 @@ impl XdfDocument {
                 units: "MAP (kPa)".to_string(),
                 equation: ScaleEquation::parse("X"),
                 labels: lambda_map,
+                rom_backed: false,
             },
             z_equation: ScaleEquation::parse("X * 0.0078125"),
             z_units: "Lambda".to_string(),
@@ -686,6 +700,7 @@ impl XdfDocument {
                 units: "RPM".to_string(),
                 equation: ScaleEquation::parse("X"),
                 labels: boost_rpm.clone(),
+                rom_backed: false,
             },
             y_axis: XdfAxis {
                 id: 'y',
@@ -694,6 +709,7 @@ impl XdfDocument {
                 units: "—".to_string(),
                 equation: ScaleEquation::parse("X"),
                 labels: vec![0.0],
+                rom_backed: false,
             },
             z_equation: ScaleEquation::parse("X"),
             z_units: "kPa".to_string(),
@@ -713,6 +729,7 @@ impl XdfDocument {
                 units: "RPM".to_string(),
                 equation: ScaleEquation::parse("X"),
                 labels: boost_rpm,
+                rom_backed: false,
             },
             y_axis: XdfAxis {
                 id: 'y',
@@ -721,6 +738,7 @@ impl XdfDocument {
                 units: "—".to_string(),
                 equation: ScaleEquation::parse("X"),
                 labels: vec![0.0],
+                rom_backed: false,
             },
             z_equation: ScaleEquation::parse("X"),
             z_units: "%".to_string(),
@@ -882,4 +900,27 @@ fn write_scalar_u8(
     let raw = equation.invert(engineering).round().clamp(0.0, 255.0) as u8;
     rom[idx] = raw;
     true
+}
+
+#[cfg(test)]
+mod rom_axis_tests {
+    use super::*;
+
+    #[test]
+    fn rom_backed_axes_rebind_after_mock_rom() {
+        let xml = std::fs::read_to_string("tests/fixtures/tacoma-bench-table.xdf").expect("fixture");
+        let mut doc = XdfDocument::parse(&xml).expect("parse");
+        // App startup binds a 0xFF mock ROM first...
+        doc.bind_from_rom(&vec![0xFFu8; 0x200], 0);
+        assert_eq!(doc.tables[0].x_axis.labels, vec![25500.0, 25500.0]);
+        // ...then the user opens a real ROM: axes must follow it.
+        let mut rom = vec![0u8; 0x200];
+        rom[0x108] = 20;
+        rom[0x109] = 40;
+        rom[0x110] = 3;
+        rom[0x111] = 9;
+        doc.bind_from_rom(&rom, 0);
+        assert_eq!(doc.tables[0].x_axis.labels, vec![2000.0, 4000.0]);
+        assert_eq!(doc.tables[0].y_axis.labels, vec![30.0, 90.0]);
+    }
 }

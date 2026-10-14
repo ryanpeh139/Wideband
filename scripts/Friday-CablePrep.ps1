@@ -65,13 +65,20 @@ if (-not (Test-Path -LiteralPath $deviceCheck)) {
 $hasDeviceCheck = Test-Path -LiteralPath $deviceCheck
 Write-Result "device_check.ps1 present" $hasDeviceCheck $(if ($hasDeviceCheck) { $deviceCheck } else { "not found beside exe or repo root" })
 
-# Registry: at least one PassThruSupport.04.04 entry with FunctionLibrary on disk
+# Registry: at least one 32-bit PassThruSupport.04.04 entry with FunctionLibrary on disk.
+# J2534Host.exe is x86, so on 64-bit Windows only the WOW6432Node view is loadable; a 64-bit-only
+# driver entry would pass a naive check and still fail at connect.
+$is64 = [Environment]::Is64BitOperatingSystem
 $regOk = $false
-$regDetail = "no PassThruSupport.04.04 entries with an existing FunctionLibrary DLL"
-$regRoots = @(
-    "HKLM:\SOFTWARE\WOW6432Node\PassThruSupport.04.04",
-    "HKLM:\SOFTWARE\PassThruSupport.04.04"
-)
+$regDetail = "no 32-bit PassThruSupport.04.04 entries with an existing FunctionLibrary DLL"
+if ($is64) {
+    $regRoots = @("HKLM:\SOFTWARE\WOW6432Node\PassThruSupport.04.04")
+    if (Test-Path -LiteralPath "HKLM:\SOFTWARE\PassThruSupport.04.04") {
+        $regDetail += " (64-bit-only entries found - J2534Host.exe is 32-bit and cannot load them; install the 32-bit driver)"
+    }
+} else {
+    $regRoots = @("HKLM:\SOFTWARE\PassThruSupport.04.04")
+}
 $found = @()
 foreach ($root in $regRoots) {
     if (-not (Test-Path -LiteralPath $root)) { continue }
@@ -127,7 +134,12 @@ if ([string]::IsNullOrWhiteSpace($DllPath)) {
     Write-Result "device_check.ps1 probe" $false "device_check.ps1 not found"
 } else {
     try {
-        $json = & powershell -NoProfile -ExecutionPolicy Bypass -File $deviceCheck -DllPath $DllPath
+        # PassThru DLLs are 32-bit: probe from 32-bit PowerShell so the load matches J2534Host.exe.
+        $ps32 = Join-Path $env:WINDIR "SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
+        if (-not $is64 -or -not (Test-Path -LiteralPath $ps32)) {
+            $ps32 = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+        }
+        $json = & $ps32 -NoProfile -ExecutionPolicy Bypass -File $deviceCheck -DllPath $DllPath
         $probe = $json | ConvertFrom-Json
         if ($probe.ok) {
             Write-Result "device_check.ps1 probe" $true ("firmware=" + $probe.firmware + " dll=" + $probe.dll)

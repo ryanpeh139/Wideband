@@ -32,6 +32,8 @@ struct FlashLayoutFile {
 
 pub struct FlashLayoutMap {
     profiles: HashMap<String, ProfileFlashLayout>,
+    /// Set when `flash-layout.json` could not be loaded; every lookup fails closed with it.
+    load_error: Option<String>,
 }
 
 impl FlashLayoutMap {
@@ -42,14 +44,33 @@ impl FlashLayoutMap {
             serde_json::from_str(&text).map_err(|e| format!("flash-layout.json parse failed: {}", e))?;
         Ok(Self {
             profiles: file.profiles,
+            load_error: None,
         })
     }
 
+    /// Empty map used when the file is missing: stock read / flash refuse with `reason`.
+    pub fn unavailable(reason: String) -> Self {
+        Self {
+            profiles: HashMap::new(),
+            load_error: Some(reason),
+        }
+    }
+
+    pub fn load_error(&self) -> Option<&str> {
+        self.load_error.as_deref()
+    }
+
     pub fn default_path() -> std::path::PathBuf {
-        std::path::PathBuf::from("flash-layout.json")
+        crate::pack_paths::beside_exe_or_cwd("flash-layout.json")
     }
 
     pub fn profile(&self, profile_id: &str) -> Result<&ProfileFlashLayout, String> {
+        if let Some(err) = &self.load_error {
+            return Err(format!(
+                "{} — put flash-layout.json beside wideband.exe (run scripts\\Package-WindowsRelease.ps1)",
+                err
+            ));
+        }
         self.profiles
             .get(profile_id)
             .ok_or_else(|| format!("No flash layout for profile '{}'", profile_id))

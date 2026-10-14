@@ -177,7 +177,7 @@ impl WidebandApp {
         let flash_layout = FlashLayoutMap::load(FlashLayoutMap::default_path())
             .unwrap_or_else(|e| {
                 eprintln!("flash-layout.json: {}", e);
-                FlashLayoutMap::load("tests/flash-layout-test.json").expect("flash layout fallback")
+                FlashLayoutMap::unavailable(e)
             });
         let flash_audit = FlashAuditLog::new(FlashAuditLog::default_path());
 
@@ -259,6 +259,12 @@ impl WidebandApp {
         let sec_note = PlatformSecurity::load_note();
         if !sec_note.is_empty() {
             app.log(&format!("Security config: {}", sec_note));
+        }
+        if let Some(err) = app.flash_layout.load_error().map(str::to_string) {
+            app.log(&format!(
+                "Flash layout unavailable ({}). Read Stock ROM and flash are disabled until flash-layout.json sits beside wideband.exe.",
+                err
+            ));
         }
 
         app.select_profile_id("tacoma-can");
@@ -1426,7 +1432,7 @@ impl WidebandApp {
                 ui.horizontal_wrapped(|ui| {
                     ui.heading(egui::RichText::new("3D Surface Mesh").size(14.0).color(ACCENT_CYAN));
                     ui.label(
-                        egui::RichText::new("Drag: orbit · Scroll: zoom")
+                        egui::RichText::new("Drag: orbit · Scroll: zoom · Click: select cell · Double-click: reset view")
                             .small()
                             .color(MUTED),
                     );
@@ -1439,7 +1445,12 @@ impl WidebandApp {
                 let mesh_side = avail.x.min(mesh_h).max(96.0);
                 let mesh_size = Vec2::new(mesh_side, mesh_side);
                 let (response, painter) =
-                    ui.allocate_painter(mesh_size, egui::Sense::drag());
+                    ui.allocate_painter(mesh_size, egui::Sense::click_and_drag());
+                if response.double_clicked() {
+                    self.mesh_yaw = 0.785;
+                    self.mesh_pitch = 0.523;
+                    self.mesh_zoom = 1.0;
+                }
                 if response.dragged() {
                     self.mesh_yaw += response.drag_delta().x * 0.01;
                     self.mesh_pitch = (self.mesh_pitch + response.drag_delta().y * 0.01).clamp(0.1, 1.4);
@@ -1454,6 +1465,20 @@ impl WidebandApp {
 
                 if !self.xdf.tables.is_empty() {
                     let table = &self.xdf.tables[self.selected_table_idx];
+                    let hover_cell = if response.dragged() {
+                        None
+                    } else {
+                        response.hover_pos().and_then(|pos| {
+                            surface_mesh::pick_cell(
+                                response.rect,
+                                table,
+                                self.mesh_yaw,
+                                self.mesh_pitch,
+                                self.mesh_zoom,
+                                pos,
+                            )
+                        })
+                    };
                     surface_mesh::paint_surface_mesh(
                         &painter,
                         response.rect,
@@ -1462,7 +1487,13 @@ impl WidebandApp {
                         self.mesh_pitch,
                         self.mesh_zoom,
                         self.active_cell,
+                        hover_cell,
                     );
+                    if response.clicked() {
+                        if let Some(cell) = hover_cell {
+                            self.active_cell = cell;
+                        }
+                    }
                 } else {
                     painter.rect_filled(response.rect, 4.0, theme::BG_FILL);
                 }

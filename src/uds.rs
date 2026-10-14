@@ -4,6 +4,13 @@ use crate::protocols::{DiagnosticProtocol, EcuProfile};
 
 const NEGATIVE: u8 = 0x7F;
 const RESPONSE_PENDING: u8 = 0x78;
+const TESTER_PRESENT_POSITIVE: u8 = 0x7E;
+/// ECU-reported P2 is server-side only; the client adds cable + J2534Host IPC latency on top.
+const CLIENT_P2_MARGIN_MS: u32 = 500;
+/// Floor for client P2 so a 50 ms server P2 never becomes a 50 ms client deadline.
+const MIN_CLIENT_P2_MS: u32 = 1000;
+/// ISO 14229 floor for P2* (enhanced timeout after NRC 0x78).
+const MIN_CLIENT_P2_STAR_MS: u32 = 5000;
 
 pub struct UdsClient {
     link: DiagnosticTransport,
@@ -31,6 +38,29 @@ impl UdsClient {
         }
     }
 
+    /// Apply ECU-reported server timing (from `diagnostic_session_control`) with client margin.
+    pub fn apply_server_timing(&mut self, p2_server_ms: u32, p2_star_server_ms: u32) {
+        self.p2_ms = p2_server_ms
+            .saturating_add(CLIENT_P2_MARGIN_MS)
+            .max(MIN_CLIENT_P2_MS);
+        self.p2_star_ms = p2_star_server_ms
+            .saturating_add(CLIENT_P2_MARGIN_MS)
+            .max(MIN_CLIENT_P2_STAR_MS);
+    }
+
+    pub fn p2_ms(&self) -> u32 {
+        self.p2_ms
+    }
+
+    pub fn p2_star_ms(&self) -> u32 {
+        self.p2_star_ms
+    }
+
+    /// UDS `3E 80` (suppressPosRspMsgIndicationBit): send-only keepalive, never waits on the ECU.
+    pub fn tester_present_no_response(&mut self, device: &mut dyn PassThruDevice) -> Result<(), String> {
+        self.link.send(device, &[0x3E, 0x80])
+    }
+
     pub fn tester_present(&mut self, device: &mut dyn PassThruDevice, protocol: DiagnosticProtocol) -> Result<(), String> {
         let req = match protocol {
             DiagnosticProtocol::Kwp => vec![0x3E],
@@ -49,13 +79,14 @@ impl UdsClient {
         session: u8,
     ) -> Result<(u32, u32), String> {
         let resp = self.request(device, &[0x10, session], 0x50)?;
+        // ISO 14229-1: P2server_max in 1 ms units, P2*server_max in 10 ms units.
         let p2 = if resp.len() >= 4 {
             ((resp[2] as u32) << 8) | (resp[3] as u32)
         } else {
             self.p2_ms
         };
         let p2_star = if resp.len() >= 6 {
-            ((resp[4] as u32) << 8) | (resp[5] as u32)
+            (((resp[4] as u32) << 8) | (resp[5] as u32)) * 10
         } else {
             self.p2_star_ms
         };
@@ -86,6 +117,15 @@ impl UdsClient {
         while pending <= self.max_pending {
             self.link.set_timeout_ms(wait_ms);
             let response = self.link.receive(device)?;
+            // Late reply to a suppressed idle keepalive (`3E 80`): ECUs may still send `7E 00`
+            // or a `7F 3E xx`. Drop it instead of failing the real request.
+            if service != 0x3E
+                && (response.first() == Some(&TESTER_PRESENT_POSITIVE)
+                    || (response.len() >= 3 && response[0] == NEGATIVE && response[1] == 0x3E))
+            {
+                pending += 1;
+                continue;
+            }
             if response.len() >= 3 && response[0] == NEGATIVE && response[2] == RESPONSE_PENDING {
                 if response[1] != service {
                     return Err("Pending response for different service".to_string());
@@ -187,6 +227,29 @@ mod tests {
             .diagnostic_session_control(&mut dev, 0x03)
             .expect("pending then positive");
         assert_eq!(p2, 50);
-        assert_eq!(p2_star, 500);
+        assert_eq!(p2_star, 5000, "P2* is reported in 10 ms units");
+    }
+
+    #[test]
+    fn server_timing_gets_client_margin() {
+        let mut dev = ScriptCan::new(0x7E0, 0x7E8);
+        let prof = EcuProfile::tacoma_can();
+        let mut client = UdsClient::for_profile(&mut dev, 1, &prof);
+        client.apply_server_timing(50, 5000);
+        assert!(client.p2_ms() >= 1000, "50 ms server P2 must not become the client deadline");
+        assert!(client.p2_star_ms() >= 5000);
+    }
+
+    #[test]
+    fn stale_tester_present_reply_is_skipped() {
+        let mut dev = ScriptCan::new(0x7E0, 0x7E8);
+        dev.enqueue_rx(&[0x02, 0x7E, 0x00, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA]);
+        dev.enqueue_rx(&[0x06, 0x50, 0x03, 0x00, 0x32, 0x01, 0xF4, 0xAA]);
+        let prof = EcuProfile::tacoma_can();
+        let mut client = UdsClient::for_profile(&mut dev, 1, &prof);
+        client.set_timers(200, 200);
+        client
+            .diagnostic_session_control(&mut dev, 0x03)
+            .expect("stale 7E 00 must not fail the session request");
     }
 }
