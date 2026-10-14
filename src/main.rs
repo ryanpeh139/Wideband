@@ -9,6 +9,7 @@ pub mod flash_job;
 pub mod flash_layout;
 pub mod managers;
 pub mod patch_recipe;
+pub mod histogram;
 pub mod isotp;
 pub mod live_trace;
 pub mod j2534;

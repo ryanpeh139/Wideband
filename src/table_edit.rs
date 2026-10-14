@@ -192,9 +192,38 @@ pub fn to_tsv(values: &[Vec<f64>], sel: &CellSelection) -> String {
         .join("\n")
 }
 
+/// How Ctrl+V combines clipboard cells with the table (HP Tuners "paste special").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasteMode {
+    Replace,
+    /// cell += clip
+    Add,
+    /// cell *= 1 + clip/100 (paste a % correction histogram)
+    MultiplyPercent,
+}
+
+impl PasteMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            PasteMode::Replace => "Replace",
+            PasteMode::Add => "Add",
+            PasteMode::MultiplyPercent => "Multiply by %",
+        }
+    }
+
+    fn combine(self, cell: f64, clip: f64) -> f64 {
+        match self {
+            PasteMode::Replace => clip,
+            PasteMode::Add => cell + clip,
+            PasteMode::MultiplyPercent => cell * (1.0 + clip / 100.0),
+        }
+    }
+}
+
 /// Parse clipboard text (tabs, commas, or runs of spaces between cells; one row per line).
-/// Errors name the first cell that isn't a number, so a bad paste changes nothing.
-pub fn parse_block(text: &str) -> Result<Vec<Vec<f64>>, String> {
+/// Empty cells (blank histogram bins) are `None` and skipped on paste. Errors name the first
+/// cell that isn't a number, so a bad paste changes nothing.
+pub fn parse_block(text: &str) -> Result<Vec<Vec<Option<f64>>>, String> {
     let mut out = Vec::new();
     for (ri, line) in text.lines().enumerate() {
         let line = line.trim_end_matches('\r');
@@ -211,26 +240,51 @@ pub fn parse_block(text: &str) -> Result<Vec<Vec<f64>>, String> {
         let mut row = Vec::with_capacity(cells.len());
         for (ci, cell) in cells.iter().enumerate() {
             let t = cell.trim();
+            if t.is_empty() {
+                row.push(None);
+                continue;
+            }
             let v: f64 = t
                 .parse()
                 .map_err(|_| format!("row {}, column {}: \"{}\" is not a number", ri + 1, ci + 1, t))?;
-            row.push(v);
+            row.push(Some(v));
         }
         out.push(row);
     }
-    if out.is_empty() {
+    if out.iter().all(|r| r.iter().all(|c| c.is_none())) {
         return Err("clipboard has no numbers".to_string());
     }
     Ok(out)
 }
 
-/// Paste `block` into `values`. A single value fills the whole selection; a block lands with
-/// its top-left at the selection's top-left and is clipped at the table edge.
-/// Returns the rectangle actually written.
+/// Optional-cell grid as TSV; `None` becomes an empty cell.
+pub fn grid_to_tsv(cells: &[Vec<Option<f64>>]) -> String {
+    cells
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|c| match c {
+                    Some(v) => {
+                        let s = format!("{:.4}", v);
+                        s.trim_end_matches('0').trim_end_matches('.').to_string()
+                    }
+                    None => String::new(),
+                })
+                .collect::<Vec<_>>()
+                .join("\t")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Paste `block` into `values` using `mode`. A single value applies to the whole selection; a
+/// block lands with its top-left at the selection's top-left, clipped at the table edge, and
+/// blank cells leave the table untouched. Returns the rectangle covered.
 pub fn paste_block(
     values: &mut [Vec<f64>],
     sel: &CellSelection,
-    block: &[Vec<f64>],
+    block: &[Vec<Option<f64>>],
+    mode: PasteMode,
 ) -> Option<CellSelection> {
     let rows = values.len();
     let cols = values.first().map_or(0, |r| r.len());
@@ -239,16 +293,23 @@ pub fn paste_block(
     }
     let (r0, r1, c0, c1) = sel.clamped(rows, cols).bounds();
     if block.len() == 1 && block[0].len() == 1 {
-        apply_math(values, &CellSelection { anchor: (r0, c0), cursor: (r1, c1) }, MathOp::Set(block[0][0]));
+        let clip = block[0][0]?;
+        for row in &mut values[r0..=r1] {
+            for v in &mut row[c0..=c1] {
+                *v = round2(mode.combine(*v, clip));
+            }
+        }
         return Some(CellSelection { anchor: (r0, c0), cursor: (r1, c1) });
     }
     let mut last = (r0, c0);
     for (dr, brow) in block.iter().enumerate() {
-        for (dc, v) in brow.iter().enumerate() {
+        for (dc, cell) in brow.iter().enumerate() {
             let (r, c) = (r0 + dr, c0 + dc);
             if r < rows && c < cols {
-                values[r][c] = round2(*v);
                 last = (last.0.max(r), last.1.max(c));
+                if let Some(clip) = cell {
+                    values[r][c] = round2(mode.combine(values[r][c], *clip));
+                }
             }
         }
     }
@@ -415,14 +476,14 @@ mod tests {
         let sel = CellSelection { anchor: (0, 1), cursor: (1, 2) };
         let tsv = to_tsv(&v, &sel);
         assert_eq!(tsv, "20\t30\n99\t99");
-        assert_eq!(parse_block(&tsv).unwrap(), vec![vec![20.0, 30.0], vec![99.0, 99.0]]);
+        assert_eq!(parse_block(&tsv).unwrap(), vec![vec![Some(20.0), Some(30.0)], vec![Some(99.0), Some(99.0)]]);
     }
 
     #[test]
     fn parse_accepts_excel_csv_and_spaces_and_reports_bad_cell() {
-        assert_eq!(parse_block("1\t2\r\n3\t4\r\n").unwrap(), vec![vec![1.0, 2.0], vec![3.0, 4.0]]);
-        assert_eq!(parse_block("1, 2.5\n").unwrap(), vec![vec![1.0, 2.5]]);
-        assert_eq!(parse_block(" -1   2 ").unwrap(), vec![vec![-1.0, 2.0]]);
+        assert_eq!(parse_block("1\t2\r\n3\t4\r\n").unwrap(), vec![vec![Some(1.0), Some(2.0)], vec![Some(3.0), Some(4.0)]]);
+        assert_eq!(parse_block("1, 2.5\n").unwrap(), vec![vec![Some(1.0), Some(2.5)]]);
+        assert_eq!(parse_block(" -1   2 ").unwrap(), vec![vec![Some(-1.0), Some(2.0)]]);
         let err = parse_block("1\t2\n3\tabc").unwrap_err();
         assert!(err.contains("row 2, column 2"), "{}", err);
     }
@@ -430,13 +491,28 @@ mod tests {
     #[test]
     fn paste_block_clips_at_edge_and_single_value_fills() {
         let mut v = grid();
-        let wrote = paste_block(&mut v, &CellSelection::single((2, 2)), &[vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]]).unwrap();
+        let b = |r: &[f64]| r.iter().map(|x| Some(*x)).collect::<Vec<_>>();
+        let wrote = paste_block(&mut v, &CellSelection::single((2, 2)), &[b(&[1.0, 2.0, 3.0]), b(&[4.0, 5.0, 6.0])], PasteMode::Replace).unwrap();
         assert_eq!(v[2], vec![50.0, 60.0, 1.0, 2.0]);
         assert_eq!(wrote.bounds(), (2, 2, 2, 3), "clipped to table");
 
         let mut v = grid();
-        paste_block(&mut v, &CellSelection { anchor: (0, 0), cursor: (1, 1) }, &[vec![7.0]]);
+        paste_block(&mut v, &CellSelection { anchor: (0, 0), cursor: (1, 1) }, &[vec![Some(7.0)]], PasteMode::Replace);
         assert_eq!((v[0][0], v[0][1], v[1][0], v[1][1], v[0][2]), (7.0, 7.0, 7.0, 7.0, 30.0));
+    }
+
+    #[test]
+    fn paste_special_skips_blanks_and_combines() {
+        // Histogram of % corrections with an empty bin in the middle.
+        let block = parse_block("10\t\t-50").unwrap();
+        assert_eq!(block, vec![vec![Some(10.0), None, Some(-50.0)]]);
+        let mut v = grid();
+        paste_block(&mut v, &CellSelection::single((0, 0)), &block, PasteMode::MultiplyPercent);
+        assert_eq!(&v[0][..3], &[11.0, 20.0, 15.0], "blank bin leaves 20 untouched");
+        let mut v = grid();
+        paste_block(&mut v, &CellSelection::single((0, 0)), &block, PasteMode::Add);
+        assert_eq!(&v[0][..3], &[20.0, 20.0, -20.0]);
+        assert_eq!(grid_to_tsv(&block), "10\t\t-50");
     }
 
     #[test]

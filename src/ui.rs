@@ -91,8 +91,11 @@ pub struct WidebandApp {
     pub table_undo: UndoStack,
     /// Typed value being entered for the selection (None = not typing).
     pub cell_entry: Option<String>,
+    /// How Ctrl+V combines clipboard cells (paste special).
+    pub paste_mode: table_edit::PasteMode,
     /// Log-based VE correction state (panel above the grid).
     pub ve_corr: VeCorrectionUi,
+    pub hist: HistogramUi,
     /// Live operating point on the selected table (separate from the edit selection).
     pub live_trace: live_trace::LiveTrace,
     pub math_amount: f64,
@@ -219,7 +222,9 @@ impl WidebandApp {
             grid_drag_select: false,
             table_undo: UndoStack::default(),
             cell_entry: None,
+            paste_mode: table_edit::PasteMode::Replace,
             ve_corr: VeCorrectionUi::default(),
+            hist: HistogramUi::default(),
             live_trace: live_trace::LiveTrace::default(),
             math_amount: 5.0,
             checksum_status: CHECKSUM_VALID.to_string(),
@@ -1753,6 +1758,13 @@ impl WidebandApp {
                     {
                         self.redo_table_edit();
                     }
+                    egui::ComboBox::from_id_salt("paste_mode")
+                        .selected_text(format!("Ctrl+V: {}", self.paste_mode.label()))
+                        .show_ui(ui, |ui| {
+                            for m in [table_edit::PasteMode::Replace, table_edit::PasteMode::Add, table_edit::PasteMode::MultiplyPercent] {
+                                ui.selectable_value(&mut self.paste_mode, m, m.label());
+                            }
+                        });
                     let sel = self.selection();
                     let (r0, r1, c0, c1) = sel.bounds();
                     ui.label(
@@ -1782,6 +1794,7 @@ impl WidebandApp {
 
                 self.handle_grid_keyboard(ui);
                 if !beginner_mode {
+                    self.render_histogram_panel(ui);
                     self.render_ve_correction_panel(ui);
                 }
                 ui.add_space(8.0);
@@ -1807,7 +1820,12 @@ impl WidebandApp {
         let live_cell = self.live_trace.current().map(live_trace::nearest_cell);
         let sel = self.selection().clamped(rows, cols);
         let multi = !sel.is_single();
-        let corr_overlay_owned = self.ve_corr.overlay_for(self.selected_table_idx).cloned();
+        let hist_overlay = self.hist.overlay_for(&self.xdf.tables[self.selected_table_idx]);
+        let corr_overlay_owned = if hist_overlay.is_some() {
+            None
+        } else {
+            self.ve_corr.overlay_for(self.selected_table_idx).cloned()
+        };
         let corr_overlay = corr_overlay_owned.as_ref();
         if !ui.input(|i| i.pointer.primary_down()) {
             self.grid_drag_select = false;
@@ -1879,7 +1897,30 @@ impl WidebandApp {
                             let text_color = Color32::from_rgb(0xFF, 0xFF, 0xFF);
                             let mut cell_text = format_cell_display(val, stock_val);
                             let mut corr_tip: Option<String> = None;
-                            if let Some(res) = corr_overlay {
+                            if let Some((h, lo, hi)) = &hist_overlay {
+                                // Histogram view: heat across the histogram's own range.
+                                match h.value(r, c) {
+                                    Some(hv) => {
+                                        bg_color = heatmap_color(hv, *lo, *hi);
+                                        cell_text = histogram_cell_text(hv);
+                                        corr_tip = Some(format!(
+                                            "{} {} = {}\n{} hits \u{00B7} table value {:.2}",
+                                            h.spec.aggregate.label(),
+                                            h.spec.value_channel,
+                                            histogram_cell_text(hv),
+                                            h.hits(r, c),
+                                            val
+                                        ));
+                                    }
+                                    None => {
+                                        bg_color = Color32::from_rgb(0x1E, 0x23, 0x2A);
+                                        cell_text = String::new();
+                                        if h.hits(r, c) > 0 {
+                                            corr_tip = Some(format!("{} hits (< {} minimum)", h.hits(r, c), h.spec.min_hits));
+                                        }
+                                    }
+                                }
+                            } else if let Some(res) = corr_overlay {
                                 // Suggestion view: red = lean (needs more), blue = rich (needs less).
                                 match res.change_pct(r, c) {
                                     Some(p) => {
@@ -3603,27 +3644,7 @@ impl WidebandApp {
             None => TargetLambda::Constant(self.ve_corr.target_const),
         };
         let table = self.xdf.tables[table_idx].clone();
-        let result = {
-            let buf = self.telemetry.lock().unwrap();
-            let live: Vec<crate::telemetry::TelemetryFrame>;
-            let frames: &[crate::telemetry::TelemetryFrame] = match self.ve_corr.source {
-                VeLogSource::Recording => &buf.record_frames,
-                VeLogSource::LiveBuffer => {
-                    live = buf.frames.iter().cloned().collect();
-                    &live
-                }
-                VeLogSource::ImportedLog => match &self.telemetry_playback.primary {
-                    Some(log) => &log.frames,
-                    None => &[],
-                },
-            };
-            if frames.is_empty() {
-                None
-            } else {
-                let src = FrameSource::new(&buf.id_index, frames);
-                Some(ve_correction::analyze(&table, &src, &settings))
-            }
-        };
+        let result = self.with_log(self.ve_corr.source, |src| ve_correction::analyze(&table, src, &settings));
         match result {
             None => {
                 self.ve_corr.result = None;
@@ -3647,6 +3668,7 @@ impl WidebandApp {
                     if res.used_trims { "included" } else { "not logged (open-loop lambda only)" },
                 );
                 self.ve_corr.show_overlay = true;
+                self.hist.show_overlay = false;
                 self.ve_corr.result = Some((table_idx, res));
             }
         }
@@ -3703,7 +3725,10 @@ impl WidebandApp {
                 egui::Event::Paste(text) => match table_edit::parse_block(&text) {
                     Ok(block) => {
                         let mut wrote = None;
-                        self.edit_selected_table("paste", |v, sel| wrote = table_edit::paste_block(v, sel, &block));
+                        let mode = self.paste_mode;
+                        self.edit_selected_table(&format!("paste ({})", mode.label()), |v, sel| {
+                            wrote = table_edit::paste_block(v, sel, &block, mode)
+                        });
                         if let Some(w) = wrote {
                             self.selection_anchor = Some(w.anchor);
                             self.active_cell = w.cursor;
@@ -3786,6 +3811,230 @@ impl WidebandApp {
         }
         if changed_entry {
             ui.ctx().request_repaint();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scanner histograms
+// ---------------------------------------------------------------------------
+
+pub struct HistogramUi {
+    pub source: VeLogSource,
+    pub value_channel: String,
+    pub x_channel: String,
+    pub y_channel: String,
+    pub aggregate: crate::histogram::Aggregate,
+    pub filter_on: bool,
+    pub filter: crate::histogram::Filter,
+    pub min_hits: u32,
+    pub result: Option<crate::histogram::Histogram>,
+    pub show_overlay: bool,
+    pub message: String,
+}
+
+impl Default for HistogramUi {
+    fn default() -> Self {
+        Self {
+            source: VeLogSource::Recording,
+            value_channel: "lambda".into(),
+            x_channel: "rpm".into(),
+            y_channel: "map".into(),
+            aggregate: crate::histogram::Aggregate::Mean,
+            filter_on: false,
+            filter: crate::histogram::Filter { channel: "ect".into(), min: 70.0, max: 130.0 },
+            min_hits: 3,
+            result: None,
+            show_overlay: true,
+            message: String::new(),
+        }
+    }
+}
+
+impl HistogramUi {
+    /// Histogram + value range when it was built for `table` (same id and shape) and is shown.
+    fn overlay_for(&self, table: &crate::definitions::XdfTable) -> Option<(crate::histogram::Histogram, f64, f64)> {
+        let h = self.result.as_ref()?;
+        let shape_ok = h.rows() == table.values.len() && h.cols() == table.values.first().map_or(0, |r| r.len());
+        if !self.show_overlay || h.table_id != table.id || !shape_ok {
+            return None;
+        }
+        let (lo, hi) = h.range().unwrap_or((0.0, 1.0));
+        Some((h.clone(), lo, hi))
+    }
+}
+
+fn histogram_cell_text(v: f64) -> String {
+    if v.abs() >= 100.0 {
+        format!("{:.0}", v)
+    } else if v.abs() >= 10.0 {
+        format!("{:.1}", v)
+    } else {
+        format!("{:.3}", v)
+    }
+}
+
+impl WidebandApp {
+    /// Run `f` over the frames of a log source. `None` when that source has no frames.
+    fn with_log<R>(&self, source: VeLogSource, f: impl FnOnce(&dyn ve_correction::SampleSource) -> R) -> Option<R> {
+        let buf = self.telemetry.lock().unwrap();
+        let live: Vec<crate::telemetry::TelemetryFrame>;
+        let frames: &[crate::telemetry::TelemetryFrame] = match source {
+            VeLogSource::Recording => &buf.record_frames,
+            VeLogSource::LiveBuffer => {
+                live = buf.frames.iter().cloned().collect();
+                &live
+            }
+            VeLogSource::ImportedLog => match &self.telemetry_playback.primary {
+                Some(log) => &log.frames,
+                None => &[],
+            },
+        };
+        if frames.is_empty() {
+            return None;
+        }
+        let src = FrameSource::new(&buf.id_index, frames);
+        Some(f(&src))
+    }
+
+    fn render_histogram_panel(&mut self, ui: &mut egui::Ui) {
+        let table_idx = self.selected_table_idx;
+        let channels: Vec<(String, String)> = {
+            let buf = self.telemetry.lock().unwrap();
+            buf.channels.iter().map(|c| (c.id.clone(), format!("{} ({})", c.label, c.id))).collect()
+        };
+        let (rec_n, live_n) = {
+            let buf = self.telemetry.lock().unwrap();
+            (buf.record_frames.len(), buf.frames.len())
+        };
+        let imported = self.telemetry_playback.primary.as_ref().map(|l| (l.name.clone(), l.frames.len()));
+
+        egui::CollapsingHeader::new(egui::RichText::new("Scanner histogram (bin any channel into this table)").strong().color(TEXT))
+            .id_salt("hist_panel")
+            .default_open(false)
+            .show(ui, |ui| {
+                let channel_combo = |ui: &mut egui::Ui, id: &str, value: &mut String| {
+                    let shown = channels.iter().find(|(c, _)| c == value).map(|(_, l)| l.clone()).unwrap_or_else(|| value.clone());
+                    egui::ComboBox::from_id_salt(id).selected_text(shown).width(170.0).show_ui(ui, |ui| {
+                        for (cid, label) in &channels {
+                            ui.selectable_value(value, cid.clone(), label);
+                        }
+                    });
+                };
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Log:").color(MUTED));
+                    let src_label = |s: VeLogSource| match s {
+                        VeLogSource::Recording => format!("Recorded ({} frames)", rec_n),
+                        VeLogSource::LiveBuffer => format!("Live buffer ({})", live_n),
+                        VeLogSource::ImportedLog => match &imported {
+                            Some((n, f)) => format!("Imported: {} ({})", n, f),
+                            None => "Imported (none)".to_string(),
+                        },
+                    };
+                    egui::ComboBox::from_id_salt("hist_src").selected_text(src_label(self.hist.source)).show_ui(ui, |ui| {
+                        for s in [VeLogSource::Recording, VeLogSource::LiveBuffer, VeLogSource::ImportedLog] {
+                            ui.selectable_value(&mut self.hist.source, s, src_label(s));
+                        }
+                    });
+                    egui::ComboBox::from_id_salt("hist_agg").selected_text(self.hist.aggregate.label()).show_ui(ui, |ui| {
+                        for a in crate::histogram::Aggregate::ALL {
+                            ui.selectable_value(&mut self.hist.aggregate, a, a.label());
+                        }
+                    });
+                    ui.label(egui::RichText::new("of").color(MUTED));
+                    channel_combo(ui, "hist_val", &mut self.hist.value_channel);
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Columns (X):").color(MUTED));
+                    channel_combo(ui, "hist_x", &mut self.hist.x_channel);
+                    ui.label(egui::RichText::new("Rows (Y):").color(MUTED));
+                    channel_combo(ui, "hist_y", &mut self.hist.y_channel);
+                    ui.label(egui::RichText::new("Min hits").color(MUTED));
+                    ui.add(egui::DragValue::new(&mut self.hist.min_hits).range(1..=1000));
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.checkbox(&mut self.hist.filter_on, "Only when");
+                    channel_combo(ui, "hist_filter", &mut self.hist.filter.channel);
+                    ui.label("between");
+                    ui.add(egui::DragValue::new(&mut self.hist.filter.min).speed(0.5));
+                    ui.label("and");
+                    ui.add(egui::DragValue::new(&mut self.hist.filter.max).speed(0.5));
+                    if ui.button("Use table axes").on_hover_text("Pick X/Y channels from this table's axis units").clicked() {
+                        let t = &self.xdf.tables[table_idx];
+                        if let Some(x) = live_trace::channel_for_axis_units(&t.x_axis.units) {
+                            self.hist.x_channel = x.to_string();
+                        }
+                        if let Some(y) = live_trace::channel_for_axis_units(&t.y_axis.units) {
+                            self.hist.y_channel = y.to_string();
+                        }
+                    }
+                    if ui.button("Build histogram").clicked() {
+                        self.build_histogram();
+                    }
+                });
+                if !self.hist.message.is_empty() {
+                    ui.label(egui::RichText::new(&self.hist.message).small().color(MUTED));
+                }
+                let built_here = self
+                    .hist
+                    .result
+                    .as_ref()
+                    .map_or(false, |h| h.table_id == self.xdf.tables[table_idx].id);
+                if built_here {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.checkbox(&mut self.hist.show_overlay, "Show on grid").changed() && self.hist.show_overlay {
+                            self.ve_corr.show_overlay = false;
+                        }
+                        if ui
+                            .button("Copy histogram")
+                            .on_hover_text("Tab-separated; empty bins stay empty. Then pick a Ctrl+V mode and paste into any table.")
+                            .clicked()
+                        {
+                            if let Some(h) = &self.hist.result {
+                                ui.ctx().copy_text(crate::table_edit::grid_to_tsv(&h.grid()));
+                                // Paste lands at the cursor: put it on the first cell so the bins line up.
+                                self.selection_anchor = None;
+                                self.active_cell = (0, 0);
+                                self.hist.message = "Copied. Select the target table's first cell, choose the Ctrl+V mode, and paste.".into();
+                            }
+                        }
+                        if ui.button("Clear").clicked() {
+                            self.hist.result = None;
+                            self.hist.message.clear();
+                        }
+                    });
+                }
+            });
+    }
+
+    fn build_histogram(&mut self) {
+        let table = self.xdf.tables[self.selected_table_idx].clone();
+        let spec = crate::histogram::HistogramSpec {
+            value_channel: self.hist.value_channel.clone(),
+            x_channel: self.hist.x_channel.clone(),
+            y_channel: self.hist.y_channel.clone(),
+            aggregate: self.hist.aggregate,
+            filter: self.hist.filter_on.then(|| self.hist.filter.clone()),
+            min_hits: self.hist.min_hits,
+        };
+        let res = self.with_log(self.hist.source, |src| {
+            crate::histogram::build(&table.id, &table.x_axis.labels, &table.y_axis.labels, src, &spec)
+        });
+        match res {
+            None => {
+                self.hist.result = None;
+                self.hist.message = "No frames in that log. Record on the Telemetry tab or import a CSV.".into();
+            }
+            Some(h) => {
+                let filled = h.grid().iter().flatten().filter(|c| c.is_some()).count();
+                self.hist.message = format!(
+                    "{} samples binned into {} cells; {} filtered out, {} outside the table axes, {} missing a channel.",
+                    h.used, filled, h.filtered, h.off_axes, h.missing
+                );
+                self.hist.show_overlay = true;
+                self.ve_corr.show_overlay = false;
+                self.hist.result = Some(h);
+            }
         }
     }
 }
