@@ -15,6 +15,10 @@ use crate::j2534::{
 #[cfg(windows)]
 use crate::j2534_host::HostPassThruDevice;
 use crate::protocols::{EcuIdentification, EcuIdentifier, EcuProfile};
+use crate::tcm::{
+    build_parameter_view, flash_blockers as tcm_flash_blockers, group_label, TcmIdentifier,
+    TcmParameterGroup, TcmParameterView, TcmProfile, TcmProfileCatalog,
+};
 use crate::security_config::{
     key_registration_label, security_mode_label, PlatformSecurity, KeyRegistration, SecurityMode,
     CHECKSUM_NOT_CONFIGURED, CHECKSUM_VALID,
@@ -37,6 +41,7 @@ use std::time::Instant;
 pub enum WorkspaceTab {
     Calibration,
     Telemetry,
+    Transmission,
     FlashDiagnostics,
     Switchboard,
 }
@@ -96,6 +101,14 @@ pub struct WidebandApp {
     pub connection_last_error: String,
     pub header_vbatt: Option<f32>,
 
+    // TCM (paired with ECM profile)
+    pub tcm_profiles: Vec<TcmProfile>,
+    pub selected_tcm_profile_idx: usize,
+    pub tcm_id: EcuIdentification,
+    pub tcm_identify_error: String,
+    pub tcm_param_view: TcmParameterView,
+    pub tcm_flash_confirm_open: bool,
+
     // UI Workspace
     pub active_tab: WorkspaceTab,
 }
@@ -109,7 +122,13 @@ impl WidebandApp {
         if !catalog.load_note.is_empty() {
             eprintln!("profiles: {}", catalog.load_note);
         }
+        let tcm_catalog = TcmProfileCatalog::load_default();
+        let tcm_profiles = tcm_catalog.profiles;
+        if !tcm_catalog.load_note.is_empty() {
+            eprintln!("tcm profiles: {}", tcm_catalog.load_note);
+        }
         let xdf = XdfDocument::sample();
+        let tcm_param_view = build_parameter_view(&xdf);
 
         let stock_tables = xdf.tables.iter().map(|t| t.values.clone()).collect();
         let stock_constants = xdf.constants.iter().map(|c| c.value).collect();
@@ -174,8 +193,22 @@ impl WidebandApp {
             diag_last_error: String::new(),
             connection_last_error: String::new(),
             header_vbatt: None,
+            tcm_profiles,
+            selected_tcm_profile_idx: 0,
+            tcm_id: EcuIdentification::default(),
+            tcm_identify_error: String::new(),
+            tcm_param_view,
+            tcm_flash_confirm_open: false,
             active_tab: WorkspaceTab::Calibration,
         };
+
+        if let Some(idx) = app
+            .tcm_profiles
+            .iter()
+            .position(|p| p.paired_ecm_profile_id == app.profiles[app.selected_profile_idx].id)
+        {
+            app.selected_tcm_profile_idx = idx;
+        }
 
         let sec_note = PlatformSecurity::load_note();
         if !sec_note.is_empty() {
@@ -266,6 +299,7 @@ impl WidebandApp {
             Ok(xml) => match XdfDocument::parse(&xml) {
                 Ok(doc) => {
                     self.xdf = doc;
+                    self.tcm_param_view = build_parameter_view(&self.xdf);
                     self.selected_table_idx = 0;
                     self.active_cell = (0, 0);
                     let label = path.file_name().unwrap_or_default().to_string_lossy().to_string();
@@ -742,8 +776,24 @@ impl WidebandApp {
             });
     }
 
+    fn sync_tcm_profile_to_ecm(&mut self) {
+        let ecm_id = self.profiles[self.selected_profile_idx].id.clone();
+        if let Some(idx) = self
+            .tcm_profiles
+            .iter()
+            .position(|p| p.paired_ecm_profile_id == ecm_id)
+        {
+            self.selected_tcm_profile_idx = idx;
+        }
+    }
+
+    fn selected_tcm_profile(&self) -> &TcmProfile {
+        &self.tcm_profiles[self.selected_tcm_profile_idx.min(self.tcm_profiles.len().saturating_sub(1))]
+    }
+
     fn paint_profile_selector(&mut self, ui: &mut egui::Ui, width: f32) {
         ui.label(egui::RichText::new("Vehicle").size(11.0).color(MUTED));
+        let prev_ecm = self.selected_profile_idx;
         egui::ComboBox::from_id_salt("profile_select")
             .width(width)
             .selected_text(&self.profiles[self.selected_profile_idx].name)
@@ -752,6 +802,9 @@ impl WidebandApp {
                     ui.selectable_value(&mut self.selected_profile_idx, idx, &prof.name);
                 }
             });
+        if prev_ecm != self.selected_profile_idx {
+            self.sync_tcm_profile_to_ecm();
+        }
     }
 
     fn paint_connect_controls(&mut self, ui: &mut egui::Ui, device_combo_w: f32) {
@@ -792,6 +845,7 @@ impl WidebandApp {
         let tabs = [
             (WorkspaceTab::Switchboard, "Switchboard"),
             (WorkspaceTab::FlashDiagnostics, "Flash & Diag"),
+            (WorkspaceTab::Transmission, "Transmission"),
             (WorkspaceTab::Telemetry, "Telemetry"),
             (WorkspaceTab::Calibration, "Calibration"),
         ];
@@ -952,6 +1006,7 @@ impl eframe::App for WidebandApp {
         match self.active_tab {
             WorkspaceTab::Calibration => self.render_calibration_tab(ctx),
             WorkspaceTab::Telemetry => self.render_telemetry_tab(ctx),
+            WorkspaceTab::Transmission => self.render_transmission_tab(ctx),
             WorkspaceTab::FlashDiagnostics => self.render_flash_tab(ctx),
             WorkspaceTab::Switchboard => self.render_switchboard_tab(ctx),
         }
@@ -1629,6 +1684,237 @@ fn read_pass_thru_vbatt(dev: &mut dyn PassThruDevice, channel: u32) -> Option<f3
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Tab: Transmission (TCM read / parameter scaffolding)
+// ---------------------------------------------------------------------------
+
+impl WidebandApp {
+    fn render_transmission_tab(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading(
+                egui::RichText::new("Transmission Control Module (TCM)")
+                    .size(16.0)
+                    .color(Color32::WHITE),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "Read-oriented TCM identify and definition-tagged shift / pressure / TCC views. Flash stays fail-closed until security-config and flash-layout are configured like ECM.",
+                )
+                .small()
+                .color(MUTED),
+            );
+            ui.separator();
+
+            let tcm = self.selected_tcm_profile().clone();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("TCM profile").size(11.0).color(MUTED));
+                egui::ComboBox::from_id_salt("tcm_profile_select")
+                    .width(280.0)
+                    .selected_text(&tcm.name)
+                    .show_ui(ui, |ui| {
+                        for (idx, prof) in self.tcm_profiles.iter().enumerate() {
+                            ui.selectable_value(&mut self.selected_tcm_profile_idx, idx, &prof.name);
+                        }
+                    });
+            });
+            ui.label(
+                egui::RichText::new(format!(
+                    "Paired ECM: {} · Family: {} · TX 0x{:X} / RX 0x{:X}",
+                    tcm.paired_ecm_profile_id,
+                    tcm.transmission_family,
+                    tcm.request_id,
+                    tcm.response_id
+                ))
+                .small()
+                .color(MUTED),
+            );
+            ui.add_space(8.0);
+
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .button(egui::RichText::new("Identify TCM").strong())
+                    .clicked()
+                {
+                    self.tcm_identify_error.clear();
+                    if let Some(dev) = &mut self.active_device {
+                        let allow_demo = self.active_device_virtual;
+                        let channel = dev.channel_id();
+                        match TcmIdentifier::query(dev.as_mut(), channel, &tcm, allow_demo) {
+                            Ok(id) => {
+                                let details = id.details.clone();
+                                self.tcm_id = id;
+                                self.log(&details);
+                            }
+                            Err(e) => {
+                                self.tcm_identify_error = e.clone();
+                                self.log(&format!("TCM identification failed: {}", e));
+                            }
+                        }
+                    } else {
+                        self.tcm_identify_error = "Connect cable first.".to_string();
+                    }
+                }
+
+                let virtual_ecu = self.cable_is_virtual();
+                let blockers = tcm_flash_blockers(&tcm, virtual_ecu, &self.flash_layout);
+                let flash_blocked = !blockers.is_empty();
+                if ui
+                    .add_enabled(
+                        !flash_blocked,
+                        egui::Button::new(
+                            egui::RichText::new("Flash TCM calibration")
+                                .strong()
+                                .color(Color32::from_rgb(255, 120, 80)),
+                        ),
+                    )
+                    .clicked()
+                {
+                    self.tcm_flash_confirm_open = true;
+                }
+            });
+
+            if !self.tcm_identify_error.is_empty() {
+                ui.label(
+                    egui::RichText::new(&self.tcm_identify_error)
+                        .small()
+                        .color(Color32::from_rgb(255, 152, 0)),
+                );
+            }
+
+            if !self.tcm_id.details.is_empty() {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(&self.tcm_id.details).monospace().color(TEXT));
+            }
+
+            if self.tcm_flash_confirm_open {
+                let virtual_ecu = self.cable_is_virtual();
+                let blockers = tcm_flash_blockers(&tcm, virtual_ecu, &self.flash_layout);
+                let mut confirm = false;
+                let mut cancel = false;
+                egui::Window::new("Confirm TCM calibration flash")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.label(
+                            "TCM writes require the same security-config and checksum setup as ECM. This build keeps TCM flash gated until layout and bench validation are complete.",
+                        );
+                        ui.label(format!("TCM profile: {}", tcm.name));
+                        for reason in &blockers {
+                            ui.label(
+                                egui::RichText::new(format!("Blocked: {}", reason))
+                                    .color(Color32::from_rgb(255, 152, 0)),
+                            );
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("Cancel").clicked() {
+                                cancel = true;
+                            }
+                            if ui
+                                .add_enabled(blockers.is_empty(), egui::Button::new("Flash"))
+                                .clicked()
+                            {
+                                confirm = true;
+                            }
+                        });
+                    });
+                if cancel {
+                    self.tcm_flash_confirm_open = false;
+                }
+                if confirm && blockers.is_empty() {
+                    self.tcm_flash_confirm_open = false;
+                    self.log("TCM flash refused: execution path not enabled in this milestone.");
+                }
+            }
+
+            ui.add_space(12.0);
+            ui.heading(egui::RichText::new("Shift / pressure / TCC (from XDF)").size(14.0).color(ACCENT_CYAN));
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} — {}",
+                    self.tcm_param_view.definition_title,
+                    self.tcm_param_view.note
+                ))
+                .small()
+                .color(MUTED),
+            );
+
+            for group in [
+                TcmParameterGroup::Shift,
+                TcmParameterGroup::Pressure,
+                TcmParameterGroup::Tcc,
+            ] {
+                let rows: Vec<_> = self
+                    .tcm_param_view
+                    .entries
+                    .iter()
+                    .filter(|e| e.group == group)
+                    .collect();
+                if rows.is_empty() {
+                    continue;
+                }
+                ui.add_space(8.0);
+                ui.collapsing(group_label(group), |ui| {
+                    TableBuilder::new(ui)
+                        .striped(true)
+                        .column(Column::auto().at_least(160.0))
+                        .column(Column::auto().at_least(64.0))
+                        .column(Column::remainder())
+                        .header(20.0, |mut row| {
+                            row.col(|ui| {
+                                ui.label(egui::RichText::new("Parameter").small().strong());
+                            });
+                            row.col(|ui| {
+                                ui.label(egui::RichText::new("Kind").small().strong());
+                            });
+                            row.col(|ui| {
+                                ui.label(egui::RichText::new("Summary").small().strong());
+                            });
+                        })
+                        .body(|mut body| {
+                            for entry in rows {
+                                body.row(22.0, |mut row| {
+                                    row.col(|ui| {
+                                        ui.label(egui::RichText::new(&entry.title).color(TEXT));
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(entry.kind)
+                                                .small()
+                                                .color(MUTED),
+                                        );
+                                    });
+                                    row.col(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(&entry.summary)
+                                                .small()
+                                                .color(MUTED),
+                                        );
+                                    });
+                                });
+                            }
+                        });
+                });
+            }
+
+            if self
+                .tcm_param_view
+                .entries
+                .iter()
+                .all(|e| e.group == TcmParameterGroup::Other)
+            {
+                ui.label(
+                    egui::RichText::new(
+                        "Load a transmission XDF or rename tables with shift, pressure, or TCC keywords to populate this panel.",
+                    )
+                    .small()
+                    .color(MUTED),
+                );
+            }
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@ pub mod security_config;
 pub mod security_session;
 pub mod telemetry;
 pub mod surface_mesh;
+pub mod tcm;
 pub mod theme;
 pub mod ui;
 pub mod uds;
@@ -393,6 +394,18 @@ mod tests {
     }
 
     #[test]
+    fn test_virtual_ecu_tcm_identify() {
+        use crate::tcm::{TcmIdentifier, TcmProfile};
+
+        let mut sim = VirtualEcuSimulator::new();
+        sim.open().unwrap();
+        let channel = sim.connect(ISO15765, 0, 500000).unwrap();
+        let prof = TcmProfile::tacoma_can_tcm();
+        let id = TcmIdentifier::query(&mut sim, channel, &prof, true).expect("TCM identify");
+        assert_eq!(id.cal_id, j2534::VIRTUAL_TACOMA_TCM_CAL_ID);
+        sim.close().unwrap();
+    }
+
     fn test_virtual_ecu_read_only_diagnostics() {
         use diagnostics::{decode_dtc_bytes, DiagnosticsReader};
 

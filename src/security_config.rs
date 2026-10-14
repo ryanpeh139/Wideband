@@ -61,11 +61,15 @@ pub struct SecurityReport {
     pub flash_blockers: Vec<String>,
 }
 
-const BUILT_IN_PROFILES: [&str; 4] = [
+const BUILT_IN_PROFILES: [&str; 8] = [
     "tacoma-can",
     "tacoma-kline",
     "silverado-can",
     "silverado-vpw",
+    "tacoma-can-tcm",
+    "tacoma-kline-tcm",
+    "silverado-can-tcm",
+    "silverado-vpw-tcm",
 ];
 
 #[derive(Clone, Debug)]
@@ -671,7 +675,11 @@ fn template_json() -> &'static str {
     "tacoma-can": { "algorithm": "denso32", "mask": "0x00000000", "generation": "", "endian": "big", "configured": false },
     "tacoma-kline": { "algorithm": "denso32", "mask": "0x00000000", "generation": "", "endian": "big", "configured": false },
     "silverado-can": { "algorithm": "gm", "keyId": "", "configured": false },
-    "silverado-vpw": { "algorithm": "gm", "keyId": "", "configured": false }
+    "silverado-vpw": { "algorithm": "gm", "keyId": "", "configured": false },
+    "tacoma-can-tcm": { "algorithm": "denso32", "mask": "0x00000000", "generation": "", "endian": "big", "configured": false },
+    "tacoma-kline-tcm": { "algorithm": "denso32", "mask": "0x00000000", "generation": "", "endian": "big", "configured": false },
+    "silverado-can-tcm": { "algorithm": "gm", "keyId": "", "configured": false },
+    "silverado-vpw-tcm": { "algorithm": "gm", "keyId": "", "configured": false }
   },
   "densoGenerations": [ { "id": "example", "mask": "0x00000000", "endian": "big", "configured": false } ],
   "gmKeys": [ { "id": "example", "bits": 16, "rotate": 1, "direction": "left", "xor": "0x0000", "add": 0, "endian": "big", "configured": false } ],

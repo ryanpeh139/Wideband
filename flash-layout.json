@@ -63,6 +63,30 @@
           "size": 65536
         }
       ]
+    },
+    "tacoma-can-tcm": {
+      "rom_origin": 0,
+      "image_bytes": 524288,
+      "stock_read": { "address": 0, "size": 0 },
+      "cal_flash_segments": []
+    },
+    "tacoma-kline-tcm": {
+      "rom_origin": 0,
+      "image_bytes": 262144,
+      "stock_read": { "address": 0, "size": 0 },
+      "cal_flash_segments": []
+    },
+    "silverado-can-tcm": {
+      "rom_origin": 0,
+      "image_bytes": 1048576,
+      "stock_read": { "address": 0, "size": 0 },
+      "cal_flash_segments": []
+    },
+    "silverado-vpw-tcm": {
+      "rom_origin": 0,
+      "image_bytes": 524288,
+      "stock_read": { "address": 0, "size": 0 },
+      "cal_flash_segments": []
     }
   }
 }
