@@ -850,7 +850,7 @@ impl PassThruDevice for VirtualEcuSimulator {
             }
             if self.active_protocol == ISO14230 {
                 if let Some(inner) = crate::ecu_bus::kwp::try_unpack_to_ecu(req_payload, 0x10) {
-                    let resp_payload = self.handle_uds_request(&inner);
+                    let resp_payload = self.handle_uds_request(&inner, BenchEcuRole::Ecm);
                     if let Ok(frame) = crate::ecu_bus::kwp::pack(0xF1, 0x10, &resp_payload) {
                         self.rx_queue.push(PassThruMsg::new(ISO14230, &frame));
                     }
@@ -858,7 +858,7 @@ impl PassThruDevice for VirtualEcuSimulator {
                 }
             } else if self.active_protocol == J1850VPW {
                 if let Some(inner) = crate::ecu_bus::vpw::try_unpack_to_ecu(req_payload, 0x10) {
-                    let resp_payload = self.handle_uds_request(&inner);
+                    let resp_payload = self.handle_uds_request(&inner, BenchEcuRole::Ecm);
                     if let Ok(frame) = crate::ecu_bus::vpw::pack(0x6C, 0xF1, 0x10, &resp_payload) {
                         self.rx_queue.push(PassThruMsg::new(J1850VPW, &frame));
                     }
