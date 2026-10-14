@@ -271,6 +271,11 @@ namespace Wideband
             table.Values = next;
         }
 
+        public static void Set(TuneTable table, IList selected, double value)
+        {
+            Each(table, selected, delegate (int y, int x) { table.Values[y][x] = value; });
+        }
+
         public static void Interpolate(TuneTable table, IList selected)
         {
             int y0, x0, y1, x1;
@@ -335,6 +340,127 @@ namespace Wideband
             }
             return best;
         }
+    }
+
+    static class HeatColor
+    {
+        public static Color Blend(double unit)
+        {
+            return Mix(unit, Color.FromArgb(186, 214, 236), Color.FromArgb(196, 224, 186), Color.FromArgb(236, 186, 176));
+        }
+
+        public static Color Deep(double unit)
+        {
+            return Mix(unit, Color.FromArgb(48, 96, 160), Color.FromArgb(36, 140, 88), Color.FromArgb(176, 64, 58));
+        }
+
+        static Color Mix(double unit, Color low, Color mid, Color high)
+        {
+            if (unit < 0) unit = 0;
+            if (unit > 1) unit = 1;
+            if (unit < 0.5) return Lerp(low, mid, unit / 0.5);
+            return Lerp(mid, high, (unit - 0.5) / 0.5);
+        }
+
+        static Color Lerp(Color a, Color b, double unit)
+        {
+            return Color.FromArgb(
+                a.R + (int)((b.R - a.R) * unit),
+                a.G + (int)((b.G - a.G) * unit),
+                a.B + (int)((b.B - a.B) * unit));
+        }
+    }
+
+    static class CellDelta
+    {
+        public static bool Changed(double value, double basis)
+        {
+            return Math.Abs(value - basis) > 0.0001;
+        }
+
+        public static string Display(TuneTable table, double value, double basis)
+        {
+            string text = FormatNumber(table, value);
+            double delta = value - basis;
+            if (!Changed(value, basis)) return text;
+            string sign = delta > 0 ? "+" : "";
+            return text + " (" + sign + FormatNumber(table, delta) + ")";
+        }
+
+        public static string FormatNumber(TuneTable table, double value)
+        {
+            if (table == null) return value.ToString("0.###", CultureInfo.InvariantCulture);
+            if (table.Decimals == 0) return Math.Round(value).ToString("0", CultureInfo.InvariantCulture);
+            if (table.Decimals > 0)
+            {
+                int places = table.Decimals;
+                if (places > 8) places = 8;
+                return value.ToString("0." + new string('0', places), CultureInfo.InvariantCulture);
+            }
+            return value.ToString("0.###", CultureInfo.InvariantCulture);
+        }
+    }
+
+    static class CellCommand
+    {
+        public static void Run(TuneTable table, IList selected, string text, double amount)
+        {
+            if (table == null) throw new ArgumentNullException("table");
+            if (text == null) text = "";
+            text = text.Trim();
+            if (text.Length == 0)
+            {
+                TableMath.Add(table, selected, amount);
+                return;
+            }
+            if (text[text.Length - 1] == '%')
+            {
+                TableMath.Scale(table, selected, ParseNumber(text.Substring(0, text.Length - 1)));
+                return;
+            }
+            if (text[0] == '=')
+            {
+                TableMath.Set(table, selected, ParseNumber(text.Substring(1)));
+                return;
+            }
+            TableMath.Add(table, selected, ParseNumber(text));
+        }
+
+        static double ParseNumber(string text)
+        {
+            if (text == null) text = "";
+            text = text.Trim();
+            double value;
+            if (!double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out value))
+                throw new FormatException("The command must be +5%, -2%, =value, or a signed number.");
+            return value;
+        }
+    }
+
+    static class CellPaint
+    {
+        public static string Apply(DataGridViewCellStyle style, TuneTable table, double value, double basis, double unit, bool compare, Font bold, Font regular)
+        {
+            bool changed = CellDelta.Changed(value, basis);
+            if (bold != null && regular != null) style.Font = changed ? bold : regular;
+            style.ForeColor = Color.FromArgb(23, 33, 28);
+            if (compare)
+            {
+                double delta = value - basis;
+                if (delta > 0.0001) style.BackColor = Color.FromArgb(214, 236, 214);
+                else if (delta < -0.0001) style.BackColor = Color.FromArgb(244, 214, 214);
+                else style.BackColor = Color.FromArgb(247, 248, 246);
+            }
+            else style.BackColor = HeatColor.Blend(unit);
+            return CellDelta.Display(table, value, basis);
+        }
+    }
+
+    sealed class SwitchPoint
+    {
+        public TuneTable Table;
+        public int Y;
+        public int X;
     }
 
     sealed class LogTable
@@ -482,6 +608,13 @@ namespace Wideband
         readonly Label status;
         readonly Label note;
         readonly Label checksumMark;
+        readonly TextBox searchBox;
+        readonly TextBox commandBox;
+        readonly TextBox switchSearch;
+        readonly Button tableViewButton;
+        readonly Button switchViewButton;
+        readonly Panel switchList;
+        readonly Font boldFont;
         TuneTable current;
         MemoryImage rom;
         long romOrigin;
@@ -489,6 +622,12 @@ namespace Wideband
         string romPath = "";
         XdfDocument definition;
         bool romBacked;
+        bool showSwitches;
+        bool fillingSwitches;
+        string parameterFilter = "";
+        string switchFilter = "";
+        double heatMin;
+        double heatSpan = 1;
 
         public CalibratePanel(TuneDocument document, string savePath)
         {
@@ -499,12 +638,12 @@ namespace Wideband
 
             note = new Label();
             note.Dock = DockStyle.Top;
-            note.Height = 64;
+            note.Height = 80;
             note.Text = document.Note + " Tables are edited here. Nothing is written to an ECU.";
 
             var tools = new FlowLayoutPanel();
             tools.Dock = DockStyle.Top;
-            tools.Height = 148;
+            tools.Height = 188;
             tools.WrapContents = true;
             tools.Controls.Add(MakeButton("Open ROM", OpenRomClicked));
             tools.Controls.Add(MakeButton("Open XDF", OpenXdfClicked));
@@ -543,19 +682,50 @@ namespace Wideband
             tools.Controls.Add(MakeButton("Scale %", ScaleClicked));
             tools.Controls.Add(amount);
             tools.Controls.Add(MakeButton("Smooth", delegate { Run(delegate { TableMath.Smooth(current, grid.SelectedCells); }, "Smoothed the selected cells."); }));
-            tools.Controls.Add(MakeButton("Interpolate", delegate { Run(delegate { TableMath.Interpolate(current, grid.SelectedCells); }, "Interpolated the selected block from its corners."); }));
+            tools.Controls.Add(MakeButton("Interpolate", delegate { InterpolateSelection(); }));
+            commandBox = new TextBox();
+            commandBox.Width = 110;
+            commandBox.AccessibleName = "Cell command";
+            commandBox.KeyDown += CommandKeyDown;
+            tools.Controls.Add(commandBox);
+            tools.Controls.Add(MakeButton("Apply", ApplyClicked));
+            tableViewButton = MakeButton("Table", delegate { ShowTableView(); });
+            switchViewButton = MakeButton("Switches", delegate { ShowSwitchView(); });
+            tools.Controls.Add(tableViewButton);
+            tools.Controls.Add(switchViewButton);
+            PaintViewButtons();
             tools.Controls.Add(compare);
             tools.Controls.Add(LabelFor("Trace"));
             tools.Controls.Add(traceX);
             tools.Controls.Add(traceY);
 
+            var sidebar = new Panel();
+            sidebar.Dock = DockStyle.Left;
+            sidebar.Width = 260;
+            sidebar.BackColor = BackColor;
+            var findLabel = new Label();
+            findLabel.Text = "Find";
+            findLabel.Dock = DockStyle.Top;
+            findLabel.Height = 22;
+            searchBox = new TextBox();
+            searchBox.Dock = DockStyle.Top;
+            searchBox.AccessibleName = "Parameter search";
+            searchBox.TextChanged += delegate
+            {
+                parameterFilter = searchBox.Text.Trim();
+                FillList();
+            };
             tree = new TreeView();
-            tree.Dock = DockStyle.Left;
-            tree.Width = 220;
+            tree.Dock = DockStyle.Fill;
             tree.BorderStyle = BorderStyle.None;
             tree.HideSelection = false;
+            tree.ShowPlusMinus = true;
+            tree.ShowRootLines = true;
             tree.BackColor = BackColor;
             tree.AccessibleName = "Parameter tree";
+            sidebar.Controls.Add(tree);
+            sidebar.Controls.Add(searchBox);
+            sidebar.Controls.Add(findLabel);
 
             mesh = new SurfaceMesh();
             mesh.Dock = DockStyle.Right;
@@ -572,6 +742,8 @@ namespace Wideband
             grid.CellEndEdit += CellEdited;
             grid.CellFormatting += FormatCell;
             grid.Nudge += Nudge;
+            grid.Gesture += GridGesture;
+            boldFont = new Font(grid.Font, FontStyle.Bold);
             traceX.ValueChanged += delegate { Trace(); };
             traceY.ValueChanged += delegate { Trace(); };
 
@@ -580,9 +752,35 @@ namespace Wideband
             status.Height = 36;
             status.Text = "Choose a table.";
 
-            Controls.Add(grid);
-            Controls.Add(mesh);
-            Controls.Add(tree);
+            switchSearch = new TextBox();
+            switchSearch.Dock = DockStyle.Top;
+            switchSearch.AccessibleName = "Switch search";
+            switchSearch.TextChanged += delegate
+            {
+                switchFilter = switchSearch.Text.Trim();
+                RebuildSwitches();
+            };
+            switchList = new Panel();
+            switchList.Dock = DockStyle.Fill;
+            switchList.AutoScroll = true;
+            switchList.BackColor = BackColor;
+            var switchBoard = new Panel();
+            switchBoard.Dock = DockStyle.Fill;
+            switchBoard.Visible = false;
+            switchBoard.BackColor = BackColor;
+            switchBoard.AccessibleName = "Switch board";
+            switchBoard.Controls.Add(switchList);
+            switchBoard.Controls.Add(switchSearch);
+
+            var workspace = new Panel();
+            workspace.Dock = DockStyle.Fill;
+            workspace.BackColor = BackColor;
+            workspace.Controls.Add(grid);
+            workspace.Controls.Add(switchBoard);
+            workspace.Controls.Add(mesh);
+
+            Controls.Add(workspace);
+            Controls.Add(sidebar);
             Controls.Add(status);
             Controls.Add(tools);
             Controls.Add(note);
@@ -684,7 +882,7 @@ namespace Wideband
             TreeNode match = null;
             foreach (TuneTable table in document.Tables)
             {
-                if (table.LevelRank() > rank) continue;
+                if (!Listed(table, rank)) continue;
                 TreeNode group = null;
                 foreach (TreeNode node in tree.Nodes)
                     if (node.Text == table.Domain) group = node;
@@ -710,6 +908,23 @@ namespace Wideband
                 Bind();
             }
             else ShowSelected(tree, new TreeViewEventArgs(match));
+            RebuildSwitches();
+        }
+
+        bool Listed(TuneTable table, int rank)
+        {
+            if (table.LevelRank() > rank) return false;
+            if (parameterFilter.Length == 0) return true;
+            if (ContainsText(table.Name, parameterFilter)) return true;
+            if (ContainsText(table.Domain, parameterFilter)) return true;
+            if (ContainsText(table.Unit, parameterFilter)) return true;
+            return false;
+        }
+
+        static bool ContainsText(string text, string part)
+        {
+            if (text == null || part == null || part.Length == 0) return false;
+            return text.IndexOf(part, StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         void RejectGroup(object sender, TreeViewCancelEventArgs e)
@@ -728,6 +943,7 @@ namespace Wideband
             grid.Columns.Clear();
             grid.Rows.Clear();
             mesh.Show(current);
+            MeasureHeat();
             if (current == null) return;
             for (int x = 0; x < current.X.Length; x++)
             {
@@ -739,28 +955,51 @@ namespace Wideband
             for (int y = 0; y < current.Values.Length; y++)
             {
                 var cells = new object[current.Values[y].Length];
-                for (int x = 0; x < cells.Length; x++) cells[x] = FormatValue(current, current.Values[y][x]);
+                for (int x = 0; x < cells.Length; x++) cells[x] = CellDelta.FormatNumber(current, current.Values[y][x]);
                 int row = grid.Rows.Add(cells);
                 string header = current.Kind == "curve" || current.Kind == "scalar" ? current.Unit : current.Y[y].ToString(CultureInfo.InvariantCulture);
                 grid.Rows[row].HeaderCell.Value = header;
             }
-            status.Text = current.Domain + " / " + current.Name + " (" + current.Unit + "). " + current.XName + " across, " + current.YName + " down. " + current.Level + ". Shift+Up/Down steps, Shift+Left/Right scales.";
+            status.Text = current.Domain + " / " + current.Name + " (" + current.Unit + "). " + current.XName + " across, " + current.YName + " down. " + current.Level + ". + and - step by the amount. The command box takes +5%, -2%, or =value. I interpolates the selection.";
             Trace();
         }
 
         void FormatCell(object sender, DataGridViewCellFormattingEventArgs e)
         {
             if (current == null || e.RowIndex < 0 || e.ColumnIndex < 0) return;
-            Color plain = Color.FromArgb(247, 248, 246);
-            if (!compare.Checked)
+            if (e.RowIndex >= current.Values.Length || e.ColumnIndex >= current.Values[e.RowIndex].Length) return;
+            double value = current.Values[e.RowIndex][e.ColumnIndex];
+            if (grid.IsCurrentCellInEditMode && grid.CurrentCell != null
+                && grid.CurrentCell.RowIndex == e.RowIndex && grid.CurrentCell.ColumnIndex == e.ColumnIndex)
             {
-                e.CellStyle.BackColor = plain;
+                e.Value = CellDelta.FormatNumber(current, value);
+                e.FormattingApplied = true;
                 return;
             }
-            double delta = current.Values[e.RowIndex][e.ColumnIndex] - current.Base[e.RowIndex][e.ColumnIndex];
-            if (delta > 0.0001) e.CellStyle.BackColor = Color.FromArgb(214, 236, 214);
-            else if (delta < -0.0001) e.CellStyle.BackColor = Color.FromArgb(244, 214, 214);
-            else e.CellStyle.BackColor = plain;
+            double basis = current.Base[e.RowIndex][e.ColumnIndex];
+            double unit = (value - heatMin) / heatSpan;
+            e.Value = CellPaint.Apply(e.CellStyle, current, value, basis, unit, compare.Checked, boldFont, grid.Font);
+            e.FormattingApplied = true;
+        }
+
+        void MeasureHeat()
+        {
+            heatMin = 0;
+            heatSpan = 1;
+            if (current == null || current.Values == null || current.Values.Length == 0 || current.Values[0].Length == 0) return;
+            heatMin = current.Values[0][0];
+            double max = heatMin;
+            for (int y = 0; y < current.Values.Length; y++)
+            {
+                for (int x = 0; x < current.Values[y].Length; x++)
+                {
+                    double value = current.Values[y][x];
+                    if (value < heatMin) heatMin = value;
+                    if (value > max) max = value;
+                }
+            }
+            heatSpan = max - heatMin;
+            if (heatSpan < 0.0001) heatSpan = 1;
         }
 
         void Nudge(Keys key)
@@ -803,16 +1042,250 @@ namespace Wideband
             Save(message);
         }
 
-        static string FormatValue(TuneTable table, double value)
+        public void ApplyCellCommand(string text)
         {
-            if (table.Decimals == 0) return Math.Round(value).ToString("0", CultureInfo.InvariantCulture);
-            if (table.Decimals > 0)
+            if (current == null)
             {
-                int places = table.Decimals;
-                if (places > 8) places = 8;
-                return value.ToString("0." + new string('0', places), CultureInfo.InvariantCulture);
+                status.Text = "Choose a table before editing cells.";
+                return;
             }
-            return value.ToString("0.###", CultureInfo.InvariantCulture);
+            try { CellCommand.Run(current, grid.SelectedCells, text, (double)amount.Value); }
+            catch (Exception ex)
+            {
+                status.Text = ex.Message;
+                return;
+            }
+            string shown = text == null ? "" : text.Trim();
+            if (shown.Length == 0) shown = "the amount";
+            Save("Applied " + shown + ".");
+        }
+
+        public void StepSelection(bool up)
+        {
+            double step = Math.Abs((double)amount.Value);
+            if (step < 0.0000001) step = 1;
+            if (!up) step = -step;
+            Run(delegate { TableMath.Add(current, grid.SelectedCells, step); }, up ? "Stepped the selected cells up." : "Stepped the selected cells down.");
+        }
+
+        public void InterpolateSelection()
+        {
+            Run(delegate { TableMath.Interpolate(current, grid.SelectedCells); }, "Interpolated the selected block from its corners.");
+        }
+
+        public byte[] CopyRom()
+        {
+            if (rom == null || rom.Bytes == null) return new byte[0];
+            return (byte[])rom.Bytes.Clone();
+        }
+
+        void ApplyClicked(object sender, EventArgs e)
+        {
+            ApplyCellCommand(commandBox.Text);
+        }
+
+        void CommandKeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.KeyCode != Keys.Enter) return;
+            ApplyCellCommand(commandBox.Text);
+            e.Handled = true;
+            e.SuppressKeyPress = true;
+        }
+
+        void GridGesture(string name)
+        {
+            if (name == "increment") StepSelection(true);
+            else if (name == "decrement") StepSelection(false);
+            else if (name == "set") BeginSetValue();
+            else if (name == "interpolate") InterpolateSelection();
+        }
+
+        void BeginSetValue()
+        {
+            string text = commandBox.Text == null ? "" : commandBox.Text.Trim();
+            if (text.Length == 0 || text[0] != '=') commandBox.Text = "=";
+            commandBox.Focus();
+            commandBox.SelectionStart = commandBox.Text.Length;
+        }
+
+        void ShowTableView()
+        {
+            showSwitches = false;
+            grid.Visible = true;
+            mesh.Visible = true;
+            if (switchList != null && switchList.Parent != null) switchList.Parent.Visible = false;
+            PaintViewButtons();
+        }
+
+        void ShowSwitchView()
+        {
+            showSwitches = true;
+            grid.Visible = false;
+            mesh.Visible = false;
+            if (switchList != null && switchList.Parent != null)
+            {
+                switchList.Parent.Visible = true;
+                switchList.Parent.BringToFront();
+            }
+            RebuildSwitches();
+            PaintViewButtons();
+        }
+
+        void PaintViewButtons()
+        {
+            Color on = Color.FromArgb(12, 110, 74);
+            Color off = Color.FromArgb(223, 227, 222);
+            Color onText = Color.FromArgb(244, 250, 247);
+            Color offText = Color.FromArgb(23, 33, 28);
+            tableViewButton.BackColor = showSwitches ? off : on;
+            tableViewButton.ForeColor = showSwitches ? offText : onText;
+            switchViewButton.BackColor = showSwitches ? on : off;
+            switchViewButton.ForeColor = showSwitches ? onText : offText;
+        }
+
+        void RebuildSwitches()
+        {
+            if (switchList == null) return;
+            fillingSwitches = true;
+            while (switchList.Controls.Count > 0)
+            {
+                Control child = switchList.Controls[0];
+                switchList.Controls.RemoveAt(0);
+                child.Dispose();
+            }
+            int top = 4;
+            int width = switchList.ClientSize.Width - 28;
+            if (width < 180) width = 220;
+            string domain = null;
+            bool any = false;
+            int rank = level.SelectedIndex;
+            foreach (TuneTable table in document.Tables)
+            {
+                if (table.LevelRank() > rank || !IsSwitch(table)) continue;
+                int cells = SwitchCells(table);
+                for (int y = 0; y < table.Values.Length; y++)
+                {
+                    for (int x = 0; x < table.Values[y].Length; x++)
+                    {
+                        string label = SwitchLabel(table, y, x, cells);
+                        if (!SwitchMatches(label)) continue;
+                        if (domain != table.Domain)
+                        {
+                            domain = table.Domain;
+                            var header = new Label();
+                            header.Text = domain;
+                            header.Font = boldFont;
+                            header.AutoSize = false;
+                            header.Height = 24;
+                            header.Width = width;
+                            header.Location = new Point(8, top);
+                            header.ForeColor = Color.FromArgb(23, 33, 28);
+                            switchList.Controls.Add(header);
+                            top += 26;
+                        }
+                        var box = new CheckBox();
+                        box.Text = label;
+                        box.AccessibleName = label;
+                        box.AutoSize = false;
+                        box.Height = 24;
+                        box.Width = width;
+                        box.Location = new Point(12, top);
+                        box.Checked = table.Values[y][x] >= 0.5;
+                        var point = new SwitchPoint();
+                        point.Table = table;
+                        point.Y = y;
+                        point.X = x;
+                        box.Tag = point;
+                        box.CheckedChanged += SwitchToggled;
+                        switchList.Controls.Add(box);
+                        top += 26;
+                        any = true;
+                    }
+                }
+            }
+            if (!any)
+            {
+                var empty = new Label();
+                empty.Text = romBacked
+                    ? "No flags or one-byte switches match."
+                    : "Open a ROM and an XDF to edit switches.";
+                empty.AutoSize = false;
+                empty.Height = 48;
+                empty.Width = width;
+                empty.Location = new Point(8, top);
+                switchList.Controls.Add(empty);
+                top += 52;
+            }
+            switchList.AutoScrollMinSize = new Size(0, top + 8);
+            fillingSwitches = false;
+        }
+
+        static bool IsSwitch(TuneTable table)
+        {
+            if (table.Binding == null || table.Binding.Region == null || table.Values == null || table.Values.Length == 0) return false;
+            if (table.Binding.Flag) return true;
+            XdfRegion region = table.Binding.Region;
+            if (region.Float || region.Bits != 8) return false;
+            int rows = table.Values.Length;
+            int cols = table.Values[0].Length;
+            int cells = rows * cols;
+            if (cells < 1 || cells > 32) return false;
+            if (rows > 1 && cols > 1) return false;
+            return true;
+        }
+
+        static int SwitchCells(TuneTable table)
+        {
+            int count = 0;
+            for (int y = 0; y < table.Values.Length; y++) count += table.Values[y].Length;
+            return count;
+        }
+
+        bool SwitchMatches(string label)
+        {
+            if (switchFilter.Length == 0) return true;
+            return ContainsText(label, switchFilter);
+        }
+
+        static string SwitchLabel(TuneTable table, int y, int x, int cells)
+        {
+            string label = table.Domain + " / " + table.Name;
+            if (cells == 1) return label;
+            string axis;
+            if (table.Values.Length == 1 && table.X != null && x < table.X.Length)
+                axis = CellDelta.FormatNumber(table, table.X[x]);
+            else if (table.Y != null && y < table.Y.Length && table.Values.Length > 1)
+                axis = CellDelta.FormatNumber(table, table.Y[y]);
+            else axis = x.ToString(CultureInfo.InvariantCulture);
+            return label + " / " + axis;
+        }
+
+        void SwitchToggled(object sender, EventArgs e)
+        {
+            if (fillingSwitches) return;
+            CheckBox box = sender as CheckBox;
+            if (box == null) return;
+            SwitchPoint point = box.Tag as SwitchPoint;
+            if (point == null || point.Table == null) return;
+            point.Table.Values[point.Y][point.X] = box.Checked ? 1 : 0;
+            WriteTable(point.Table, "Set " + box.Text + ".");
+        }
+
+        void RefreshSwitchChecks()
+        {
+            if (switchList == null) return;
+            fillingSwitches = true;
+            foreach (Control control in switchList.Controls)
+            {
+                CheckBox box = control as CheckBox;
+                if (box == null) continue;
+                SwitchPoint point = box.Tag as SwitchPoint;
+                if (point == null || point.Table == null || point.Table.Values == null) continue;
+                if (point.Y < 0 || point.Y >= point.Table.Values.Length) continue;
+                if (point.X < 0 || point.X >= point.Table.Values[point.Y].Length) continue;
+                box.Checked = point.Table.Values[point.Y][point.X] >= 0.5;
+            }
+            fillingSwitches = false;
         }
 
         void OpenRomClicked(object sender, EventArgs e)
@@ -913,7 +1386,7 @@ namespace Wideband
             if (header.Length > 160) header = header.Substring(0, 160);
             note.Text = "ROM " + Path.GetFileName(romPath) + " (" + rom.Bytes.Length.ToString(CultureInfo.InvariantCulture)
                 + " bytes) with " + definition.Title + ". " + result.Document.Tables.Count.ToString(CultureInfo.InvariantCulture)
-                + " parameters. Edits stay in the ROM buffer until you save the ROM. Save ROM updates a configured checksum. Nothing is written to an ECU. " + header;
+                + " parameters. Categories are folders. Switches edit flags in the ROM buffer. Edits stay there until you save the ROM. Save ROM updates a configured checksum. Nothing is written to an ECU. " + header;
             FillList();
             if (result.Errors.Count > 0)
                 status.Text = result.Errors.Count.ToString(CultureInfo.InvariantCulture) + " parameters were skipped. " + result.Errors[0];
@@ -934,29 +1407,37 @@ namespace Wideband
 
         void WriteThrough(string message)
         {
-            if (rom == null || current == null || current.Binding == null)
+            WriteTable(current, message);
+        }
+
+        void WriteTable(TuneTable table, string message)
+        {
+            if (rom == null || table == null || table.Binding == null)
             {
                 status.Text = message;
+                RefreshSwitchChecks();
                 return;
             }
             byte[] trial = (byte[])rom.Bytes.Clone();
             try
             {
-                current.Binding.WriteTable(trial, current);
+                table.Binding.WriteTable(trial, table);
                 rom.Bytes = trial;
-                foreach (TuneTable table in document.Tables)
-                    if (table.Binding != null) table.Binding.ReadInto(rom.Bytes, table);
+                foreach (TuneTable item in document.Tables)
+                    if (item.Binding != null) item.Binding.ReadInto(rom.Bytes, item);
             }
             catch (Exception ex)
             {
-                if (current.Binding != null) current.Binding.ReadInto(rom.Bytes, current);
-                Bind();
+                if (table.Binding != null) table.Binding.ReadInto(rom.Bytes, table);
+                if (current != null) Bind();
+                RefreshSwitchChecks();
                 status.Text = ex.Message;
                 return;
             }
-            Bind();
+            if (current != null) Bind();
             status.Text = message + " The ROM buffer was updated.";
             RefreshChecksum();
+            RefreshSwitchChecks();
         }
 
         void Trace()
@@ -1199,6 +1680,38 @@ namespace Wideband
     sealed class TuneGrid : DataGridView
     {
         public event Action<Keys> Nudge;
+        public event Action<string> Gesture;
+
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            if (!IsCurrentCellInEditMode && Gesture != null)
+            {
+                Keys code = keyData & Keys.KeyCode;
+                bool shift = (keyData & Keys.Shift) == Keys.Shift;
+                bool plain = (keyData & (Keys.Control | Keys.Alt)) == 0;
+                if (code == Keys.Add || (code == Keys.Oemplus && shift))
+                {
+                    Gesture("increment");
+                    return true;
+                }
+                if (code == Keys.Subtract || (code == Keys.OemMinus && !shift))
+                {
+                    Gesture("decrement");
+                    return true;
+                }
+                if (plain && code == Keys.Oemplus && !shift)
+                {
+                    Gesture("set");
+                    return true;
+                }
+                if (plain && code == Keys.I)
+                {
+                    Gesture("interpolate");
+                    return true;
+                }
+            }
+            return base.ProcessCmdKey(ref msg, keyData);
+        }
 
         protected override bool ProcessDataGridViewKey(KeyEventArgs e)
         {
@@ -1257,12 +1770,10 @@ namespace Wideband
                 for (int x = 0; x < table.Values[y].Length; x++)
                 {
                     double unit = (table.Values[y][x] - min) / span;
-                    int green = 70 + (int)(140 * unit);
-                    int red = 18 + (int)(90 * (1 - unit));
                     float height = 4f + (float)unit * barLimit;
                     float left = 10 + x * pitchX;
                     float bottom = Height - 10 - (rows - 1 - y) * (pitchY * 0.45f);
-                    using (var brush = new SolidBrush(Color.FromArgb(red, green, 78)))
+                    using (var brush = new SolidBrush(HeatColor.Deep(unit)))
                         e.Graphics.FillRectangle(brush, left, bottom - height, Math.Max(4f, pitchX - 3f), height);
                 }
             }
