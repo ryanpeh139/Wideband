@@ -24,6 +24,8 @@ namespace Wideband
         public double[] Y = new double[0];
         public double[][] Values = new double[0][];
         public double[][] Base = new double[0][];
+        public int Decimals = -1;
+        public XdfBinding Binding;
 
         public int LevelRank()
         {
@@ -42,6 +44,7 @@ namespace Wideband
     {
         public readonly List<TuneTable> Tables = new List<TuneTable>();
         public string Note = "";
+        public bool Persist = true;
         public event EventHandler Changed;
 
         public TuneTable Find(string id)
@@ -70,6 +73,8 @@ namespace Wideband
 
         public void Write(string path)
         {
+            if (!Persist)
+                throw new InvalidOperationException("This definition is not written to the sample file.");
             var serializer = new JavaScriptSerializer();
             var tables = new List<Dictionary<string, object>>();
             foreach (TuneTable table in Tables)
@@ -464,7 +469,7 @@ namespace Wideband
 
     sealed class CalibratePanel : UserControl
     {
-        readonly TuneDocument document;
+        TuneDocument document;
         readonly string savePath;
         readonly TreeView tree;
         readonly ComboBox level;
@@ -477,6 +482,12 @@ namespace Wideband
         readonly Label status;
         readonly Label note;
         TuneTable current;
+        MemoryImage rom;
+        long romOrigin;
+        string romNote = "";
+        string romPath = "";
+        XdfDocument definition;
+        bool romBacked;
 
         public CalibratePanel(TuneDocument document, string savePath)
         {
@@ -487,13 +498,16 @@ namespace Wideband
 
             note = new Label();
             note.Dock = DockStyle.Top;
-            note.Height = 36;
+            note.Height = 64;
             note.Text = document.Note + " Tables are edited here. Nothing is written to an ECU.";
 
             var tools = new FlowLayoutPanel();
             tools.Dock = DockStyle.Top;
-            tools.Height = 78;
+            tools.Height = 116;
             tools.WrapContents = true;
+            tools.Controls.Add(MakeButton("Open ROM", OpenRomClicked));
+            tools.Controls.Add(MakeButton("Open XDF", OpenXdfClicked));
+            tools.Controls.Add(MakeButton("Save ROM", SaveRomClicked));
             level = new ComboBox();
             level.DropDownStyle = ComboBoxStyle.DropDownList;
             level.Width = 130;
@@ -668,7 +682,7 @@ namespace Wideband
             for (int y = 0; y < current.Values.Length; y++)
             {
                 var cells = new object[current.Values[y].Length];
-                for (int x = 0; x < cells.Length; x++) cells[x] = current.Values[y][x].ToString("0.###", CultureInfo.InvariantCulture);
+                for (int x = 0; x < cells.Length; x++) cells[x] = FormatValue(current, current.Values[y][x]);
                 int row = grid.Rows.Add(cells);
                 string header = current.Kind == "curve" || current.Kind == "scalar" ? current.Unit : current.Y[y].ToString(CultureInfo.InvariantCulture);
                 grid.Rows[row].HeaderCell.Value = header;
@@ -732,11 +746,143 @@ namespace Wideband
             Save(message);
         }
 
+        static string FormatValue(TuneTable table, double value)
+        {
+            if (table.Decimals == 0) return Math.Round(value).ToString("0", CultureInfo.InvariantCulture);
+            if (table.Decimals > 0)
+            {
+                int places = table.Decimals;
+                if (places > 8) places = 8;
+                return value.ToString("0." + new string('0', places), CultureInfo.InvariantCulture);
+            }
+            return value.ToString("0.###", CultureInfo.InvariantCulture);
+        }
+
+        void OpenRomClicked(object sender, EventArgs e)
+        {
+            var dialog = new OpenFileDialog();
+            dialog.Title = "Open ROM";
+            dialog.Filter = "Calibration binaries (*.bin;*.cuw)|*.bin;*.cuw|BIN files (*.bin)|*.bin|Toyota CUW (*.cuw)|*.cuw|All files (*.*)|*.*";
+            if (dialog.ShowDialog(FindForm()) != DialogResult.OK) return;
+            try { OpenRomFile(dialog.FileName); }
+            catch (Exception ex) { status.Text = ex.Message; }
+        }
+
+        void OpenXdfClicked(object sender, EventArgs e)
+        {
+            var dialog = new OpenFileDialog();
+            dialog.Title = "Open XDF";
+            dialog.Filter = "TunerPro definitions (*.xdf)|*.xdf|All files (*.*)|*.*";
+            if (dialog.ShowDialog(FindForm()) != DialogResult.OK) return;
+            try { OpenDefinitionFile(dialog.FileName); }
+            catch (Exception ex) { status.Text = ex.Message; }
+        }
+
+        void SaveRomClicked(object sender, EventArgs e)
+        {
+            if (rom == null)
+            {
+                status.Text = "Open a ROM before saving one.";
+                return;
+            }
+            var dialog = new SaveFileDialog();
+            dialog.Title = "Save ROM";
+            dialog.Filter = "BIN files (*.bin)|*.bin|All files (*.*)|*.*";
+            string name = Path.GetFileName(romPath);
+            if (romPath.EndsWith(".cuw", StringComparison.OrdinalIgnoreCase))
+                name = Path.GetFileNameWithoutExtension(romPath) + ".bin";
+            dialog.FileName = name;
+            if (dialog.ShowDialog(FindForm()) != DialogResult.OK) return;
+            try
+            {
+                rom.Save(dialog.FileName, null);
+                romPath = dialog.FileName;
+                status.Text = "Saved " + Path.GetFileName(dialog.FileName) + ".";
+            }
+            catch (Exception ex)
+            {
+                status.Text = ex.Message;
+            }
+        }
+
+        public void OpenRomFile(string path)
+        {
+            RomFile loaded = CalibrationFiles.Open(path);
+            rom = loaded.Image;
+            romOrigin = loaded.Origin;
+            romNote = loaded.Note;
+            romPath = path;
+            if (definition != null) BindLoaded();
+            else status.Text = "Loaded ROM " + Path.GetFileName(path) + " (" + rom.Bytes.Length.ToString(CultureInfo.InvariantCulture) + " bytes). Open an XDF to fill the parameter tree.";
+        }
+
+        public void OpenDefinitionFile(string path)
+        {
+            XdfDocument parsed = XdfDocument.Load(path);
+            definition = parsed;
+            if (rom != null) BindLoaded();
+            else status.Text = "Loaded definition " + Path.GetFileName(path) + " (" + parsed.Items.Count.ToString(CultureInfo.InvariantCulture) + " parameters). Open a ROM to fill the parameter tree.";
+        }
+
+        void BindLoaded()
+        {
+            XdfBindResult result = definition.Bind(rom.Bytes, romOrigin);
+            if (result.Document.Tables.Count == 0)
+            {
+                status.Text = result.Errors.Count == 0
+                    ? "The definition has no parameters in this ROM."
+                    : result.Errors[0];
+                return;
+            }
+            document = result.Document;
+            romBacked = true;
+            current = null;
+            string header = romNote.Replace("\r", " ").Replace("\n", " ").Trim();
+            if (header.Length > 160) header = header.Substring(0, 160);
+            note.Text = "ROM " + Path.GetFileName(romPath) + " (" + rom.Bytes.Length.ToString(CultureInfo.InvariantCulture)
+                + " bytes) with " + definition.Title + ". " + result.Document.Tables.Count.ToString(CultureInfo.InvariantCulture)
+                + " parameters. Edits stay in the ROM buffer until you save the ROM. Nothing is written to an ECU. " + header;
+            FillList();
+            if (result.Errors.Count > 0)
+                status.Text = result.Errors.Count.ToString(CultureInfo.InvariantCulture) + " parameters were skipped. " + result.Errors[0];
+        }
+
         void Save(string message)
         {
+            if (romBacked)
+            {
+                WriteThrough(message);
+                return;
+            }
             document.Write(savePath);
             Bind();
             status.Text = message;
+        }
+
+        void WriteThrough(string message)
+        {
+            if (rom == null || current == null || current.Binding == null)
+            {
+                status.Text = message;
+                return;
+            }
+            byte[] trial = (byte[])rom.Bytes.Clone();
+            try
+            {
+                current.Binding.WriteTable(trial, current);
+                rom.Bytes = trial;
+                foreach (TuneTable table in document.Tables)
+                    if (table.Binding != null) table.Binding.ReadInto(rom.Bytes, table);
+            }
+            catch (Exception ex)
+            {
+                if (current.Binding != null) current.Binding.ReadInto(rom.Bytes, current);
+                Bind();
+                status.Text = ex.Message;
+                return;
+            }
+            Bind();
+            status.Text = message + " The ROM buffer was updated.";
         }
 
         void Trace()
