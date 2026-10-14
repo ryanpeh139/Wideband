@@ -1,6 +1,19 @@
 # Wideband
 
-This folder is the Wideband project. It is a Windows desktop app, and the whole project is these files. Open the folder in another editor, or clone the private repository https://github.com/ryanpeh139/Wideband branch `main`. The GitHub account is `ryanpeh139`. Push later work to that remote. Do not force-push. Do not commit `XAI_API_KEY` or any other secret.
+This folder is the Wideband project. Open the folder in another editor, or clone the private repository https://github.com/ryanpeh139/Wideband branch `main`. The GitHub account is `ryanpeh139`. Push later work to that remote. Do not force-push. Do not commit `XAI_API_KEY` or any other secret.
+
+## Rust Motorsport Studio (primary UI)
+
+The active desktop UI is the native Rust **egui** app under `src/`. Build and test from the repo root (Rust **1.88+**, see `rust-toolchain.toml`):
+
+```
+cargo build
+cargo test
+```
+
+Run the binary as `wideband` (or `target/debug/wideband` / `target/release/wideband`). J2534 bench logic, XDF parsing, ISO-TP/UDS flash paths, and the motorsport calibration workspace live in `src/`.
+
+The legacy C# WinForms tree (`Wideband.cs`, `Calibrate.cs`, …) remains for reference and Windows-only `csc.exe` handoff; new UI work targets Rust.
 
 ## Handoff
 
