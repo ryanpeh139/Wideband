@@ -15,7 +15,10 @@ use crate::j2534::{
 #[cfg(windows)]
 use crate::j2534_host::HostPassThruDevice;
 use crate::protocols::{EcuIdentification, EcuIdentifier, EcuProfile};
-use crate::security_config::{PlatformSecurity, CHECKSUM_VALID};
+use crate::security_config::{
+    key_registration_label, security_mode_label, PlatformSecurity, KeyRegistration, SecurityMode,
+    CHECKSUM_VALID,
+};
 use std::fs;
 use std::path::PathBuf;
 use crate::surface_mesh;
@@ -378,6 +381,12 @@ impl WidebandApp {
         if is_virtual {
             PlatformSecurity::register_bench_keys_for_virtual();
             self.log("Virtual bench: explicit zero-mask security keys registered for loopback only.");
+        } else {
+            PlatformSecurity::install(&PlatformSecurity::default_config_path());
+            let sec_note = PlatformSecurity::load_note();
+            if !sec_note.is_empty() {
+                self.log(&format!("Security config: {}", sec_note));
+            }
         }
 
         let prof = &self.profiles[self.selected_profile_idx];
@@ -413,15 +422,124 @@ impl WidebandApp {
             let _ = dev.close();
             self.is_connected = false;
             self.header_vbatt = None;
+            PlatformSecurity::install(&PlatformSecurity::default_config_path());
             self.log("Cable disconnected.");
         }
     }
 
-    fn selected_device_is_virtual(&self) -> bool {
-        self.devices
-            .get(self.selected_device_idx)
-            .map(|d| d.is_virtual)
-            .unwrap_or(true)
+    fn cable_is_virtual(&self) -> bool {
+        if self.is_connected {
+            self.active_device_virtual
+        } else {
+            self.devices
+                .get(self.selected_device_idx)
+                .map(|d| d.is_virtual)
+                .unwrap_or(true)
+        }
+    }
+
+    fn render_security_status_panel(&mut self, ui: &mut egui::Ui) {
+        let prof = &self.profiles[self.selected_profile_idx];
+        let virtual_ecu = self.cable_is_virtual();
+        let report = PlatformSecurity::security_report(&prof.id, virtual_ecu);
+        let mode_color = match report.mode {
+            SecurityMode::Production => EMERALD,
+            SecurityMode::Bench => Color32::from_rgb(0xF5, 0x88, 0x36),
+            SecurityMode::FailClosed => Color32::from_rgb(255, 23, 68),
+        };
+
+        egui::Frame::none()
+            .fill(CARD_FILL)
+            .stroke(Stroke::new(1.0, STROKE))
+            .rounding(egui::Rounding::same(6.0))
+            .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading(
+                        egui::RichText::new("Security config")
+                            .size(14.0)
+                            .color(ACCENT_CYAN),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(security_mode_label(report.mode))
+                                .strong()
+                                .color(mode_color),
+                        );
+                    });
+                });
+                ui.label(
+                    egui::RichText::new(format!("File: {}", report.config_path))
+                        .small()
+                        .color(MUTED),
+                );
+                if !report.load_note.is_empty() {
+                    ui.label(
+                        egui::RichText::new(&report.load_note)
+                            .small()
+                            .color(Color32::from_rgb(255, 120, 120)),
+                    );
+                }
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Profiles (seed-key 0x27):").small().strong());
+                for line in &report.profiles {
+                    let key_color = match line.key_registration {
+                        KeyRegistration::Json => EMERALD,
+                        KeyRegistration::Bench => Color32::from_rgb(0xF5, 0x88, 0x36),
+                        KeyRegistration::None => MUTED,
+                    };
+                    let json_flag = if line.configured_in_json { "configured: true" } else { "configured: false" };
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "  {} [{}] — {} — key {}",
+                            line.profile_id,
+                            line.algorithm,
+                            json_flag,
+                            key_registration_label(line.key_registration),
+                        ))
+                        .small()
+                        .color(key_color),
+                    );
+                }
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Checksum ranges:").small().strong());
+                if report.checksums.is_empty() {
+                    ui.label(egui::RichText::new("  (none declared in JSON)").small().color(MUTED));
+                } else {
+                    for line in &report.checksums {
+                        let status = if line.active {
+                            "active"
+                        } else if line.configured_in_json {
+                            "configured but not loaded"
+                        } else {
+                            "placeholder"
+                        };
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "  {} profile={} {} — {}",
+                                line.id,
+                                if line.profile.is_empty() { "any" } else { &line.profile },
+                                line.algorithm,
+                                status,
+                            ))
+                            .small()
+                            .color(if line.active { EMERALD } else { MUTED }),
+                        );
+                    }
+                }
+                if !report.flash_blockers.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("Flash blocked until resolved:")
+                            .small()
+                            .strong()
+                            .color(Color32::from_rgb(255, 23, 68)),
+                    );
+                    for reason in &report.flash_blockers {
+                        ui.label(egui::RichText::new(format!("  • {}", reason)).small());
+                    }
+                }
+            });
     }
 
     pub fn poll_telemetry(&mut self) {
@@ -774,7 +892,7 @@ impl WidebandApp {
                 });
             });
 
-        if self.selected_device_is_virtual() {
+        if self.cable_is_virtual() {
             ui.add_space(6.0);
             egui::Frame::none()
                 .fill(Color32::from_rgb(255, 193, 7).gamma_multiply(0.12))
@@ -1552,13 +1670,28 @@ impl WidebandApp {
                     self.execute_stock_read();
                 }
 
-                if ui.button(egui::RichText::new("⚡ Flash Active Calibration").strong().color(Color32::from_rgb(255, 23, 68))).clicked() {
+                let prof = &self.profiles[self.selected_profile_idx];
+                let virtual_ecu = self.cable_is_virtual();
+                let flash_blocked = !PlatformSecurity::flash_blockers(&prof.id, virtual_ecu).is_empty();
+                let flash_btn = ui.add_enabled(
+                    !flash_blocked,
+                    egui::Button::new(
+                        egui::RichText::new("⚡ Flash Active Calibration")
+                            .strong()
+                            .color(Color32::from_rgb(255, 23, 68)),
+                    ),
+                );
+                if flash_btn.clicked() {
                     self.flash_confirm_open = true;
                 }
             });
 
+            self.render_security_status_panel(ui);
+
             if self.flash_confirm_open {
                 let prof = self.profiles[self.selected_profile_idx].clone();
+                let virtual_ecu = self.cable_is_virtual();
+                let blockers = PlatformSecurity::flash_blockers(&prof.id, virtual_ecu);
                 let segments = self
                     .flash_layout
                     .cal_segments(&prof.id)
@@ -1583,8 +1716,15 @@ impl WidebandApp {
                                 seg.address
                             ));
                         }
+                        for reason in &blockers {
+                            ui.label(
+                                egui::RichText::new(format!("Flash blocked: {}", reason))
+                                    .color(Color32::from_rgb(255, 152, 0)),
+                            );
+                        }
                         if !self.active_device_virtual
                             && !PlatformSecurity::security_key_configured_for_profile(&prof.id)
+                            && blockers.is_empty()
                         {
                             ui.label(
                                 egui::RichText::new(
@@ -1597,11 +1737,15 @@ impl WidebandApp {
                             if ui.button(egui::RichText::new("Cancel").strong()).clicked() {
                                 cancel = true;
                             }
+                            let write_enabled = blockers.is_empty();
                             if ui
-                                .button(
-                                    egui::RichText::new("Write calibration to ECU")
-                                        .strong()
-                                        .color(Color32::from_rgb(255, 23, 68)),
+                                .add_enabled(
+                                    write_enabled,
+                                    egui::Button::new(
+                                        egui::RichText::new("Write calibration to ECU")
+                                            .strong()
+                                            .color(Color32::from_rgb(255, 23, 68)),
+                                    ),
                                 )
                                 .clicked()
                             {
@@ -1612,12 +1756,11 @@ impl WidebandApp {
                 if cancel {
                     self.flash_confirm_open = false;
                 }
-                if confirm {
+                if confirm && blockers.is_empty() {
                     self.flash_confirm_open = false;
                     self.execute_flash_active();
                 }
             }
-
             ui.add_space(8.0);
             ui.group(|ui| {
                 ui.heading("Active ECU Metadata");
@@ -1929,8 +2072,14 @@ impl WidebandApp {
             return;
         }
 
-        self.log("Stamping and verifying checksum before cal-only flash...");
         let prof = self.profiles[self.selected_profile_idx].clone();
+        let virtual_ecu = self.cable_is_virtual();
+        if let Err(e) = PlatformSecurity::assert_flash_allowed(&prof.id, virtual_ecu) {
+            self.log(&format!("Flash blocked: {}", e));
+            return;
+        }
+
+        self.log("Stamping and verifying checksum before cal-only flash...");
         self.xdf.write_all_tables_to_rom(&mut self.active_rom, self.rom_origin);
         let prepared = match PlatformSecurity::prepare_for_flash(
             &prof.checksum_profile_id,
