@@ -1,13 +1,22 @@
 {
-  "version": 1,
-  "title": "Wideband default live log channels",
+  "version": 2,
+  "title": "Toyota Tacoma live log (Mode 01 + UDS 0x22)",
+  "scheduler": {
+    "tick_ms": 25,
+    "max_requests_per_tick": 4,
+    "skip_backlog": true
+  },
+  "recording": {
+    "ring_capacity": 12000,
+    "record_capacity": 0
+  },
   "channels": [
     {
       "id": "rpm",
       "label": "ENGINE RPM",
       "unit": "RPM",
       "priority": 1,
-      "interval_ms": 50,
+      "interval_ms": 40,
       "request": { "service": "mode01", "pid": 12 },
       "decode": "pid_0c_rpm",
       "gauge": true,
@@ -18,18 +27,40 @@
       "label": "MANIFOLD MAP",
       "unit": "kPa",
       "priority": 1,
-      "interval_ms": 50,
+      "interval_ms": 40,
       "request": { "service": "mode01", "pid": 11 },
       "decode": "pid_0b_map_kpa",
       "gauge": true,
       "plot": { "scale": 30.0, "color": [255, 193, 7] }
     },
     {
+      "id": "tps",
+      "label": "THROTTLE TPS",
+      "unit": "%",
+      "priority": 1,
+      "interval_ms": 50,
+      "request": { "service": "mode01", "pid": 17 },
+      "decode": "pid_11_tps",
+      "gauge": true,
+      "plot": { "scale": 50.0, "color": [121, 85, 72] }
+    },
+    {
+      "id": "veh_speed",
+      "label": "VEHICLE SPEED",
+      "unit": "km/h",
+      "priority": 2,
+      "interval_ms": 80,
+      "request": { "service": "mode01", "pid": 13 },
+      "decode": "pid_0d_speed_kph",
+      "gauge": true,
+      "plot": { "scale": 5.0, "color": [176, 190, 197] }
+    },
+    {
       "id": "lambda",
       "label": "LAMBDA (AFR)",
       "unit": "λ",
       "priority": 2,
-      "interval_ms": 100,
+      "interval_ms": 80,
       "request": { "service": "mode01", "pid": 36 },
       "decode": "pid_24_lambda",
       "gauge": true,
@@ -40,11 +71,55 @@
       "label": "SPARK ADVANCE",
       "unit": "deg",
       "priority": 2,
-      "interval_ms": 100,
+      "interval_ms": 80,
       "request": { "service": "mode01", "pid": 14 },
       "decode": "pid_0e_timing",
       "gauge": true,
       "plot": { "scale": 100.0, "color": [244, 67, 54] }
+    },
+    {
+      "id": "load",
+      "label": "CALC LOAD",
+      "unit": "%",
+      "priority": 2,
+      "interval_ms": 100,
+      "request": { "service": "mode01", "pid": 4 },
+      "decode": "pid_04_load",
+      "gauge": true,
+      "plot": { "scale": 50.0, "color": [255, 152, 0] }
+    },
+    {
+      "id": "maf",
+      "label": "MAF FLOW",
+      "unit": "g/s",
+      "priority": 2,
+      "interval_ms": 100,
+      "request": { "service": "mode01", "pid": 16 },
+      "decode": "pid_10_maf_gs",
+      "gauge": false,
+      "plot": { "scale": 100.0, "color": [63, 81, 181] }
+    },
+    {
+      "id": "stft_b1",
+      "label": "STFT B1",
+      "unit": "%",
+      "priority": 3,
+      "interval_ms": 200,
+      "request": { "service": "mode01", "pid": 6 },
+      "decode": "pid_06_stft_pct",
+      "gauge": false,
+      "plot": { "scale": 50.0, "color": [0, 188, 212] }
+    },
+    {
+      "id": "ltft_b1",
+      "label": "LTFT B1",
+      "unit": "%",
+      "priority": 3,
+      "interval_ms": 500,
+      "request": { "service": "mode01", "pid": 7 },
+      "decode": "pid_07_ltft_pct",
+      "gauge": false,
+      "plot": { "scale": 50.0, "color": [77, 182, 172] }
     },
     {
       "id": "ect",
@@ -58,59 +133,108 @@
       "plot": { "scale": 10.0, "color": [30, 136, 229] }
     },
     {
-      "id": "load",
-      "label": "CALC LOAD",
-      "unit": "%",
-      "priority": 3,
-      "interval_ms": 200,
-      "request": { "service": "mode01", "pid": 4 },
-      "decode": "pid_04_load",
-      "gauge": true,
-      "plot": { "scale": 50.0, "color": [255, 152, 0] }
-    },
-    {
       "id": "iat",
       "label": "INTAKE IAT",
       "unit": "°C",
-      "priority": 4,
-      "interval_ms": 1000,
+      "priority": 3,
+      "interval_ms": 500,
       "request": { "service": "mode01", "pid": 15 },
       "decode": "pid_0f_iat",
       "gauge": false,
       "plot": { "scale": 10.0, "color": [156, 39, 176] }
     },
     {
-      "id": "tps",
-      "label": "THROTTLE TPS",
-      "unit": "%",
-      "priority": 3,
-      "interval_ms": 200,
-      "request": { "service": "mode01", "pid": 17 },
-      "decode": "pid_11_tps",
+      "id": "baro",
+      "label": "BARO PRESS",
+      "unit": "kPa",
+      "priority": 4,
+      "interval_ms": 1000,
+      "request": { "service": "mode01", "pid": 51 },
+      "decode": "pid_33_baro_kpa",
       "gauge": false,
-      "plot": { "scale": 50.0, "color": [121, 85, 72] }
+      "plot": { "scale": 20.0, "color": [96, 125, 139] }
+    },
+    {
+      "id": "fuel_lvl",
+      "label": "FUEL LEVEL",
+      "unit": "%",
+      "priority": 4,
+      "interval_ms": 2000,
+      "request": { "service": "mode01", "pid": 47 },
+      "decode": "pid_2f_fuel_pct",
+      "gauge": false,
+      "plot": { "scale": 50.0, "color": [139, 195, 74] }
+    },
+    {
+      "id": "ecu_v",
+      "label": "ECU SUPPLY",
+      "unit": "V",
+      "priority": 4,
+      "interval_ms": 1000,
+      "request": { "service": "mode01", "pid": 66 },
+      "decode": "pid_42_ecu_v",
+      "gauge": false,
+      "plot": { "scale": 100.0, "color": [255, 235, 59] }
     },
     {
       "id": "vbatt",
-      "label": "BATTERY",
+      "label": "BATTERY (UDS)",
       "unit": "V",
       "priority": 4,
       "interval_ms": 1000,
       "request": { "service": "uds22", "did": 6160 },
       "decode": "did_f010_vbatt",
+      "oem_note": "Common bench placeholder DID F010; verify on OEM ECU",
       "gauge": false,
-      "plot": { "scale": 100.0, "color": [255, 235, 59] }
+      "plot": { "scale": 100.0, "color": [255, 213, 79] }
     },
     {
       "id": "oil_temp",
-      "label": "OIL TEMP",
+      "label": "OIL TEMP (UDS)",
       "unit": "°C",
       "priority": 4,
       "interval_ms": 1000,
       "request": { "service": "uds22", "did": 6161 },
       "decode": "did_f011_oil_temp",
+      "oem_note": "Placeholder F011 — Tacoma/Denso DID may differ",
       "gauge": false,
       "plot": { "scale": 10.0, "color": [255, 87, 34] }
+    },
+    {
+      "id": "tacoma_cat_temp",
+      "label": "CAT TEMP (UDS)",
+      "unit": "raw",
+      "priority": 5,
+      "interval_ms": 2000,
+      "request": { "service": "uds22", "did": 6145 },
+      "decode": "did_placeholder_u16",
+      "oem_note": "OEM DID TBD — 0x1801 placeholder for Tacoma catalyst temp",
+      "gauge": false,
+      "plot": { "scale": 1.0, "color": [233, 30, 99] }
+    },
+    {
+      "id": "tacoma_torque_req",
+      "label": "TORQUE REQ (UDS)",
+      "unit": "raw",
+      "priority": 5,
+      "interval_ms": 2000,
+      "request": { "service": "uds22", "did": 6146 },
+      "decode": "did_placeholder_u16",
+      "oem_note": "OEM DID TBD — 0x1802 placeholder (engine torque request)",
+      "gauge": false,
+      "plot": { "scale": 1.0, "color": [171, 71, 188] }
+    },
+    {
+      "id": "tacoma_vvt_angle",
+      "label": "VVT ANGLE (UDS)",
+      "unit": "raw",
+      "priority": 5,
+      "interval_ms": 2000,
+      "request": { "service": "uds22", "did": 6147 },
+      "decode": "did_placeholder_u8",
+      "oem_note": "OEM DID TBD — 0x1803 placeholder for intake VVT",
+      "gauge": false,
+      "plot": { "scale": 50.0, "color": [102, 187, 106] }
     }
   ]
 }
