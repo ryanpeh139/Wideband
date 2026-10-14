@@ -16,6 +16,7 @@ fn test_serial_lock() -> std::sync::MutexGuard<'static, ()> {
 
 pub const CHECKSUM_VALID: &str = "Checksum Valid";
 pub const CHECKSUM_UPDATED: &str = "Checksum Updated";
+pub const CHECKSUM_NOT_CONFIGURED: &str = "Checksum Not Configured";
 
 /// How programming keys were registered (JSON file vs Virtual ECU bench override).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -412,6 +413,41 @@ Configure security-config.json with your authorized Denso mask or generation bef
         format!("0x27 seed {} key {}", hex_bytes(seed), hex_bytes(key))
     }
 
+    pub fn checksum_configured(profile_id: &str, image: &[u8], origin: i64) -> bool {
+        PlatformSecurity::checksum_for(profile_id, image, origin).is_some()
+    }
+
+    /// Fail-closed gate before flash: require configured ranges and a verifiable stamp.
+    pub fn ensure_flash_checksum(
+        profile_id: &str,
+        profile_name: &str,
+        image: &[u8],
+        origin: i64,
+    ) -> Result<Vec<u8>, String> {
+        if image.is_empty() {
+            return Err("The download image is empty.".to_string());
+        }
+        let name = if profile_name.is_empty() {
+            profile_id.to_string()
+        } else {
+            profile_name.to_string()
+        };
+        let group = PlatformSecurity::checksum_for(profile_id, image, origin).ok_or_else(|| {
+            format!(
+                "No checksum range is configured for {}. Flashing edited calibrations is blocked.",
+                name
+            )
+        })?;
+        let mut corrected = image.to_vec();
+        group.stamp(&mut corrected);
+        if !group.verify(&corrected) {
+            return Err(
+                "Checksum correction failed after stamping. Flashing is blocked.".to_string(),
+            );
+        }
+        Ok(corrected)
+    }
+
     pub fn checksum_for(profile_id: &str, image: &[u8], origin: i64) -> Option<BlockChecksumGroup> {
         if image.is_empty() {
             return None;
@@ -445,23 +481,7 @@ Configure security-config.json with your authorized Denso mask or generation bef
         image: &[u8],
         origin: i64,
     ) -> Result<Vec<u8>, String> {
-        if image.is_empty() {
-            return Err("The download image is empty.".to_string());
-        }
-        let group = PlatformSecurity::checksum_for(profile_id, image, origin).ok_or_else(|| {
-            let name = if profile_name.is_empty() {
-                profile_id.to_string()
-            } else {
-                profile_name.to_string()
-            };
-            format!("No checksum range is configured for {}.", name)
-        })?;
-        let mut corrected = image.to_vec();
-        group.stamp(&mut corrected);
-        if !group.verify(&corrected) {
-            return Err("The checksum could not be stored.".to_string());
-        }
-        Ok(corrected)
+        PlatformSecurity::ensure_flash_checksum(profile_id, profile_name, image, origin)
     }
 
     pub fn stamp_image(
@@ -488,7 +508,7 @@ Configure security-config.json with your authorized Denso mask or generation bef
         match PlatformSecurity::checksum_for(profile_id, image, origin) {
             Some(group) if group.verify(image) => CHECKSUM_VALID.to_string(),
             Some(_) => CHECKSUM_UPDATED.to_string(),
-            None => CHECKSUM_VALID.to_string(),
+            None => CHECKSUM_NOT_CONFIGURED.to_string(),
         }
     }
 }
@@ -561,26 +581,20 @@ impl BlockChecksum {
         if self.range_start + self.range_length > image.len() {
             return Err("range out of bounds".to_string());
         }
-        let mut window = image[self.range_start..self.range_start + self.range_length].to_vec();
+        let window = image[self.range_start..self.range_start + self.range_length].to_vec();
         let width = algorithm_width(&self.algorithm);
-        let local = self.field_offset - self.range_start;
-        if local < window.len() {
-            let count = width.min(window.len() - local);
-            for i in 0..count {
-                window[local + i] = 0;
-            }
-        }
-        if self.algorithm == "crc32" {
-            return Ok(pack_u32(crc32_iso_hdlc(&window), 4, self.big_endian));
-        }
-        let sum: u32 = window.iter().map(|&b| b as u32).sum();
-        if self.algorithm == "sum16" {
-            return Ok(pack_u32(sum & 0xFFFF, 2, self.big_endian));
-        }
-        if self.algorithm == "sum32" {
-            return Ok(pack_u32(sum, 4, self.big_endian));
-        }
-        Err("unsupported algorithm".to_string())
+        let local = if self.field_offset >= self.range_start {
+            self.field_offset - self.range_start
+        } else {
+            0
+        };
+        crate::checksum_routine::compute_block(
+            &self.algorithm,
+            &window,
+            local,
+            width,
+            self.big_endian,
+        )
     }
 }
 
@@ -635,34 +649,6 @@ fn algorithm_width(algorithm: &str) -> usize {
         "sum32" | "crc32" => 4,
         _ => 0,
     }
-}
-
-fn crc32_iso_hdlc(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFFFFFFu32;
-    for &byte in data {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            if (crc & 1) != 0 {
-                crc = (crc >> 1) ^ 0xEDB88320;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    !crc
-}
-
-fn pack_u32(value: u32, width: usize, big_endian: bool) -> Vec<u8> {
-    let mut data = vec![0u8; width];
-    for i in 0..width {
-        let shift = if big_endian {
-            (width - 1 - i) * 8
-        } else {
-            i * 8
-        };
-        data[i] = ((value >> shift) & 0xFF) as u8;
-    }
-    data
 }
 
 fn hex_bytes(data: &[u8]) -> String {

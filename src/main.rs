@@ -1,6 +1,8 @@
 pub mod audit_log;
 pub mod cal_editor;
+pub mod checksum_routine;
 pub mod definitions;
+pub mod rom_image;
 pub mod diagnostics;
 pub mod flash_job;
 pub mod flash_layout;
@@ -52,7 +54,7 @@ mod tests {
     use std::path::PathBuf;
     use cal_editor::{cell_changed, format_cell_display, param_matches_query, table_has_edits};
     use definitions::{CuwFile, ScaleEquation, XdfDocument};
-    use security_config::{CHECKSUM_UPDATED, CHECKSUM_VALID};
+    use security_config::{CHECKSUM_NOT_CONFIGURED, CHECKSUM_UPDATED, CHECKSUM_VALID};
 
     #[test]
     fn test_cal_editor_delta_and_search() {
@@ -138,6 +140,49 @@ mod tests {
         assert_eq!(cuw.image.len(), 2);
         assert_eq!(cuw.image[0], 0x11);
         assert_eq!(cuw.image[1], 0x22);
+    }
+
+    #[test]
+    fn test_xdf_bind_table_scalar_and_flag_from_rom() {
+        let xdf_xml = std::fs::read_to_string("tests/fixtures/tacoma-bench-table.xdf")
+            .expect("fixture xdf");
+        let mut doc = XdfDocument::parse(&xdf_xml).expect("parse fixture");
+        assert_eq!(doc.tables[0].x_axis.dim, 2);
+        assert_eq!(doc.tables[0].address, 0x100);
+
+        let mut rom = vec![0xFFu8; 0x200];
+        // Z table 2x2 @ 0x100: 10, 20 / 30, 40
+        rom[0x100] = 10;
+        rom[0x101] = 20;
+        rom[0x102] = 30;
+        rom[0x103] = 40;
+        // X axis @ 0x108: raw 8,9 => 800, 900 RPM
+        rom[0x108] = 8;
+        rom[0x109] = 9;
+        // Scalar rev @ 0x120: raw 200 => 6400 RPM
+        rom[0x120] = 200;
+        // Flag @ 0x130 bit0 set
+        rom[0x130] = 0x01;
+
+        doc.bind_from_rom(&rom, 0);
+        assert_eq!(doc.tables[0].values[0][0], 10.0);
+        assert_eq!(doc.tables[0].values[1][1], 40.0);
+        assert!((doc.tables[0].x_axis.labels[0] - 800.0).abs() < 1e-3);
+        assert!((doc.constants[0].value - 6400.0).abs() < 1e-3);
+        assert!(doc.flags[0].is_set);
+    }
+
+    #[test]
+    fn test_flash_blocked_without_checksum_config() {
+        install_test_security_config();
+        let rom = vec![0x10u8, 0x20, 0x30, 0x40];
+        let err = PlatformSecurity::ensure_flash_checksum("tacoma-kline", "Tacoma K-Line", &rom, 0)
+            .expect_err("flash must be blocked");
+        assert!(err.contains("No checksum range"));
+        assert_eq!(
+            PlatformSecurity::checksum_badge("tacoma-kline", &rom, 0),
+            CHECKSUM_NOT_CONFIGURED
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@ use crate::audit_log::FlashAuditLog;
 use crate::cal_editor::{
     cell_changed, format_cell_display, param_matches_query, table_has_edits, FavoriteTables,
 };
-use crate::definitions::{CuwFile, XdfDocument};
+use crate::definitions::{RomImage, XdfDocument};
 use crate::diagnostics::{
     self, DiagnosticsSnapshot, DtcStatus, status_label,
 };
@@ -16,8 +16,12 @@ use crate::j2534::{
 use crate::j2534_host::HostPassThruDevice;
 use crate::protocols::{EcuIdentification, EcuIdentifier, EcuProfile};
 use crate::security_config::{
+<<<<<<< HEAD
     key_registration_label, security_mode_label, PlatformSecurity, KeyRegistration, SecurityMode,
     CHECKSUM_VALID,
+=======
+    PlatformSecurity, CHECKSUM_NOT_CONFIGURED, CHECKSUM_VALID,
+>>>>>>> 89d8f8c (Add ROM loaders, checksum routines, and XDF bind improvements)
 };
 use std::fs;
 use std::path::PathBuf;
@@ -224,37 +228,29 @@ impl WidebandApp {
             .unwrap_or("")
             .to_lowercase();
 
-        let load_result: Result<String, String> = if ext == "cuw" {
-            let bytes = match fs::read(&path) {
-                Ok(b) => b,
-                Err(e) => return self.log(&format!("Open ROM failed: {}", e)),
-            };
-            let cuw = match CuwFile::parse(&bytes) {
-                Ok(c) => c,
-                Err(e) => return self.log(&format!("Open ROM failed: {}", e)),
-            };
-            self.rom_origin = cuw.origin as i64;
-            if cuw.image.len() > self.active_rom.len() {
-                self.active_rom.resize(cuw.image.len(), 0xFF);
+        let bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => return self.log(&format!("Open ROM failed: {}", e)),
+        };
+        let load_result: Result<String, String> = match RomImage::from_bytes(&ext, &bytes) {
+            Ok(img) => {
+                self.rom_origin = img.origin as i64;
+                img.load_into_buffer(&mut self.active_rom, ext != "cuw");
+                let note = if img.note.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", img.note.lines().next().unwrap_or(""))
+                };
+                Ok(format!(
+                    "Loaded {} {} ({} bytes @ 0x{:X}{})",
+                    if ext == "cuw" { "CUW" } else { "ROM" },
+                    label,
+                    img.bytes.len(),
+                    img.origin,
+                    note
+                ))
             }
-            let start = cuw.origin as usize;
-            if start + cuw.image.len() <= self.active_rom.len() {
-                self.active_rom[start..start + cuw.image.len()].copy_from_slice(&cuw.image);
-            }
-            Ok(format!(
-                "Loaded CUW {} ({} bytes @ 0x{:X})",
-                label,
-                cuw.image.len(),
-                cuw.origin
-            ))
-        } else {
-            let data = match fs::read(&path) {
-                Ok(d) => d,
-                Err(e) => return self.log(&format!("Open ROM failed: {}", e)),
-            };
-            self.active_rom = data;
-            self.rom_origin = 0;
-            Ok(format!("Loaded ROM {} ({} bytes)", label, self.active_rom.len()))
+            Err(e) => Err(e),
         };
 
         match load_result {
@@ -1261,7 +1257,9 @@ impl WidebandApp {
                 ui.horizontal_wrapped(|ui| {
                     ui.heading(egui::RichText::new(&table_title).size(16.0).color(TEXT));
                     ui.label(egui::RichText::new(format!("({})", z_units)).color(ACCENT_CYAN));
-                    let ck_color = if self.checksum_status == CHECKSUM_VALID {
+                    let ck_color = if self.checksum_status == CHECKSUM_NOT_CONFIGURED {
+                        Color32::from_rgb(255, 152, 0)
+                    } else if self.checksum_status == CHECKSUM_VALID {
                         EMERALD
                     } else {
                         Color32::from_rgb(0xF5, 0x88, 0x36)
@@ -2081,8 +2079,24 @@ impl WidebandApp {
 
         self.log("Stamping and verifying checksum before cal-only flash...");
         self.xdf.write_all_tables_to_rom(&mut self.active_rom, self.rom_origin);
+<<<<<<< HEAD
         let prepared = match PlatformSecurity::prepare_for_flash(
             &prof.checksum_profile_id,
+=======
+        self.xdf.write_all_constants_to_rom(&mut self.active_rom, self.rom_origin);
+        for flag in &self.xdf.flags {
+            self.xdf.write_flag_to_rom(&mut self.active_rom, self.rom_origin, flag);
+        }
+        if self.checksum_status == CHECKSUM_NOT_CONFIGURED {
+            self.log(&format!(
+                "Flash blocked: {} — configure checksum ranges in security-config.json.",
+                CHECKSUM_NOT_CONFIGURED
+            ));
+            return;
+        }
+        let prepared = match PlatformSecurity::ensure_flash_checksum(
+            &prof.id,
+>>>>>>> b5ba17f (Add ROM loaders, checksum routines, and XDF bind improvements)
             &prof.name,
             &self.active_rom,
             self.rom_origin,

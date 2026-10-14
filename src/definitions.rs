@@ -1,5 +1,8 @@
+pub use crate::rom_image::CuwFile;
 use crate::security_config::locate;
 use roxmltree::Document;
+
+pub use crate::rom_image::{RomImage, MAX_CUW_SPAN};
 
 // ---------------------------------------------------------------------------
 // ScaleEquation Math Parser & Inverter
@@ -189,133 +192,6 @@ impl ScaleEquation {
 }
 
 // ---------------------------------------------------------------------------
-// Motorola S-Record (.cuw) File Extractor
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug)]
-pub struct CuwFile {
-    pub origin: u32,
-    pub image: Vec<u8>,
-    pub note: String,
-}
-
-impl CuwFile {
-    pub fn parse(content: &[u8]) -> Result<Self, String> {
-        let text = String::from_utf8_lossy(content);
-        let lines = text.lines().peekable();
-
-        let mut note = String::new();
-        let mut s_records = Vec::new();
-
-        for line in lines {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            if trimmed.starts_with('S') || trimmed.starts_with('s') {
-                s_records.push(trimmed.to_string());
-            } else if s_records.is_empty() {
-                if !note.is_empty() {
-                    note.push('\n');
-                }
-                note.push_str(trimmed);
-            }
-        }
-
-        if s_records.is_empty() {
-            // Raw binary fallback
-            return Ok(Self {
-                origin: 0,
-                image: content.to_vec(),
-                note: "Raw binary ROM".to_string(),
-            });
-        }
-
-        let mut chunks: Vec<(u32, Vec<u8>)> = Vec::new();
-        let mut min_addr = u32::MAX;
-        let mut max_addr = 0u32;
-
-        for (line_idx, line) in s_records.iter().enumerate() {
-            if line.len() < 4 {
-                continue;
-            }
-            let rec_type = line.chars().nth(1).unwrap();
-            let addr_len = match rec_type {
-                '1' => 2,
-                '2' => 3,
-                '3' => 4,
-                _ => continue, // S0 header or S7/S8/S9 termination
-            };
-
-            let count_hex = &line[2..4];
-            let count = u8::from_str_radix(count_hex, 16)
-                .map_err(|e| format!("Invalid S-record count at line {}: {}", line_idx, e))? as usize;
-
-            if line.len() < 4 + count * 2 {
-                continue;
-            }
-
-            let hex_payload = &line[4..4 + count * 2];
-            let mut bytes = Vec::new();
-            for i in (0..hex_payload.len()).step_by(2) {
-                if i + 2 <= hex_payload.len() {
-                    let b = u8::from_str_radix(&hex_payload[i..i + 2], 16)
-                        .map_err(|e| format!("Invalid hex byte at line {}: {}", line_idx, e))?;
-                    bytes.push(b);
-                }
-            }
-
-            if bytes.len() <= addr_len + 1 {
-                continue;
-            }
-
-            // Checksum verification: sum of count + bytes must be 0xFF
-            let mut sum = count as u8;
-            for &b in &bytes {
-                sum = sum.wrapping_add(b);
-            }
-            if sum != 0xFF {
-                return Err(format!("S-record checksum mismatch at line {}", line_idx));
-            }
-
-            // Parse address
-            let mut addr = 0u32;
-            for i in 0..addr_len {
-                addr = (addr << 8) | (bytes[i] as u32);
-            }
-
-            let data = bytes[addr_len..bytes.len() - 1].to_vec();
-            if !data.is_empty() {
-                min_addr = min_addr.min(addr);
-                max_addr = max_addr.max(addr + data.len() as u32);
-                chunks.push((addr, data));
-            }
-        }
-
-        if chunks.is_empty() {
-            return Err("No S1/S2/S3 data records found in CUW file".to_string());
-        }
-
-        let total_size = (max_addr - min_addr) as usize;
-        let mut image = vec![0xFFu8; total_size];
-
-        for (addr, data) in chunks {
-            let offset = (addr - min_addr) as usize;
-            if offset + data.len() <= total_size {
-                image[offset..offset + data.len()].copy_from_slice(&data);
-            }
-        }
-
-        Ok(Self {
-            origin: min_addr,
-            image,
-            note,
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
 // TunerPro XDF Document Parser (<XDFTABLE>, <XDFCONSTANT>, <XDFFLAG>)
 // ---------------------------------------------------------------------------
 
@@ -406,6 +282,12 @@ impl XdfDocument {
     /// Load engineering values from a ROM image using XDF addresses.
     pub fn bind_from_rom(&mut self, rom: &[u8], origin: i64) {
         for table in &mut self.tables {
+            if labels_look_like_placeholders(&table.x_axis.labels) {
+                read_axis_labels_from_rom(rom, origin, &mut table.x_axis);
+            }
+            if labels_look_like_placeholders(&table.y_axis.labels) {
+                read_axis_labels_from_rom(rom, origin, &mut table.y_axis);
+            }
             read_table_from_rom(rom, origin, table);
         }
         for constant in &mut self.constants {
@@ -430,6 +312,16 @@ impl XdfDocument {
     pub fn write_all_tables_to_rom(&self, rom: &mut [u8], origin: i64) {
         for table in &self.tables {
             write_table_to_rom(rom, origin, table);
+        }
+    }
+
+    pub fn write_constant_to_rom(&self, rom: &mut [u8], origin: i64, constant: &XdfConstant) -> bool {
+        write_scalar_u8(rom, origin, constant.address, &constant.equation, constant.value)
+    }
+
+    pub fn write_all_constants_to_rom(&self, rom: &mut [u8], origin: i64) {
+        for constant in &self.constants {
+            write_scalar_u8(rom, origin, constant.address, &constant.equation, constant.value);
         }
     }
 
@@ -473,17 +365,14 @@ impl XdfDocument {
 
         for axis_node in node.children().filter(|n| n.has_tag_name("XDFAXIS")) {
             let axis_id = axis_node.attribute("id").unwrap_or("x");
-            let dim = axis_node.children().find(|n| n.has_tag_name("dim"))
-                .and_then(|n| n.text()).and_then(|t| t.parse().ok()).unwrap_or(1);
+            let dim = axis_dimension(&axis_node);
             let units = axis_node.children().find(|n| n.has_tag_name("units"))
                 .and_then(|n| n.text()).unwrap_or("").to_string();
             let eq_str = axis_node.children().find(|n| n.has_tag_name("MATH"))
                 .and_then(|n| n.attribute("equation")).unwrap_or("X");
 
-            let addr = axis_node.children().find(|n| n.has_tag_name("EMBEDDEDDATA"))
-                .and_then(|n| n.attribute("mmedaddress"))
-                .and_then(|a| u32::from_str_radix(a.trim_start_matches("0x"), 16).ok())
-                .unwrap_or(0);
+            let addr = embedded_address(&axis_node).unwrap_or(0);
+            let labels = parse_axis_labels(&axis_node, dim);
 
             let axis = XdfAxis {
                 id: axis_id.chars().next().unwrap_or('x'),
@@ -491,14 +380,16 @@ impl XdfDocument {
                 address: addr,
                 units: units.clone(),
                 equation: ScaleEquation::parse(eq_str),
-                labels: (0..dim).map(|i| (i * 500) as f64).collect(),
+                labels,
             };
 
             match axis_id {
                 "x" | "X" => x_axis = axis,
                 "y" | "Y" => y_axis = axis,
                 "z" | "Z" => {
-                    table_addr = addr;
+                    if table_addr == 0 {
+                        table_addr = addr;
+                    }
                     z_equation = ScaleEquation::parse(eq_str);
                     z_units = units.clone();
                     element_bits = Self::embedded_element_bits(&axis_node).unwrap_or(8);
@@ -507,13 +398,11 @@ impl XdfDocument {
             }
         }
 
-        // Generate synthetic grid values for editor display
-        let mut values = vec![vec![0.0; x_axis.dim]; y_axis.dim];
-        for row in 0..y_axis.dim {
-            for col in 0..x_axis.dim {
-                values[row][col] = 45.0 + (col as f64 * 3.2) + (row as f64 * 2.5);
-            }
+        if table_addr == 0 {
+            table_addr = embedded_address(node).unwrap_or(0);
         }
+
+        let values = vec![vec![0.0; x_axis.dim]; y_axis.dim];
 
         Some(XdfTable {
             id,
@@ -761,6 +650,95 @@ impl XdfDocument {
 
         xdf
     }
+}
+
+fn axis_dimension(axis_node: &roxmltree::Node) -> usize {
+    if let Some(dim) = axis_node
+        .children()
+        .find(|n| n.has_tag_name("dim"))
+        .and_then(|n| n.text())
+        .and_then(|t| t.parse::<usize>().ok())
+    {
+        return dim.max(1);
+    }
+    if let Some(count) = axis_node
+        .children()
+        .find(|n| n.has_tag_name("indexcount"))
+        .and_then(|n| n.text())
+        .and_then(|t| t.parse::<usize>().ok())
+    {
+        return count.max(1);
+    }
+    1
+}
+
+fn embedded_address(node: &roxmltree::Node) -> Option<u32> {
+    let data = node
+        .children()
+        .find(|n| n.has_tag_name("EMBEDDEDDATA"))?;
+    parse_hex_address(data.attribute("mmedaddress")).or_else(|| {
+        data.children()
+            .find(|n| n.has_tag_name("mmedaddress"))
+            .and_then(|n| n.text())
+            .and_then(|t| parse_hex_address(Some(t)))
+    })
+}
+
+fn parse_hex_address(text: Option<&str>) -> Option<u32> {
+    let t = text?.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let s = t.trim_start_matches("0x").trim_start_matches("0X");
+    u32::from_str_radix(s, 16).ok()
+}
+
+fn labels_look_like_placeholders(labels: &[f64]) -> bool {
+    !labels.is_empty()
+        && labels
+            .iter()
+            .enumerate()
+            .all(|(i, v)| (*v - i as f64).abs() < 1e-6)
+}
+
+fn parse_axis_labels(axis_node: &roxmltree::Node, dim: usize) -> Vec<f64> {
+    let mut labels: Vec<Option<f64>> = vec![None; dim];
+    for label_node in axis_node.children().filter(|n| n.has_tag_name("LABEL")) {
+        let idx = label_node
+            .attribute("index")
+            .and_then(|t| t.parse::<usize>().ok())
+            .unwrap_or(0);
+        let text = label_node
+            .attribute("value")
+            .or_else(|| label_node.text())
+            .unwrap_or("0");
+        if let Ok(v) = text.trim().parse::<f64>() {
+            if idx < dim {
+                labels[idx] = Some(v);
+            }
+        }
+    }
+    if labels.iter().any(|l| l.is_some()) {
+        return labels
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| v.unwrap_or(i as f64))
+            .collect();
+    }
+    (0..dim).map(|i| i as f64).collect()
+}
+
+fn read_axis_labels_from_rom(rom: &[u8], origin: i64, axis: &mut XdfAxis) {
+    if axis.address == 0 || axis.dim == 0 {
+        return;
+    }
+    let mut labels = Vec::with_capacity(axis.dim);
+    for i in 0..axis.dim {
+        let addr = axis.address + i as u32;
+        let v = read_scalar_u8(rom, origin, addr, &axis.equation).unwrap_or(i as f64);
+        labels.push(v);
+    }
+    axis.labels = labels;
 }
 
 fn read_scalar_u8(rom: &[u8], origin: i64, address: u32, equation: &ScaleEquation) -> Option<f64> {
