@@ -16,12 +16,8 @@ use crate::j2534::{
 use crate::j2534_host::HostPassThruDevice;
 use crate::protocols::{EcuIdentification, EcuIdentifier, EcuProfile};
 use crate::security_config::{
-<<<<<<< HEAD
     key_registration_label, security_mode_label, PlatformSecurity, KeyRegistration, SecurityMode,
-    CHECKSUM_VALID,
-=======
-    PlatformSecurity, CHECKSUM_NOT_CONFIGURED, CHECKSUM_VALID,
->>>>>>> 89d8f8c (Add ROM loaders, checksum routines, and XDF bind improvements)
+    CHECKSUM_NOT_CONFIGURED, CHECKSUM_VALID,
 };
 use std::fs;
 use std::path::PathBuf;
