@@ -1,6 +1,9 @@
-use crate::definitions::XdfDocument;
+use crate::definitions::{CuwFile, XdfDocument};
 use crate::j2534::{create_device, J2534DeviceInfo, J2534RegistryScanner, PassThruDevice};
-use crate::protocols::{ChecksumEngine, EcuIdentification, EcuIdentifier, EcuProfile, FlashDownload};
+use crate::protocols::{EcuIdentification, EcuIdentifier, EcuProfile, FlashDownload};
+use crate::security_config::{PlatformSecurity, CHECKSUM_UPDATED, CHECKSUM_VALID};
+use std::fs;
+use std::path::PathBuf;
 use crate::surface_mesh;
 use crate::telemetry::TelemetryBuffer;
 use crate::theme::{
@@ -39,6 +42,9 @@ pub struct WidebandApp {
     pub math_amount: f64,
     pub checksum_status: String,
     pub active_rom: Vec<u8>,
+    pub rom_origin: i64,
+    pub rom_path: Option<PathBuf>,
+    pub xdf_path: Option<PathBuf>,
 
     // Telemetry
     pub telemetry: Arc<Mutex<TelemetryBuffer>>,
@@ -70,7 +76,9 @@ impl WidebandApp {
 
         let stock_tables = xdf.tables.iter().map(|t| t.values.clone()).collect();
         let mut rom = vec![0xFFu8; 1024 * 1024]; // 1MB mock ROM buffer
-        ChecksumEngine::update_and_verify(&mut rom, &profiles[0].id).ok();
+        xdf.write_all_tables_to_rom(&mut rom, 0);
+
+        PlatformSecurity::install(&PlatformSecurity::default_config_path());
 
         let mut app = Self {
             devices,
@@ -85,8 +93,11 @@ impl WidebandApp {
             stock_tables,
             active_cell: (0, 0),
             math_amount: 5.0,
-            checksum_status: "Checksum Valid".to_string(),
+            checksum_status: CHECKSUM_VALID.to_string(),
             active_rom: rom,
+            rom_origin: 0,
+            rom_path: None,
+            xdf_path: None,
             telemetry: Arc::new(Mutex::new(TelemetryBuffer::new(5000))),
             trace_rpm: 2400.0,
             trace_map: 70.0,
@@ -101,9 +112,126 @@ impl WidebandApp {
             active_tab: WorkspaceTab::Calibration,
         };
 
+        let sec_note = PlatformSecurity::load_note();
+        if !sec_note.is_empty() {
+            app.log(&format!("Security config: {}", sec_note));
+        }
+
         // Auto-connect to Virtual ECU Loopback on startup for instant live preview
         app.connect_cable();
         app
+    }
+
+    fn commit_table_edits(&mut self) {
+        let idx = self.selected_table_idx;
+        self.xdf.write_table_to_rom(&mut self.active_rom, self.rom_origin, idx);
+        self.checksum_status = CHECKSUM_UPDATED.to_string();
+    }
+
+    fn refresh_stock_tables(&mut self) {
+        self.stock_tables = self.xdf.tables.iter().map(|t| t.values.clone()).collect();
+    }
+
+    fn load_rom_from_path(&mut self, path: PathBuf) {
+        let label = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        let load_result: Result<String, String> = if ext == "cuw" {
+            let bytes = match fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => return self.log(&format!("Open ROM failed: {}", e)),
+            };
+            let cuw = match CuwFile::parse(&bytes) {
+                Ok(c) => c,
+                Err(e) => return self.log(&format!("Open ROM failed: {}", e)),
+            };
+            self.rom_origin = cuw.origin as i64;
+            if cuw.image.len() > self.active_rom.len() {
+                self.active_rom.resize(cuw.image.len(), 0xFF);
+            }
+            let start = cuw.origin as usize;
+            if start + cuw.image.len() <= self.active_rom.len() {
+                self.active_rom[start..start + cuw.image.len()].copy_from_slice(&cuw.image);
+            }
+            Ok(format!(
+                "Loaded CUW {} ({} bytes @ 0x{:X})",
+                label,
+                cuw.image.len(),
+                cuw.origin
+            ))
+        } else {
+            let data = match fs::read(&path) {
+                Ok(d) => d,
+                Err(e) => return self.log(&format!("Open ROM failed: {}", e)),
+            };
+            self.active_rom = data;
+            self.rom_origin = 0;
+            Ok(format!("Loaded ROM {} ({} bytes)", label, self.active_rom.len()))
+        };
+
+        match load_result {
+            Ok(msg) => {
+                self.rom_path = Some(path);
+                self.xdf.bind_from_rom(&self.active_rom, self.rom_origin);
+                self.refresh_stock_tables();
+                self.checksum_status = CHECKSUM_VALID.to_string();
+                self.log(&msg);
+            }
+            Err(e) => self.log(&format!("Open ROM failed: {}", e)),
+        }
+    }
+
+    fn load_xdf_from_path(&mut self, path: PathBuf) {
+        match fs::read_to_string(&path) {
+            Ok(xml) => match XdfDocument::parse(&xml) {
+                Ok(doc) => {
+                    self.xdf = doc;
+                    self.selected_table_idx = 0;
+                    self.active_cell = (0, 0);
+                    let label = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    self.xdf_path = Some(path);
+                    self.xdf.bind_from_rom(&self.active_rom, self.rom_origin);
+                    self.refresh_stock_tables();
+                    self.log(&format!("Loaded XDF {} ({} tables)", label, self.xdf.tables.len()));
+                }
+                Err(e) => self.log(&format!("XDF parse failed: {}", e)),
+            },
+            Err(e) => self.log(&format!("Open XDF failed: {}", e)),
+        }
+    }
+
+    fn save_rom_to_path(&mut self, path: PathBuf) {
+        let prof = &self.profiles[self.selected_profile_idx];
+        self.xdf.write_all_tables_to_rom(&mut self.active_rom, self.rom_origin);
+        for flag in &self.xdf.flags {
+            self.xdf.write_flag_to_rom(&mut self.active_rom, self.rom_origin, flag);
+        }
+
+        let mut image = self.active_rom.clone();
+        match PlatformSecurity::stamp_image(&prof.id, &mut image, self.rom_origin) {
+            Ok(status) => {
+                self.checksum_status = status;
+                let nbytes = image.len();
+                match fs::write(&path, &image) {
+                    Ok(()) => {
+                        self.active_rom = image;
+                        self.rom_path = Some(path.clone());
+                        self.log(&format!(
+                            "Saved ROM {} ({} bytes, {})",
+                            path.file_name().unwrap_or_default().to_string_lossy(),
+                            nbytes,
+                            self.checksum_status
+                        ));
+                    }
+                    Err(e) => self.log(&format!("Save ROM failed: {}", e)),
+                }
+            }
+            Err(e) => self.log(&format!("Save ROM blocked: {}", e)),
+        }
     }
 
     pub fn log(&mut self, text: &str) {
@@ -117,12 +245,18 @@ impl WidebandApp {
     pub fn connect_cable(&mut self) {
         if self.selected_device_idx < self.devices.len() {
             let dev_info = &self.devices[self.selected_device_idx];
+            let dev_name = dev_info.name.clone();
+            let is_virtual = dev_info.is_virtual;
             let mut dev = create_device(dev_info);
             if let Ok(()) = dev.open() {
+                if is_virtual {
+                    PlatformSecurity::register_bench_keys_for_virtual();
+                    self.log("Virtual bench: explicit zero-mask security keys registered for loopback only.");
+                }
                 let prof = &self.profiles[self.selected_profile_idx];
                 let _ = dev.connect(prof.protocol_id, prof.connect_flags, prof.bitrate);
                 let ver = dev.firmware_version();
-                self.log(&format!("Connected to {}: {}", dev_info.name, ver));
+                self.log(&format!("Connected to {}: {}", dev_name, ver));
                 self.active_device = Some(dev);
                 self.is_connected = true;
             } else {
@@ -212,7 +346,7 @@ impl WidebandApp {
                 _ => cur,
             };
             table.values[r][c] = (updated * 100.0).round() / 100.0;
-            self.checksum_status = "Checksum Updated".to_string();
+            self.commit_table_edits();
         }
     }
 
@@ -231,7 +365,7 @@ impl WidebandApp {
                 let frac = i as f64 / (n - 1) as f64;
                 row[i] = ((first + (last - first) * frac) * 100.0).round() / 100.0;
             }
-            self.checksum_status = "Checksum Updated".to_string();
+            self.commit_table_edits();
         }
     }
 
@@ -256,7 +390,7 @@ impl WidebandApp {
             }
         }
         table.values = smoothed;
-        self.checksum_status = "Checksum Updated".to_string();
+        self.commit_table_edits();
     }
 }
 
@@ -599,6 +733,56 @@ impl WidebandApp {
         egui::CentralPanel::default()
             .frame(theme::panel_frame())
             .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Open ROM (.bin / .cuw)").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("ROM image", &["bin", "cuw"])
+                            .pick_file()
+                        {
+                            self.load_rom_from_path(path);
+                        }
+                    }
+                    if ui.button("Open XDF").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("TunerPro XDF", &["xdf"])
+                            .pick_file()
+                        {
+                            self.load_xdf_from_path(path);
+                        }
+                    }
+                    if ui.button("Save ROM").clicked() {
+                        let mut dialog = rfd::FileDialog::new().add_filter("ROM image", &["bin"]);
+                        if let Some(p) = &self.rom_path {
+                            if let Some(name) = p.file_name() {
+                                dialog = dialog.set_file_name(name.to_string_lossy().to_string());
+                            }
+                        }
+                        if let Some(path) = dialog.save_file() {
+                            self.save_rom_to_path(path);
+                        }
+                    }
+                    let rom_label = self
+                        .rom_path
+                        .as_ref()
+                        .and_then(|p| p.file_name())
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "No ROM file".to_string());
+                    let xdf_label = self
+                        .xdf_path
+                        .as_ref()
+                        .and_then(|p| p.file_name())
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| self.xdf.title.clone());
+                    ui.label(
+                        egui::RichText::new(format!("ROM: {} | XDF: {}", rom_label, xdf_label))
+                            .small()
+                            .color(MUTED),
+                    );
+                });
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+
                 if self.xdf.tables.is_empty() {
                     ui.label(egui::RichText::new("No calibration tables loaded.").color(MUTED));
                     return;
@@ -922,17 +1106,26 @@ impl WidebandApp {
 
         self.log("Stamping and verifying checksum before flash...");
         let prof = self.profiles[self.selected_profile_idx].clone();
-        if let Err(e) = ChecksumEngine::update_and_verify(&mut self.active_rom, &prof.id) {
-            self.log(&format!("Flash blocked: Checksum calculation failed: {}", e));
-            return;
-        }
+        self.xdf.write_all_tables_to_rom(&mut self.active_rom, self.rom_origin);
+        let prepared = match PlatformSecurity::prepare_for_flash(
+            &prof.id,
+            &prof.name,
+            &self.active_rom[..64 * 1024],
+            self.rom_origin,
+        ) {
+            Ok(img) => img,
+            Err(e) => {
+                self.log(&format!("Flash blocked: {}", e));
+                return;
+            }
+        };
 
         self.log(&format!("Starting flash sequence for {}...", prof.name));
         self.is_flashing = true;
         self.transfer_progress = 0.0;
 
         if let Some(dev) = &mut self.active_device {
-            let rom_slice = self.active_rom[..64 * 1024].to_vec(); // Transfer 64KB block in test
+            let rom_slice = prepared;
             let flash_res = FlashDownload::execute(
                 dev.as_mut(),
                 1,
@@ -971,14 +1164,18 @@ impl WidebandApp {
             ui.separator();
 
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for flag in &mut self.xdf.flags {
+                for idx in 0..self.xdf.flags.len() {
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
-                            let mut checked = flag.is_set;
+                            let mut checked = self.xdf.flags[idx].is_set;
                             if ui.checkbox(&mut checked, "").changed() {
-                                flag.is_set = checked;
+                                self.xdf.flags[idx].is_set = checked;
+                                let flag = &self.xdf.flags[idx];
+                                self.xdf.write_flag_to_rom(&mut self.active_rom, self.rom_origin, flag);
+                                self.checksum_status = CHECKSUM_UPDATED.to_string();
                             }
 
+                            let flag = &self.xdf.flags[idx];
                             let badge_color = if flag.is_set {
                                 Color32::from_rgb(0, 230, 118)
                             } else {

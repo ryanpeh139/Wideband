@@ -1,0 +1,41 @@
+{
+  "profiles": {
+    "tacoma-can": {
+      "algorithm": "denso32",
+      "mask": "0x00000000",
+      "generation": "",
+      "endian": "big",
+      "configured": true
+    },
+    "silverado-can": {
+      "algorithm": "gm",
+      "keyId": "test-gm32",
+      "configured": true
+    }
+  },
+  "densoGenerations": [],
+  "gmKeys": [
+    {
+      "id": "test-gm32",
+      "bits": 32,
+      "rotate": 0,
+      "direction": "left",
+      "xor": "0x00000000",
+      "add": 0,
+      "endian": "big",
+      "configured": true
+    }
+  ],
+  "checksums": [
+    {
+      "id": "test-sum32",
+      "profile": "tacoma-can",
+      "algorithm": "sum32",
+      "start": "0x0",
+      "end": "0x3",
+      "store": "0x4",
+      "endian": "big",
+      "configured": true
+    }
+  ]
+}

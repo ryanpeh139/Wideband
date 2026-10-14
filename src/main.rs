@@ -1,6 +1,7 @@
 pub mod definitions;
 pub mod j2534;
 pub mod protocols;
+pub mod security_config;
 pub mod telemetry;
 pub mod surface_mesh;
 pub mod theme;
@@ -36,7 +37,9 @@ fn main() -> eframe::Result<()> {
 mod tests {
     use super::*;
     use j2534::{PassThruDevice, PassThruMsg, VirtualEcuSimulator, ISO15765};
-    use protocols::{ChecksumEngine, EcuIdentifier, EcuProfile, FlashDownload, SecurityKeys};
+    use protocols::{ChecksumEngine, EcuIdentifier, EcuProfile, FlashDownload};
+    use security_config::PlatformSecurity;
+    use std::path::PathBuf;
     use definitions::{CuwFile, ScaleEquation, XdfDocument};
 
     #[test]
@@ -137,8 +140,15 @@ mod tests {
         assert!((raw - 200.0).abs() < 1e-3);
     }
 
+    fn install_test_security_config() {
+        let path = PathBuf::from("tests/security-config-test.json");
+        PlatformSecurity::install(&path);
+    }
+
     #[test]
     fn test_checksum_calculations() {
+        install_test_security_config();
+
         let test_bytes = vec![0x01, 0x02, 0x03, 0x04, 0x05];
         let sum16 = ChecksumEngine::sum16(&test_bytes);
         assert_eq!(sum16, 15);
@@ -150,23 +160,29 @@ mod tests {
         assert_ne!(crc, 0);
 
         let mut rom = vec![0x10, 0x20, 0x30, 0x40, 0x00, 0x00, 0x00, 0x00];
-        let res = ChecksumEngine::update_and_verify(&mut rom, "tacoma-can");
+        let res = ChecksumEngine::update_and_verify(&mut rom, "tacoma-can", 0);
         assert!(res.is_ok());
-        // Verify that checksum was stamped into last 4 bytes
         let stamped_sum = u32::from_be_bytes([rom[4], rom[5], rom[6], rom[7]]);
         assert_eq!(stamped_sum, 0x10 + 0x20 + 0x30 + 0x40);
 
-        // Test Denso and GM seed-key calculation
         let seed = [0x12, 0x34, 0x56, 0x78];
-        let tacoma_key = SecurityKeys::compute_for_profile(&seed, "tacoma-can").expect("Tacoma key must succeed");
+        let tacoma = EcuProfile::tacoma_can();
+        let tacoma_key = PlatformSecurity::compute_key(&seed, &tacoma).expect("Tacoma key must succeed");
         assert_eq!(tacoma_key.len(), 4);
 
-        let silverado_key = SecurityKeys::compute_for_profile(&seed, "silverado-can").expect("Silverado key must succeed");
+        let silverado = EcuProfile::silverado_can();
+        let silverado_key = PlatformSecurity::compute_key(&seed, &silverado).expect("Silverado key must succeed");
         assert_eq!(silverado_key.len(), 4);
+
+        let unconfigured = PlatformSecurity::compute_key(&seed, &EcuProfile::tacoma_kline());
+        assert!(unconfigured.is_err());
     }
 
     #[test]
     fn test_virtual_ecu_loopback_flash() {
+        install_test_security_config();
+        PlatformSecurity::register_bench_keys_for_virtual();
+
         let mut sim = VirtualEcuSimulator::new();
         sim.open().expect("Simulator open must succeed");
         let channel = sim.connect(ISO15765, 0, 500000).expect("Connect must succeed");

@@ -1,3 +1,4 @@
+use crate::security_config::locate;
 use roxmltree::Document;
 
 // ---------------------------------------------------------------------------
@@ -338,6 +339,7 @@ pub struct XdfTable {
     pub y_axis: XdfAxis,
     pub z_equation: ScaleEquation,
     pub z_units: String,
+    pub element_bits: u8,
     pub values: Vec<Vec<f64>>,
 }
 
@@ -401,6 +403,46 @@ impl XdfDocument {
         Ok(xdf)
     }
 
+    /// Load engineering values from a ROM image using XDF addresses.
+    pub fn bind_from_rom(&mut self, rom: &[u8], origin: i64) {
+        for table in &mut self.tables {
+            read_table_from_rom(rom, origin, table);
+        }
+        for constant in &mut self.constants {
+            if let Some(v) = read_scalar_u8(rom, origin, constant.address, &constant.equation) {
+                constant.value = v;
+            }
+        }
+        for flag in &mut self.flags {
+            if let Some(idx) = locate(rom, origin, flag.address as i64) {
+                flag.is_set = (rom[idx] & flag.mask) != 0;
+            }
+        }
+    }
+
+    pub fn write_table_to_rom(&self, rom: &mut [u8], origin: i64, table_idx: usize) -> bool {
+        if table_idx >= self.tables.len() {
+            return false;
+        }
+        write_table_to_rom(rom, origin, &self.tables[table_idx])
+    }
+
+    pub fn write_all_tables_to_rom(&self, rom: &mut [u8], origin: i64) {
+        for table in &self.tables {
+            write_table_to_rom(rom, origin, table);
+        }
+    }
+
+    pub fn write_flag_to_rom(&self, rom: &mut [u8], origin: i64, flag: &XdfFlag) {
+        if let Some(idx) = locate(rom, origin, flag.address as i64) {
+            if flag.is_set {
+                rom[idx] |= flag.mask;
+            } else {
+                rom[idx] &= !flag.mask;
+            }
+        }
+    }
+
     fn parse_table(node: &roxmltree::Node) -> Option<XdfTable> {
         let id = node.attribute("uniqueid").unwrap_or("table").to_string();
         let title = node.children().find(|n| n.has_tag_name("title"))
@@ -427,6 +469,7 @@ impl XdfDocument {
         let mut z_equation = ScaleEquation::parse("X");
         let mut z_units = "VE %".to_string();
         let mut table_addr = 0u32;
+        let mut element_bits = 8u8;
 
         for axis_node in node.children().filter(|n| n.has_tag_name("XDFAXIS")) {
             let axis_id = axis_node.attribute("id").unwrap_or("x");
@@ -446,7 +489,7 @@ impl XdfDocument {
                 id: axis_id.chars().next().unwrap_or('x'),
                 dim,
                 address: addr,
-                units,
+                units: units.clone(),
                 equation: ScaleEquation::parse(eq_str),
                 labels: (0..dim).map(|i| (i * 500) as f64).collect(),
             };
@@ -457,7 +500,8 @@ impl XdfDocument {
                 "z" | "Z" => {
                     table_addr = addr;
                     z_equation = ScaleEquation::parse(eq_str);
-                    z_units = axis.units;
+                    z_units = units.clone();
+                    element_bits = Self::embedded_element_bits(&axis_node).unwrap_or(8);
                 }
                 _ => {}
             }
@@ -480,8 +524,17 @@ impl XdfDocument {
             y_axis,
             z_equation,
             z_units,
+            element_bits,
             values,
         })
+    }
+
+    fn embedded_element_bits(axis_node: &roxmltree::Node) -> Option<u8> {
+        axis_node
+            .children()
+            .find(|n| n.has_tag_name("EMBEDDEDDATA"))
+            .and_then(|n| n.attribute("mmedelementsizebits"))
+            .and_then(|t| t.parse().ok())
     }
 
     fn parse_constant(node: &roxmltree::Node) -> Option<XdfConstant> {
@@ -577,6 +630,7 @@ impl XdfDocument {
             },
             z_equation: ScaleEquation::parse("X * 0.1"),
             z_units: "%".to_string(),
+            element_bits: 8,
             values: ve_values,
         });
 
@@ -614,6 +668,7 @@ impl XdfDocument {
             },
             z_equation: ScaleEquation::parse("X * 0.25"),
             z_units: "deg BTDC".to_string(),
+            element_bits: 8,
             values: spark_values,
         });
 
@@ -656,6 +711,7 @@ impl XdfDocument {
             },
             z_equation: ScaleEquation::parse("X * 0.0078125"),
             z_units: "Lambda".to_string(),
+            element_bits: 8,
             values: lambda_values,
         });
 
@@ -705,4 +761,66 @@ impl XdfDocument {
 
         xdf
     }
+}
+
+fn read_scalar_u8(rom: &[u8], origin: i64, address: u32, equation: &ScaleEquation) -> Option<f64> {
+    let idx = locate(rom, origin, address as i64)?;
+    let raw = rom[idx] as f64;
+    Some(equation.evaluate(raw))
+}
+
+fn read_table_from_rom(rom: &[u8], origin: i64, table: &mut XdfTable) {
+    let rows = table.y_axis.dim;
+    let cols = table.x_axis.dim;
+    if table.values.len() != rows {
+        table.values = vec![vec![0.0; cols]; rows];
+    }
+    for r in 0..rows {
+        if table.values[r].len() != cols {
+            table.values[r] = vec![0.0; cols];
+        }
+        for c in 0..cols {
+            let offset = (r * cols + c) as u32;
+            let addr = table.address + offset;
+            if let Some(v) = read_scalar_u8(rom, origin, addr, &table.z_equation) {
+                table.values[r][c] = (v * 100.0).round() / 100.0;
+            }
+        }
+    }
+}
+
+fn write_table_to_rom(rom: &mut [u8], origin: i64, table: &XdfTable) -> bool {
+    let rows = table.values.len();
+    if rows == 0 {
+        return false;
+    }
+    let cols = table.values[0].len();
+    for r in 0..rows {
+        for c in 0..cols {
+            if c >= table.values[r].len() {
+                continue;
+            }
+            let offset = (r * cols + c) as u32;
+            let addr = table.address + offset;
+            if !write_scalar_u8(rom, origin, addr, &table.z_equation, table.values[r][c]) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn write_scalar_u8(
+    rom: &mut [u8],
+    origin: i64,
+    address: u32,
+    equation: &ScaleEquation,
+    engineering: f64,
+) -> bool {
+    let Some(idx) = locate(rom, origin, address as i64) else {
+        return false;
+    };
+    let raw = equation.invert(engineering).round().clamp(0.0, 255.0) as u8;
+    rom[idx] = raw;
+    true
 }
