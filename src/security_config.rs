@@ -14,12 +14,6 @@ fn test_serial_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-/// Hold for the full body of any test that reads or writes `PlatformSecurity` state (parallel-safe).
-#[cfg(test)]
-pub fn test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
-    test_serial_lock()
-}
-
 pub const CHECKSUM_VALID: &str = "Checksum Valid";
 pub const CHECKSUM_UPDATED: &str = "Checksum Updated";
 
@@ -147,6 +141,12 @@ fn state() -> &'static Mutex<PlatformState> {
 pub struct PlatformSecurity;
 
 impl PlatformSecurity {
+    /// Hold for the full body of any test that reads or writes global security state (parallel-safe).
+    #[cfg(test)]
+    pub fn test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
+        test_serial_lock()
+    }
+
     pub fn default_config_path() -> PathBuf {
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
@@ -274,8 +274,10 @@ impl PlatformSecurity {
         let id = canonical_profile(profile_id);
         let guard = state().lock().unwrap();
         let mut reasons = Vec::new();
+        let bench_virtual = virtual_ecu
+            && guard.key_registration.get(&id) == Some(&KeyRegistration::Bench);
 
-        if !guard.load_note.is_empty() {
+        if !guard.load_note.is_empty() && !bench_virtual {
             reasons.push(format!("Security config: {}", guard.load_note));
         }
 
@@ -316,7 +318,7 @@ Configure security-config.json with your authorized Denso mask or generation bef
             .checksums
             .iter()
             .any(|e| applies_checksum(e, &id));
-        if !has_active_checksum {
+        if !has_active_checksum && !bench_virtual {
             let pending = guard
                 .checksum_declarations
                 .iter()
@@ -1230,7 +1232,12 @@ mod security_config_tests {
             "{:?}",
             blockers
         );
-        assert!(PlatformSecurity::flash_blockers("tacoma-can", true).is_empty());
+        let virtual_blockers = PlatformSecurity::flash_blockers("tacoma-can", true);
+        assert!(
+            virtual_blockers.is_empty(),
+            "virtual bench flash should be allowed: {:?}",
+            virtual_blockers
+        );
     }
 
     #[test]
