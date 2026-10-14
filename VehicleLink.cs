@@ -165,6 +165,39 @@ namespace Wideband
             Interlocked.Exchange(ref busy, 0);
         }
 
+        public IDiagnosticLink OpenDiagnosticLink()
+        {
+            lock (gate) return diagnostic;
+        }
+
+        public bool TryRunDiagnostic<T>(Func<IDiagnosticLink, EcuProfile, T> action, out T result)
+        {
+            result = default(T);
+            if (!connected) return false;
+            if (Interlocked.CompareExchange(ref busy, 1, 0) != 0) return false;
+            try
+            {
+                IDiagnosticLink link;
+                EcuProfile selected;
+                lock (gate)
+                {
+                    link = diagnostic;
+                    selected = profile;
+                }
+                if (link == null || selected == null) return false;
+                result = action(link, selected);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+            finally
+            {
+                Interlocked.Exchange(ref busy, 0);
+            }
+        }
+
         public byte[] ReadCalibration(long address, int length, int chunkBytes, FlashProgressHandler progress)
         {
             IDiagnosticLink link;
@@ -297,7 +330,7 @@ namespace Wideband
             return selected;
         }
 
-        ISecurityKey KeysFor(EcuProfile selected)
+        public ISecurityKey KeysFor(EcuProfile selected)
         {
             ComputeKey local = computeKey;
             EcuProfile current = selected;

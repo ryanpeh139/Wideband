@@ -7,9 +7,157 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Web.Script.Serialization;
+using Microsoft.Win32;
 
 namespace Wideband
 {
+    // One J2534 v04.04 Pass-Thru library found in the registry or supplied by the user.
+    sealed class J2534Device
+    {
+        public string Name = "";
+        public string Vendor = "";
+        public string LibraryPath = "";
+        public string Source = "";
+        public ushort Machine;
+        public bool Exists;
+
+        public const ushort MachineX86 = 0x014C;
+        public const ushort MachineX64 = 0x8664;
+
+        // J2534Host.exe is x86. A library is usable when it exists and is not a 64-bit image.
+        public bool Usable
+        {
+            get { return Exists && Machine != MachineX64; }
+        }
+
+        public override string ToString()
+        {
+            string text = Name.Length > 0 ? Name : Path.GetFileName(LibraryPath);
+            if (Vendor.Length > 0 && text.IndexOf(Vendor, StringComparison.OrdinalIgnoreCase) < 0)
+                text += " (" + Vendor + ")";
+            if (!Exists) text += " - DLL not found";
+            else if (Machine == MachineX64) text += " - 64-bit DLL, not usable";
+            return text;
+        }
+    }
+
+    // Enumerates SAE J2534-1 v04.04 devices. Each subkey of PassThruSupport.04.04 is one device
+    // with Name, Vendor, and FunctionLibrary values. Both the WOW6432Node and native roots are read.
+    static class J2534RegistryScanner
+    {
+        public const string Wow64Root = @"SOFTWARE\WOW6432Node\PassThruSupport.04.04";
+        public const string NativeRoot = @"SOFTWARE\PassThruSupport.04.04";
+        public const string VfTunerLibrary = @"C:\Program Files (x86)\VF Tuner\esp32.dll";
+
+        public static List<J2534Device> Scan()
+        {
+            var found = new List<J2534Device>();
+            ReadRoot(found, Wow64Root);
+            ReadRoot(found, NativeRoot);
+            return found;
+        }
+
+        // Registry devices first, then the VF Tuner library and any extra fallback path.
+        public static List<J2534Device> WithFallbacks(string extraLibrary)
+        {
+            var list = new List<J2534Device>();
+            foreach (J2534Device device in Scan()) Add(list, device);
+            Add(list, Describe("VF Tuner", "VF Tuner", VfTunerLibrary, "fallback"));
+            if (extraLibrary != null && extraLibrary.Trim().Length > 0)
+                Add(list, Describe("VF Tuner", "VF Tuner", extraLibrary.Trim(), "fallback"));
+            return list;
+        }
+
+        public static J2534Device Describe(string name, string vendor, string libraryPath, string source)
+        {
+            var device = new J2534Device();
+            device.Name = name == null ? "" : name.Trim();
+            device.Vendor = vendor == null ? "" : vendor.Trim();
+            device.LibraryPath = libraryPath == null ? "" : libraryPath.Trim();
+            device.Source = source == null ? "" : source;
+            device.Exists = device.LibraryPath.Length > 0 && File.Exists(device.LibraryPath);
+            device.Machine = device.Exists ? PeMachine(device.LibraryPath) : (ushort)0;
+            return device;
+        }
+
+        // Adds a device unless the same library path is already listed.
+        public static bool Add(List<J2534Device> list, J2534Device device)
+        {
+            if (list == null || device == null || device.LibraryPath.Length == 0) return false;
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (string.Equals(list[i].LibraryPath, device.LibraryPath, StringComparison.OrdinalIgnoreCase))
+                    return false;
+            }
+            list.Add(device);
+            return true;
+        }
+
+        // Returns the IMAGE_FILE_HEADER Machine field, or 0 when the file is not a PE image.
+        public static ushort PeMachine(string path)
+        {
+            try
+            {
+                using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    var head = new byte[64];
+                    if (stream.Read(head, 0, head.Length) != head.Length) return 0;
+                    if (head[0] != (byte)'M' || head[1] != (byte)'Z') return 0;
+                    int offset = BitConverter.ToInt32(head, 0x3C);
+                    if (offset < 64 || offset > 64 * 1024 || offset + 6 > stream.Length) return 0;
+                    stream.Seek(offset, SeekOrigin.Begin);
+                    var pe = new byte[6];
+                    if (stream.Read(pe, 0, pe.Length) != pe.Length) return 0;
+                    if (pe[0] != (byte)'P' || pe[1] != (byte)'E' || pe[2] != 0 || pe[3] != 0) return 0;
+                    return (ushort)(pe[4] | (pe[5] << 8));
+                }
+            }
+            catch (Exception)
+            {
+                return 0;
+            }
+        }
+
+        static void ReadRoot(List<J2534Device> found, string rootPath)
+        {
+            RegistryKey hive = null;
+            RegistryKey root = null;
+            try
+            {
+                hive = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64);
+                root = hive.OpenSubKey(rootPath, false);
+                if (root == null) return;
+                foreach (string child in root.GetSubKeyNames())
+                {
+                    using (RegistryKey key = root.OpenSubKey(child, false))
+                    {
+                        if (key == null) continue;
+                        string library = Value(key, "FunctionLibrary");
+                        if (library.Length == 0) continue;
+                        string name = Value(key, "Name");
+                        if (name.Length == 0) name = child;
+                        J2534Device device = Describe(name, Value(key, "Vendor"), Environment.ExpandEnvironmentVariables(library), "HKLM\\" + rootPath);
+                        Add(found, device);
+                    }
+                }
+            }
+            catch (Exception)
+            {
+            }
+            finally
+            {
+                if (root != null) root.Dispose();
+                if (hive != null) hive.Dispose();
+            }
+        }
+
+        static string Value(RegistryKey key, string name)
+        {
+            object value = key.GetValue(name);
+            return value == null ? "" : value.ToString().Trim();
+        }
+    }
+
     // CAN transport only. It does not program an ECU, correct a checksum, or send a frame on its own.
     sealed class CanFrame
     {

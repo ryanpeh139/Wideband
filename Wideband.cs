@@ -320,7 +320,7 @@ namespace Wideband
     {
         readonly List<Definition> definitions;
         readonly string installPath;
-        readonly string dllPath;
+        string dllPath;
         Dictionary<string, object> device;
         readonly Font ui;
         readonly Font titleFont;
@@ -348,6 +348,17 @@ namespace Wideband
         readonly Button readButton;
         readonly Button transferButton;
         readonly Button disconnectButton;
+        readonly ComboBox deviceBox;
+        readonly Button browseDllButton;
+        readonly Button identifyButton;
+        readonly Button virtualReadButton;
+        readonly Button flashActiveButton;
+        readonly TextBox vinBox;
+        readonly TextBox calIdBox;
+        readonly TextBox cvnBox;
+        readonly Button browseStockButton;
+        readonly List<J2534Device> detectedDevices = new List<J2534Device>();
+        string stockRomsFolder;
         readonly ComboBox platformBox;
         readonly ComboBox protocolBox;
         readonly TextBox addressBox;
@@ -389,18 +400,27 @@ namespace Wideband
 
             var header = new Panel();
             header.Dock = DockStyle.Top;
-            header.Height = 72;
+            header.Height = 46;
             header.BackColor = BackColor;
+            header.Paint += delegate(object s, PaintEventArgs pe)
+            {
+                using (var pen = new Pen(Color.FromArgb(48, 54, 61), 1f))
+                {
+                    pe.Graphics.DrawLine(pen, 0, header.Height - 1, header.Width, header.Height - 1);
+                }
+            };
             var nameLabel = new Label();
-            nameLabel.Dock = DockStyle.Top;
-            nameLabel.Height = 36;
-            nameLabel.Padding = new Padding(20, 12, 20, 0);
+            nameLabel.Dock = DockStyle.Left;
+            nameLabel.Width = 140;
+            nameLabel.TextAlign = ContentAlignment.MiddleLeft;
+            nameLabel.Padding = new Padding(16, 0, 0, 0);
             nameLabel.Font = titleFont;
             nameLabel.ForeColor = ink;
             nameLabel.Text = "Wideband";
             summary = new Label();
             summary.Dock = DockStyle.Fill;
-            summary.Padding = new Padding(20, 0, 20, 0);
+            summary.TextAlign = ContentAlignment.MiddleLeft;
+            summary.Padding = new Padding(8, 0, 16, 0);
             summary.ForeColor = muted;
             summary.Text = "Sample calibration, " + definitions.Count + " logger definitions, " + profiles.Count + " profiles.";
             header.Controls.Add(summary);
@@ -496,87 +516,190 @@ namespace Wideband
             cableView.BackColor = panel;
             var cableTitle = SectionTitle("Cable");
             var cableCopy = new Label();
+            stockRomsFolder = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "StockRoms");
+            try { if (!Directory.Exists(stockRomsFolder)) Directory.CreateDirectory(stockRomsFolder); } catch { }
+
             cableCopy.Dock = DockStyle.Top;
-            cableCopy.Height = 120;
-            cableCopy.Text = "Connect Cable opens the J2534 device, reads the firmware version, and leaves the channel open. Tester present (0x3E) is sent every 2 seconds. Tacoma 2009+ and Silverado 2007+ use ISO 15765 on CAN at 500 kbps. Tacoma 2005-2008 uses ISO 14230 K-Line at 10400 baud. Silverado 1999-2007 uses J1850 VPW at 10400 baud. Read ECU uses service 0x23. Write sends session 0x10, security 0x27, download 0x34, transfer 0x36, exit 0x37, and reset 0x11 after confirmation. Security keys and checksum ranges are read from security-config.json. Nothing is sent when that entry is not configured.";
+            cableCopy.Height = 105;
+            cableCopy.Text = "Connect Cable opens the J2534 device, reads the firmware version, and leaves the channel open. Tester present (0x3E) is sent every 2 seconds. Tacoma 2009+ and Silverado 2007+ use ISO 15765 on CAN at 500 kbps. Tacoma 2005-2008 uses ISO 14230 K-Line at 10400 baud. Silverado 1999-2007 uses J1850 VPW at 10400 baud. Identify ECU queries VIN, Cal ID, and CVN. Virtual Read matches stock ROMs locally. Flash Active writes the edited calibration with verified checksum.";
+
+            deviceBox = new ComboBox();
+            deviceBox.DropDownStyle = ComboBoxStyle.DropDownList;
+            deviceBox.Width = 320;
+            deviceBox.AccessibleName = "J2534 PassThru Device";
+            deviceBox.SelectedIndexChanged += DeviceBoxSelectedIndexChanged;
+
+            browseDllButton = ActionButton("Browse DLL...");
+            browseDllButton.AutoSize = true;
+            browseDllButton.Click += BrowseDllClicked;
+
             platformBox = new ComboBox();
             platformBox.DropDownStyle = ComboBoxStyle.DropDownList;
             platformBox.Width = 180;
             platformBox.Items.Add("Toyota Tacoma");
             platformBox.Items.Add("Chevrolet Silverado");
             platformBox.AccessibleName = "Vehicle platform";
+
             protocolBox = new ComboBox();
             protocolBox.DropDownStyle = ComboBoxStyle.DropDownList;
-            protocolBox.Width = 280;
+            protocolBox.Width = 270;
             protocolBox.AccessibleName = "Diagnostic protocol";
+
             linkBadge = new Label();
             linkBadge.Text = "CLOSED";
             linkBadge.AutoSize = true;
             linkBadge.Padding = new Padding(8, 6, 8, 6);
             linkBadge.BackColor = Color.FromArgb(223, 227, 222);
             linkBadge.TextAlign = ContentAlignment.MiddleCenter;
+
             var addressLabel = new Label();
             addressLabel.Text = "Address";
             addressLabel.AutoSize = true;
             addressLabel.Padding = new Padding(8, 8, 0, 0);
+
             addressBox = new TextBox();
             addressBox.Width = 110;
             addressBox.AccessibleName = "Memory address";
             addressBox.AccessibleRole = AccessibleRole.Text;
+
             var lengthLabel = new Label();
             lengthLabel.Text = "Length";
             lengthLabel.AutoSize = true;
             lengthLabel.Padding = new Padding(8, 8, 0, 0);
+
             lengthBox = new TextBox();
             lengthBox.Width = 90;
             lengthBox.AccessibleName = "Read length";
             lengthBox.AccessibleRole = AccessibleRole.Text;
+
             chunkBox = new ComboBox();
             chunkBox.DropDownStyle = ComboBoxStyle.DropDownList;
             chunkBox.Width = 80;
             chunkBox.AccessibleName = "Transfer chunk";
+
             connectButton = ActionButton("Connect Cable");
             connectButton.AutoSize = true;
             connectButton.Click += ConnectClicked;
-            readButton = ActionButton("Read ECU");
-            readButton.AutoSize = true;
-            readButton.Enabled = false;
-            readButton.Click += ReadClicked;
-            transferButton = ActionButton("Write/Flash Calibration");
-            transferButton.AutoSize = true;
-            transferButton.Enabled = false;
-            transferButton.Click += TransferClicked;
+
             disconnectButton = ActionButton("Disconnect");
             disconnectButton.AutoSize = true;
             disconnectButton.Enabled = false;
             disconnectButton.Click += DisconnectClicked;
+
+            identifyButton = ActionButton("Identify ECU");
+            identifyButton.AutoSize = true;
+            identifyButton.Enabled = false;
+            identifyButton.Click += IdentifyClicked;
+
+            var vinLabel = new Label();
+            vinLabel.Text = "VIN:";
+            vinLabel.AutoSize = true;
+            vinLabel.Padding = new Padding(6, 8, 0, 0);
+
+            vinBox = new TextBox();
+            vinBox.Width = 160;
+            vinBox.ReadOnly = true;
+            vinBox.BackColor = panel;
+            vinBox.AccessibleName = "Vehicle Identification Number";
+
+            var calIdLabel = new Label();
+            calIdLabel.Text = "Cal ID:";
+            calIdLabel.AutoSize = true;
+            calIdLabel.Padding = new Padding(6, 8, 0, 0);
+
+            calIdBox = new TextBox();
+            calIdBox.Width = 120;
+            calIdBox.ReadOnly = true;
+            calIdBox.BackColor = panel;
+            calIdBox.AccessibleName = "Calibration Identification";
+
+            var cvnLabel = new Label();
+            cvnLabel.Text = "CVN:";
+            cvnLabel.AutoSize = true;
+            cvnLabel.Padding = new Padding(6, 8, 0, 0);
+
+            cvnBox = new TextBox();
+            cvnBox.Width = 100;
+            cvnBox.ReadOnly = true;
+            cvnBox.BackColor = panel;
+            cvnBox.AccessibleName = "Calibration Verification Number";
+
+            virtualReadButton = ActionButton("Virtual Read (Stock ROM)");
+            virtualReadButton.AutoSize = true;
+            virtualReadButton.Click += VirtualReadClicked;
+
+            browseStockButton = ActionButton("Stock Folder...");
+            browseStockButton.AutoSize = true;
+            browseStockButton.Click += BrowseStockClicked;
+
+            readButton = ActionButton("Read ECU");
+            readButton.AutoSize = true;
+            readButton.Enabled = false;
+            readButton.Click += ReadClicked;
+
+            flashActiveButton = ActionButton("Flash Active Calibration");
+            flashActiveButton.AutoSize = true;
+            flashActiveButton.Enabled = false;
+            flashActiveButton.Click += FlashActiveClicked;
+
+            transferButton = ActionButton("Write BIN File...");
+            transferButton.AutoSize = true;
+            transferButton.Enabled = false;
+            transferButton.Click += TransferClicked;
+
             var cableTools = new FlowLayoutPanel();
             cableTools.Dock = DockStyle.Top;
-            cableTools.Height = 148;
+            cableTools.Height = 185;
             cableTools.WrapContents = true;
+            cableTools.AutoScroll = true;
+
+            var devLabel = new Label();
+            devLabel.Text = "J2534:";
+            devLabel.AutoSize = true;
+            devLabel.Padding = new Padding(4, 8, 0, 0);
+
+            cableTools.Controls.Add(devLabel);
+            cableTools.Controls.Add(deviceBox);
+            cableTools.Controls.Add(browseDllButton);
+            cableTools.Controls.Add(connectButton);
+            cableTools.Controls.Add(disconnectButton);
+            cableTools.Controls.Add(linkBadge);
+
             cableTools.Controls.Add(platformBox);
             cableTools.Controls.Add(protocolBox);
-            cableTools.Controls.Add(linkBadge);
             cableTools.Controls.Add(addressLabel);
             cableTools.Controls.Add(addressBox);
             cableTools.Controls.Add(lengthLabel);
             cableTools.Controls.Add(lengthBox);
             cableTools.Controls.Add(chunkBox);
-            cableTools.Controls.Add(connectButton);
+
+            cableTools.Controls.Add(identifyButton);
+            cableTools.Controls.Add(vinLabel);
+            cableTools.Controls.Add(vinBox);
+            cableTools.Controls.Add(calIdLabel);
+            cableTools.Controls.Add(calIdBox);
+            cableTools.Controls.Add(cvnLabel);
+            cableTools.Controls.Add(cvnBox);
+
+            cableTools.Controls.Add(virtualReadButton);
+            cableTools.Controls.Add(browseStockButton);
             cableTools.Controls.Add(readButton);
+            cableTools.Controls.Add(flashActiveButton);
             cableTools.Controls.Add(transferButton);
-            cableTools.Controls.Add(disconnectButton);
+
             cableStatus = new Label();
             cableStatus.Dock = DockStyle.Top;
             cableStatus.Height = 72;
             cableStatus.Padding = new Padding(8);
             cableStatus.BackColor = Color.FromArgb(223, 227, 222);
             cableStatus.Text = "The channel is closed.";
+
             var logCaption = new Label();
             logCaption.Text = "Communication log";
             logCaption.Dock = DockStyle.Top;
             logCaption.Height = 22;
             logCaption.TextAlign = ContentAlignment.MiddleLeft;
+
             cableLog = new TextBox();
             cableLog.Multiline = true;
             cableLog.ReadOnly = true;
@@ -586,26 +709,32 @@ namespace Wideband
             cableLog.BackColor = panel;
             cableLog.AccessibleName = "Communication log";
             cableLog.AccessibleRole = AccessibleRole.Text;
+
             transferProgress = new ProgressBar();
             transferProgress.Dock = DockStyle.Bottom;
             transferProgress.Height = 22;
             transferProgress.Maximum = 100;
             transferProgress.AccessibleName = "Transfer progress";
+
             var progressLabel = new Label();
             progressLabel.Text = "Transfer progress";
             progressLabel.Dock = DockStyle.Bottom;
             progressLabel.Height = 22;
             progressLabel.TextAlign = ContentAlignment.MiddleLeft;
+
             platformBox.SelectedIndexChanged += PlatformChanged;
             protocolBox.SelectedIndexChanged += ProfileChanged;
             suppressProfile = true;
             platformBox.SelectedIndex = 0;
             suppressProfile = false;
             FillProtocols();
+            PopulateDevices(dllPath);
+
             VehicleLink.Current.Noted += HoldNoted;
             VehicleLink.Current.Traced += CableTraced;
             if (PlatformSecurityAndChecksum.LoadNote.Length > 0)
                 AppendLog(PlatformSecurityAndChecksum.LoadNote);
+
             cableView.Controls.Add(cableLog);
             cableView.Controls.Add(progressLabel);
             cableView.Controls.Add(transferProgress);
@@ -947,9 +1076,85 @@ namespace Wideband
             disconnectButton.Enabled = open;
             readButton.Enabled = open;
             transferButton.Enabled = open;
+            identifyButton.Enabled = open;
+            flashActiveButton.Enabled = open;
+            deviceBox.Enabled = !open;
+            browseDllButton.Enabled = !open;
             linkBadge.Text = open ? "OPEN" : "CLOSED";
             linkBadge.BackColor = open ? accent : Color.FromArgb(223, 227, 222);
             linkBadge.ForeColor = open ? Color.White : ink;
+        }
+
+        void PopulateDevices(string preferredDll)
+        {
+            detectedDevices.Clear();
+            detectedDevices.AddRange(J2534RegistryScanner.WithFallbacks(preferredDll));
+            deviceBox.Items.Clear();
+            int sel = 0;
+            for (int i = 0; i < detectedDevices.Count; i++)
+            {
+                deviceBox.Items.Add(detectedDevices[i]);
+                if (!string.IsNullOrEmpty(preferredDll) && string.Equals(detectedDevices[i].LibraryPath, preferredDll, StringComparison.OrdinalIgnoreCase))
+                    sel = i;
+            }
+            if (deviceBox.Items.Count > 0)
+            {
+                deviceBox.SelectedIndex = sel;
+                dllPath = detectedDevices[sel].LibraryPath;
+            }
+        }
+
+        void DeviceBoxSelectedIndexChanged(object sender, EventArgs e)
+        {
+            var dev = deviceBox.SelectedItem as J2534Device;
+            if (dev != null && dev.LibraryPath.Length > 0)
+            {
+                dllPath = dev.LibraryPath;
+                if (!dev.Exists)
+                    cableStatus.Text = "Selected device library not found: " + dev.LibraryPath;
+                else if (dev.Machine == J2534Device.MachineX64)
+                    cableStatus.Text = "Selected device is a 64-bit DLL and cannot be loaded by 32-bit J2534Host.exe: " + dev.LibraryPath;
+                else
+                    cableStatus.Text = "Selected J2534 device: " + dev.Name;
+            }
+        }
+
+        void BrowseDllClicked(object sender, EventArgs e)
+        {
+            using (var dialog = new OpenFileDialog())
+            {
+                dialog.Title = "Select J2534 Pass-Thru DLL (32-bit x86)";
+                dialog.Filter = "J2534 Dynamic Link Libraries (*.dll)|*.dll|All files (*.*)|*.*";
+                if (dialog.ShowDialog(this) != DialogResult.OK) return;
+                string chosen = dialog.FileName;
+                var custom = J2534RegistryScanner.Describe(Path.GetFileNameWithoutExtension(chosen), "Custom DLL", chosen, "custom");
+                J2534RegistryScanner.Add(detectedDevices, custom);
+                deviceBox.Items.Clear();
+                int sel = 0;
+                for (int i = 0; i < detectedDevices.Count; i++)
+                {
+                    deviceBox.Items.Add(detectedDevices[i]);
+                    if (string.Equals(detectedDevices[i].LibraryPath, chosen, StringComparison.OrdinalIgnoreCase))
+                        sel = i;
+                }
+                deviceBox.SelectedIndex = sel;
+                dllPath = chosen;
+            }
+        }
+
+        void BrowseStockClicked(object sender, EventArgs e)
+        {
+            using (var dialog = new FolderBrowserDialog())
+            {
+                dialog.Description = "Select Folder Containing Stock ROMs (.cuw / .bin)";
+                if (Directory.Exists(stockRomsFolder))
+                    dialog.SelectedPath = stockRomsFolder;
+                if (dialog.ShowDialog(this) == DialogResult.OK)
+                {
+                    stockRomsFolder = dialog.SelectedPath;
+                    AppendLog("Stock ROM folder set to: " + stockRomsFolder);
+                }
+            }
         }
 
         void ConnectClicked(object sender, EventArgs e)
@@ -960,10 +1165,31 @@ namespace Wideband
             readButton.Enabled = false;
             transferButton.Enabled = false;
             disconnectButton.Enabled = false;
+            identifyButton.Enabled = false;
+            flashActiveButton.Enabled = false;
             cableStatus.BackColor = Color.FromArgb(223, 227, 222);
             cableStatus.Text = "Opening the cable and holding the channel.";
+
+            var dev = deviceBox.SelectedItem as J2534Device;
+            string library = dev != null ? dev.LibraryPath : dllPath;
+            if (dev != null && !dev.Exists)
+            {
+                cableBusy = false;
+                cableStatus.BackColor = Color.FromArgb(243, 228, 225);
+                cableStatus.Text = "Selected J2534 DLL not found: " + dev.LibraryPath;
+                SetCableButtons(false);
+                return;
+            }
+            if (dev != null && dev.Machine == J2534Device.MachineX64)
+            {
+                cableBusy = false;
+                cableStatus.BackColor = Color.FromArgb(243, 228, 225);
+                cableStatus.Text = "Selected J2534 DLL is 64-bit and incompatible with 32-bit J2534Host.exe: " + dev.LibraryPath;
+                SetCableButtons(false);
+                return;
+            }
+
             EcuProfile profile = SelectedProfile();
-            string library = dllPath;
             ThreadPool.QueueUserWorkItem(delegate
             {
                 bool ok = false;
@@ -1005,6 +1231,239 @@ namespace Wideband
                     SetCableButtons(ok);
                     if (!ok) transferProgress.Value = 0;
                 });
+            });
+        }
+
+        void IdentifyClicked(object sender, EventArgs e)
+        {
+            if (!VehicleLink.Current.IsConnected)
+            {
+                cableStatus.Text = "Connect the cable first.";
+                return;
+            }
+            identifyButton.Enabled = false;
+            cableStatus.Text = "Querying ECU identification (VIN, Cal ID, CVN)...";
+            AppendLog("Querying ECU identification...");
+            EcuProfile profile = SelectedProfile();
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                EcuIdentification id = null;
+                bool ok = false;
+                for (int retry = 0; retry < 10; retry++)
+                {
+                    if (VehicleLink.Current.TryRunDiagnostic(delegate (IDiagnosticLink link, EcuProfile p)
+                    {
+                        return EcuIdentifier.Query(link, p);
+                    }, out id))
+                    {
+                        ok = true;
+                        break;
+                    }
+                    Thread.Sleep(200);
+                }
+
+                BeginInvoke((Action)delegate
+                {
+                    identifyButton.Enabled = VehicleLink.Current.IsConnected;
+                    if (!ok || id == null)
+                    {
+                        cableStatus.Text = "Could not query ECU identification. Bus was busy or not responding.";
+                        AppendLog(cableStatus.Text);
+                        return;
+                    }
+                    vinBox.Text = id.Vin;
+                    calIdBox.Text = id.CalId;
+                    cvnBox.Text = id.Cvn;
+                    cableStatus.Text = id.Details;
+                    AppendLog("ECU Identification: " + id.Details);
+
+                    bool isTacoma = profile.Id == "tacoma-can" || profile.Id == "tacoma-kline" || platformBox.SelectedIndex == 0;
+                    if (isTacoma && id.CalId.Length > 0)
+                    {
+                        RunVirtualRead(id.CalId, false);
+                    }
+                });
+            });
+        }
+
+        void VirtualReadClicked(object sender, EventArgs e)
+        {
+            string calId = calIdBox.Text.Trim();
+            if (calId.Length == 0)
+            {
+                MessageBox.Show(this, "Please run 'Identify ECU' first or enter a Calibration ID in the Cal ID field.", "Virtual Read", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            RunVirtualRead(calId, true);
+        }
+
+        void RunVirtualRead(string calId, bool promptIfMissing)
+        {
+            if (string.IsNullOrEmpty(calId)) return;
+            AppendLog("Searching stock ROMs for Cal ID: " + calId + " in " + stockRomsFolder);
+            string match = StockRomMatcher.FindMatch(stockRomsFolder, calId);
+            if (match != null && File.Exists(match))
+            {
+                try
+                {
+                    calibrateView.OpenRomFile(match);
+                    cableStatus.Text = "Virtual Read matched: " + Path.GetFileName(match) + ". Loaded into calibration editor.";
+                    AppendLog(cableStatus.Text);
+                    ShowView("calibrate");
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    cableStatus.Text = "Error loading matched ROM: " + ex.Message;
+                    AppendLog(cableStatus.Text);
+                }
+            }
+
+            if (promptIfMissing)
+            {
+                DialogResult res = MessageBox.Show(this,
+                    "No matching stock ROM found in:\n" + stockRomsFolder + "\nfor Cal ID: " + calId + ".\n\nWould you like to browse for a .cuw or .bin file manually?",
+                    "Virtual Read - Stock ROM Not Found",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Question);
+                if (res == DialogResult.Yes)
+                {
+                    using (var dialog = new OpenFileDialog())
+                    {
+                        dialog.Title = "Select Stock ROM for Cal ID " + calId;
+                        dialog.Filter = "Calibration binaries (*.bin;*.cuw)|*.bin;*.cuw|BIN files (*.bin)|*.bin|Toyota CUW (*.cuw)|*.cuw|All files (*.*)|*.*";
+                        if (dialog.ShowDialog(this) == DialogResult.OK)
+                        {
+                            try
+                            {
+                                calibrateView.OpenRomFile(dialog.FileName);
+                                cableStatus.Text = "Loaded ROM: " + Path.GetFileName(dialog.FileName);
+                                AppendLog(cableStatus.Text);
+                                ShowView("calibrate");
+                            }
+                            catch (Exception ex)
+                            {
+                                cableStatus.Text = "Error loading ROM: " + ex.Message;
+                                AppendLog(cableStatus.Text);
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                AppendLog("Virtual Read: No local stock ROM found matching Cal ID " + calId + " in " + stockRomsFolder);
+            }
+        }
+
+        void FlashActiveClicked(object sender, EventArgs e)
+        {
+            if (!VehicleLink.Current.IsConnected)
+            {
+                cableStatus.Text = "Connect the cable first.";
+                return;
+            }
+            if (!calibrateView.HasRom)
+            {
+                MessageBox.Show(this, "No calibration ROM is currently open in the editor. Open a ROM or perform a Virtual Read first.", "Flash Active Calibration", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            byte[] romBytes = calibrateView.CopyRom();
+            if (romBytes == null || romBytes.Length == 0)
+            {
+                MessageBox.Show(this, "The active calibration ROM buffer is empty.", "Flash Active Calibration", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            long address;
+            string hex = addressBox.Text.Trim();
+            if (hex.StartsWith("0x") || hex.StartsWith("0X")) hex = hex.Substring(2);
+            if (hex.Length > 0 && long.TryParse(hex, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out address))
+            {
+            }
+            else
+            {
+                address = calibrateView.RomOrigin;
+                addressBox.Text = "0x" + address.ToString("X");
+            }
+
+            EcuProfile profile = SelectedProfile();
+            IChecksum checksum = PlatformSecurityAndChecksum.ChecksumFor(profile.Id, romBytes, address);
+            if (checksum == null)
+            {
+                MessageBox.Show(this, "No checksum range is configured for " + profile.Name + " (" + profile.Id + "). Flashing is blocked.", "Checksum Verification Failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                cableStatus.Text = "Flashing blocked: No checksum configured for " + profile.Name + ".";
+                return;
+            }
+
+            byte[] flashBuffer = (byte[])romBytes.Clone();
+            checksum.Stamp(flashBuffer);
+            if (!checksum.Verify(flashBuffer))
+            {
+                MessageBox.Show(this, "Checksum calculation or verification failed on the active ROM buffer. Flashing is blocked.", "Checksum Verification Failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                cableStatus.Text = "Flashing blocked: Checksum verification failed.";
+                return;
+            }
+
+            DialogResult confirm = MessageBox.Show(this,
+                "Flash active calibration buffer (" + flashBuffer.Length.ToString(CultureInfo.InvariantCulture) + " bytes) to "
+                + profile.Name + " at address 0x" + address.ToString("X")
+                + "?\n\nChecksum has been verified and stamped.\nDiagnostic Session: 0x" + profile.ProgrammingSession.ToString("X2")
+                + "\nECU will reset upon completion.",
+                "Confirm Flash Active Calibration",
+                MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Warning);
+            if (confirm != DialogResult.OK) return;
+
+            IDiagnosticLink link = VehicleLink.Current.OpenDiagnosticLink();
+            if (link == null)
+            {
+                cableStatus.Text = "Diagnostic link is not available.";
+                return;
+            }
+
+            var plan = new FlashPlan();
+            plan.Address = address;
+            plan.Image = flashBuffer;
+            plan.Keys = VehicleLink.Current.KeysFor(profile);
+            plan.Checksum = checksum;
+            plan.ProgrammingSession = true;
+            plan.SessionType = profile.ProgrammingSession;
+            plan.Diagnostic = profile.Diagnostic;
+            plan.ChunkBytes = SelectedChunk();
+            plan.AddressBytes = profile.AddressBytes;
+            plan.SizeBytes = profile.SizeBytes;
+            plan.Erase = false;
+            plan.ResetWhenComplete = true;
+
+            transferring = true;
+            connectButton.Enabled = false;
+            readButton.Enabled = false;
+            transferButton.Enabled = false;
+            flashActiveButton.Enabled = false;
+            identifyButton.Enabled = false;
+            transferProgress.Value = 0;
+            cableStatus.BackColor = Color.FromArgb(223, 227, 222);
+            cableStatus.Text = "Starting flash of active calibration.";
+            AppendLog("Flash active calibration started at 0x" + address.ToString("X") + " (" + flashBuffer.Length.ToString(CultureInfo.InvariantCulture) + " bytes).");
+
+            VehicleLink.Current.PauseKeepAlive();
+            var worker = new FlashWorker();
+            worker.Start(null, link, plan, delegate (FlashProgress update)
+            {
+                ShowProgress(update);
+            }, delegate (FlashResult result)
+            {
+                VehicleLink.Current.ResumeKeepAlive();
+                transferring = false;
+                bool ok = result != null && result.Complete;
+                if (ok) transferProgress.Value = 100;
+                cableStatus.BackColor = ok ? tint : Color.FromArgb(243, 228, 225);
+                cableStatus.Text = ok
+                    ? "Flash active calibration completed successfully. ECU was reset."
+                    : (result == null || string.IsNullOrEmpty(result.Error) ? "The transfer stopped." : result.Error);
+                AppendLog(cableStatus.Text);
+                SetCableButtons(VehicleLink.Current.IsConnected);
             });
         }
 
@@ -1051,6 +1510,8 @@ namespace Wideband
                 connectButton.Enabled = false;
                 readButton.Enabled = false;
                 transferButton.Enabled = false;
+                identifyButton.Enabled = false;
+                flashActiveButton.Enabled = false;
                 transferProgress.Value = 0;
                 cableStatus.BackColor = Color.FromArgb(223, 227, 222);
                 cableStatus.Text = "Starting the read.";
@@ -1071,6 +1532,14 @@ namespace Wideband
                         });
                         File.WriteAllBytes(path, data);
                         ok = true;
+                        try
+                        {
+                            BeginInvoke((Action)delegate { calibrateView.OpenRomFile(path); });
+                        }
+                        catch (Exception ex)
+                        {
+                            AppendLog("Note loading read ROM into editor: " + ex.Message);
+                        }
                     }
                     catch (Exception ex)
                     {
@@ -1082,7 +1551,7 @@ namespace Wideband
                         if (ok) transferProgress.Value = 100;
                         cableStatus.BackColor = ok ? tint : Color.FromArgb(243, 228, 225);
                         cableStatus.Text = ok
-                            ? "Read finished. The channel is still open."
+                            ? "Read finished. File saved to " + Path.GetFileName(path) + " and loaded into calibration editor."
                             : (error.Length == 0 ? "The read stopped." : error);
                         AppendLog(cableStatus.Text);
                         SetCableButtons(VehicleLink.Current.IsConnected);
@@ -1149,6 +1618,8 @@ namespace Wideband
                 connectButton.Enabled = false;
                 readButton.Enabled = false;
                 transferButton.Enabled = false;
+                identifyButton.Enabled = false;
+                flashActiveButton.Enabled = false;
                 transferProgress.Value = 0;
                 cableStatus.BackColor = Color.FromArgb(223, 227, 222);
                 cableStatus.Text = "Starting the transfer.";
@@ -1182,6 +1653,21 @@ namespace Wideband
                             ? "Transfer finished. The ECU was reset. The cable channel is still open. The image checksum was checked and corrected before the download."
                             : (result == null || result.Error.Length == 0 ? "The transfer stopped." : result.Error);
                         AppendLog(cableStatus.Text);
+                        if (result != null && result.ReadData != null && result.ReadData.Length > 0)
+                        {
+                            try
+                            {
+                                string backupName = "silverado-backup-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".bin";
+                                string backupPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, backupName);
+                                File.WriteAllBytes(backupPath, result.ReadData);
+                                calibrateView.OpenRomFile(backupPath);
+                                AppendLog("Silverado backup saved to " + backupName + " and loaded into calibration editor.");
+                            }
+                            catch (Exception ex)
+                            {
+                                AppendLog("Silverado backup note: " + ex.Message);
+                            }
+                        }
                         bool held = VehicleLink.Current.IsConnected;
                         SetCableButtons(held);
                     });
@@ -1247,7 +1733,7 @@ namespace Wideband
             Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
             Application.ThreadException += delegate(object sender, ThreadExceptionEventArgs args)
             {
-                File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "startup-error.txt"), args.Exception.ToString());
+                try { File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "startup-error.txt"), args.Exception.ToString()); } catch { }
             };
             try
             {
@@ -1263,7 +1749,7 @@ namespace Wideband
             }
             catch (Exception ex)
             {
-                File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "startup-error.txt"), ex.ToString());
+                try { File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "startup-error.txt"), ex.ToString()); } catch { }
             }
         }
     }

@@ -1,0 +1,193 @@
+pub mod definitions;
+pub mod j2534;
+pub mod protocols;
+pub mod telemetry;
+pub mod ui;
+
+use eframe::egui;
+use ui::WidebandApp;
+
+fn main() -> eframe::Result<()> {
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1440.0, 880.0])
+            .with_min_inner_size([1024.0, 680.0])
+            .with_title("Wideband Motorsport Studio — OEM Calibration & Diagnostics"),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Wideband Motorsport Studio",
+        native_options,
+        Box::new(|cc| Ok(Box::new(WidebandApp::new(cc)))),
+    )
+}
+
+// ===========================================================================
+// Comprehensive Unit Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use j2534::{PassThruDevice, PassThruMsg, VirtualEcuSimulator, ISO15765};
+    use protocols::{ChecksumEngine, EcuIdentifier, EcuProfile, FlashDownload, SecurityKeys};
+    use definitions::{CuwFile, ScaleEquation, XdfDocument};
+
+    #[test]
+    fn test_j2534_big_endian_frame_packing() {
+        let mut msg = PassThruMsg::default();
+        msg.protocol_id = ISO15765;
+
+        // 0x7E8 per SAE J2534-1 must be Big-Endian: 00 00 07 E8
+        msg.write_id(0x7E8);
+        assert_eq!(msg.data[0], 0x00);
+        assert_eq!(msg.data[1], 0x00);
+        assert_eq!(msg.data[2], 0x07);
+        assert_eq!(msg.data[3], 0xE8);
+        assert_eq!(msg.read_id(), 0x7E8);
+
+        // 29-bit CAN ID 0x18DAF110: 18 DA F1 10
+        msg.write_id(0x18DAF110);
+        assert_eq!(msg.data[0], 0x18);
+        assert_eq!(msg.data[1], 0xDA);
+        assert_eq!(msg.data[2], 0xF1);
+        assert_eq!(msg.data[3], 0x10);
+        assert_eq!(msg.read_id(), 0x18DAF110);
+    }
+
+    #[test]
+    fn test_cuw_s_record_parsing() {
+        // Sample Motorola S-records: S3 4-byte address records with valid 1's complement checksums
+        // Line 1: S3 09 00 01 00 00 AA BB CC 7E
+        // Count = 0x09 (9 bytes: 4 address + 3 data + 1 checksum)
+        // Addr = 00010000, Data = AA BB CC
+        // Checksum: !(0x09 + 0x00 + 0x01 + 0x00 + 0x00 + 0xAA + 0xBB + 0xCC) = !(0x027F) = !(0x7F) = 0x80
+        // Let's create an exact valid S3 record:
+        // Bytes: [0x08, 0x00, 0x01, 0x00, 0x00, 0x11, 0x22]
+        // Sum = 0x08 + 0x00 + 0x01 + 0x00 + 0x00 + 0x11 + 0x22 = 0x3C
+        // Checksum = 0xFF - 0x3C = 0xC3
+        let s_text = "HDR TOYOTA CUW TEST\nS307000100001122C4\nS70500010000F9\n";
+        let cuw = CuwFile::parse(s_text.as_bytes()).expect("CUW parsing should succeed");
+
+        assert_eq!(cuw.origin, 0x10000);
+        assert_eq!(cuw.image.len(), 2);
+        assert_eq!(cuw.image[0], 0x11);
+        assert_eq!(cuw.image[1], 0x22);
+    }
+
+    #[test]
+    fn test_xdf_parsing_and_scale_equation() {
+        let xdf_xml = r#"
+        <XDFFORMAT version="1.60">
+            <XDFHEADER>
+                <deftitle>Test XDF Definition</deftitle>
+            </XDFHEADER>
+            <XDFTABLE uniqueid="tbl_ve">
+                <title>VE Table Test</title>
+                <description>Volumetric Efficiency</description>
+                <XDFAXIS id="x">
+                    <dim>4</dim>
+                    <units>RPM</units>
+                    <MATH equation="X * 100" />
+                </XDFAXIS>
+                <XDFAXIS id="y">
+                    <dim>3</dim>
+                    <units>MAP</units>
+                    <MATH equation="X * 10" />
+                </XDFAXIS>
+                <XDFAXIS id="z">
+                    <units>%</units>
+                    <MATH equation="X * 0.1" />
+                </XDFAXIS>
+            </XDFTABLE>
+            <XDFCONSTANT uniqueid="rev_lim">
+                <title>Rev Limiter</title>
+                <units>RPM</units>
+                <MATH equation="X * 32" />
+            </XDFCONSTANT>
+            <XDFFLAG uniqueid="vvt_flag">
+                <title>VVT Enable</title>
+                <mask>0x04</mask>
+            </XDFFLAG>
+        </XDFFORMAT>
+        "#;
+
+        let doc = XdfDocument::parse(xdf_xml).expect("XDF XML parse must succeed");
+        assert_eq!(doc.title, "Test XDF Definition");
+        assert_eq!(doc.tables.len(), 1);
+        assert_eq!(doc.tables[0].title, "VE Table Test");
+        assert_eq!(doc.tables[0].x_axis.dim, 4);
+        assert_eq!(doc.tables[0].y_axis.dim, 3);
+        assert_eq!(doc.constants.len(), 1);
+        assert_eq!(doc.constants[0].title, "Rev Limiter");
+        assert_eq!(doc.flags.len(), 1);
+        assert_eq!(doc.flags[0].mask, 0x04);
+
+        // Test math equation forward & invert
+        let eq = ScaleEquation::parse("(X - 128) * 0.5");
+        let eng = eq.evaluate(200.0);
+        assert_eq!(eng, 36.0);
+        let raw = eq.invert(36.0);
+        assert!((raw - 200.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_checksum_calculations() {
+        let test_bytes = vec![0x01, 0x02, 0x03, 0x04, 0x05];
+        let sum16 = ChecksumEngine::sum16(&test_bytes);
+        assert_eq!(sum16, 15);
+
+        let sum32 = ChecksumEngine::sum32(&test_bytes);
+        assert_eq!(sum32, 15);
+
+        let crc = ChecksumEngine::crc32(&test_bytes);
+        assert_ne!(crc, 0);
+
+        let mut rom = vec![0x10, 0x20, 0x30, 0x40, 0x00, 0x00, 0x00, 0x00];
+        let res = ChecksumEngine::update_and_verify(&mut rom, "tacoma-can");
+        assert!(res.is_ok());
+        // Verify that checksum was stamped into last 4 bytes
+        let stamped_sum = u32::from_be_bytes([rom[4], rom[5], rom[6], rom[7]]);
+        assert_eq!(stamped_sum, 0x10 + 0x20 + 0x30 + 0x40);
+
+        // Test Denso and GM seed-key calculation
+        let seed = [0x12, 0x34, 0x56, 0x78];
+        let tacoma_key = SecurityKeys::compute_for_profile(&seed, "tacoma-can").expect("Tacoma key must succeed");
+        assert_eq!(tacoma_key.len(), 4);
+
+        let silverado_key = SecurityKeys::compute_for_profile(&seed, "silverado-can").expect("Silverado key must succeed");
+        assert_eq!(silverado_key.len(), 4);
+    }
+
+    #[test]
+    fn test_virtual_ecu_loopback_flash() {
+        let mut sim = VirtualEcuSimulator::new();
+        sim.open().expect("Simulator open must succeed");
+        let channel = sim.connect(ISO15765, 0, 500000).expect("Connect must succeed");
+
+        let prof = EcuProfile::tacoma_can();
+
+        // 1. Test ECU Identification
+        let id = EcuIdentifier::query(&mut sim, channel, &prof).expect("ECU identify must succeed");
+        assert_eq!(id.vin, "5TFRX54N56Z123456");
+        assert_eq!(id.cal_id, "89663-04B04");
+        assert_eq!(id.cvn, "A1B2C3D4");
+
+        // 2. Test End-to-End Flash Sequence (Security -> Download 0x34 -> Transfer 0x36 -> Exit 0x37 -> Reset 0x11)
+        let flash_data = vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22];
+        let flash_result = FlashDownload::execute(
+            &mut sim,
+            channel,
+            &prof,
+            0x10000,
+            &flash_data,
+            |sent, total| {
+                assert!(sent <= total);
+            },
+        );
+
+        assert!(flash_result.is_ok(), "Flash sequence must complete without error");
+        sim.close().expect("Simulator close must succeed");
+    }
+}

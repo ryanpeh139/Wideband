@@ -2,6 +2,8 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Text;
 using System.Globalization;
 using System.IO;
 using System.Text;
@@ -67,7 +69,8 @@ namespace Wideband
                 catch (Exception) { }
             }
             TuneDocument created = Sample();
-            created.Write(path);
+            try { created.Write(path); }
+            catch (Exception) { }
             return created;
         }
 
@@ -342,6 +345,29 @@ namespace Wideband
         }
     }
 
+    static class Theme
+    {
+        public static readonly Color Background = Color.FromArgb(240, 242, 239);
+        public static readonly Color Panel = Color.FromArgb(247, 248, 246);
+        public static readonly Color SlateHeader = Color.FromArgb(23, 33, 28);
+        public static readonly Color Ink = Color.FromArgb(23, 33, 28);
+        public static readonly Color Muted = Color.FromArgb(75, 88, 82);
+        public static readonly Color Border = Color.FromArgb(195, 202, 196);
+        public static readonly Color DarkBorder = Color.FromArgb(160, 170, 162);
+        public static readonly Color Accent = Color.FromArgb(12, 110, 74);
+        public static readonly Color AccentTint = Color.FromArgb(229, 242, 235);
+        public static readonly Color TextLight = Color.FromArgb(244, 250, 247);
+        public static readonly Color ValidGreen = Color.FromArgb(214, 236, 214);
+        public static readonly Color WarningAmber = Color.FromArgb(244, 228, 196);
+        public static readonly Color ErrorCoral = Color.FromArgb(244, 214, 214);
+
+        public static Color ContrastText(Color bg)
+        {
+            double lum = (0.299 * bg.R + 0.587 * bg.G + 0.114 * bg.B);
+            return lum < 135 ? TextLight : Ink;
+        }
+    }
+
     static class HeatColor
     {
         public static Color Blend(double unit)
@@ -443,15 +469,15 @@ namespace Wideband
         {
             bool changed = CellDelta.Changed(value, basis);
             if (bold != null && regular != null) style.Font = changed ? bold : regular;
-            style.ForeColor = Color.FromArgb(23, 33, 28);
             if (compare)
             {
                 double delta = value - basis;
-                if (delta > 0.0001) style.BackColor = Color.FromArgb(214, 236, 214);
-                else if (delta < -0.0001) style.BackColor = Color.FromArgb(244, 214, 214);
-                else style.BackColor = Color.FromArgb(247, 248, 246);
+                if (delta > 0.0001) style.BackColor = Theme.ValidGreen;
+                else if (delta < -0.0001) style.BackColor = Theme.ErrorCoral;
+                else style.BackColor = Theme.Panel;
             }
             else style.BackColor = HeatColor.Blend(unit);
+            style.ForeColor = Theme.ContrastText(style.BackColor);
             return CellDelta.Display(table, value, basis);
         }
     }
@@ -615,6 +641,10 @@ namespace Wideband
         readonly Button switchViewButton;
         readonly Panel switchList;
         readonly Font boldFont;
+        readonly Font monoFont;
+        readonly Label telemReadout;
+        readonly SplitContainer outerSplit;
+        readonly SplitContainer innerSplit;
         TuneTable current;
         MemoryImage rom;
         long romOrigin;
@@ -634,79 +664,139 @@ namespace Wideband
             this.document = document;
             this.savePath = savePath;
             Dock = DockStyle.Fill;
-            BackColor = Color.FromArgb(247, 248, 246);
+            Size = new Size(1000, 680);
+            BackColor = Theme.Panel;
 
-            note = new Label();
-            note.Dock = DockStyle.Top;
-            note.Height = 80;
-            note.Text = document.Note + " Tables are edited here. Nothing is written to an ECU.";
+            var commandStrip = new Panel();
+            commandStrip.Dock = DockStyle.Top;
+            commandStrip.Height = 73;
+            commandStrip.BackColor = Theme.Background;
+            commandStrip.Padding = new Padding(4, 2, 4, 2);
 
-            var tools = new FlowLayoutPanel();
-            tools.Dock = DockStyle.Top;
-            tools.Height = 188;
-            tools.WrapContents = true;
-            tools.Controls.Add(MakeButton("Open ROM", OpenRomClicked));
-            tools.Controls.Add(MakeButton("Open XDF", OpenXdfClicked));
-            tools.Controls.Add(MakeButton("Save ROM", SaveRomClicked));
+            var topRow = new FlowLayoutPanel();
+            topRow.Dock = DockStyle.Top;
+            topRow.Height = 34;
+            topRow.WrapContents = false;
+            topRow.BackColor = Theme.Background;
+
+            var divider = new Panel();
+            divider.Dock = DockStyle.Top;
+            divider.Height = 1;
+            divider.BackColor = Color.FromArgb(48, 54, 61);
+
+            var bottomRow = new FlowLayoutPanel();
+            bottomRow.Dock = DockStyle.Bottom;
+            bottomRow.Height = 34;
+            bottomRow.WrapContents = false;
+            bottomRow.BackColor = Theme.Background;
+
+            topRow.Controls.Add(MakeButton("Open ROM", OpenRomClicked));
+            topRow.Controls.Add(MakeButton("Open XDF", OpenXdfClicked));
+            topRow.Controls.Add(MakeButton("Save ROM", SaveRomClicked));
+
             checksumMark = new Label();
             checksumMark.AutoSize = true;
             checksumMark.TextAlign = ContentAlignment.MiddleCenter;
-            checksumMark.Padding = new Padding(10, 6, 10, 6);
-            checksumMark.Margin = new Padding(8, 3, 4, 3);
+            checksumMark.Padding = new Padding(8, 4, 8, 4);
+            checksumMark.Margin = new Padding(4, 2, 4, 2);
             checksumMark.AccessibleName = "Checksum indicator";
             checksumMark.AccessibleRole = AccessibleRole.StaticText;
-            Font badgeFont = BadgeFont();
-            checksumMark.Font = badgeFont;
-            tools.Controls.Add(checksumMark);
+            checksumMark.Font = BadgeFont();
             SetMark("");
+            topRow.Controls.Add(checksumMark);
+
+            topRow.Controls.Add(MakeSeparator());
+
+            tableViewButton = MakeButton("Table", delegate { ShowTableView(); });
+            switchViewButton = MakeButton("Switches", delegate { ShowSwitchView(); });
+            topRow.Controls.Add(tableViewButton);
+            topRow.Controls.Add(switchViewButton);
+            PaintViewButtons();
+
+            compare = new CheckBox();
+            compare.Text = "Compare";
+            compare.AutoSize = true;
+            compare.Margin = new Padding(6, 6, 4, 2);
+            compare.CheckedChanged += delegate { grid.Invalidate(); };
+            topRow.Controls.Add(compare);
+
+            topRow.Controls.Add(MakeSeparator());
+
+            var traceLabel = LabelFor("Trace");
+            traceX = NumberBox(3000, 0, 20000, 0);
+            traceX.AccessibleName = "Trace RPM";
+            traceX.Width = 72;
+            traceY = NumberBox(60, 0, 500, 0);
+            traceY.AccessibleName = "Trace load";
+            traceY.Width = 60;
+            topRow.Controls.Add(traceLabel);
+            topRow.Controls.Add(traceX);
+            topRow.Controls.Add(traceY);
+
+            commandStrip.Controls.Add(bottomRow);
+            commandStrip.Controls.Add(divider);
+            commandStrip.Controls.Add(topRow);
+
+            bottomRow.Controls.Add(LabelFor("Safety"));
             level = new ComboBox();
             level.DropDownStyle = ComboBoxStyle.DropDownList;
-            level.Width = 130;
+            level.Width = 110;
             level.Items.AddRange(new object[] { "Beginner", "Intermediate", "Advanced" });
             level.SelectedIndex = 1;
             level.AccessibleName = "Safety level";
             level.SelectedIndexChanged += delegate { FillList(); };
+            bottomRow.Controls.Add(level);
+
+            bottomRow.Controls.Add(MakeSeparator());
+
             amount = NumberBox(10, -1000, 1000, 0);
             amount.AccessibleName = "Amount";
-            traceX = NumberBox(3000, 0, 20000, 0);
-            traceX.AccessibleName = "Trace RPM";
-            traceY = NumberBox(60, 0, 500, 0);
-            traceY.AccessibleName = "Trace load";
-            compare = new CheckBox();
-            compare.Text = "Compare";
-            compare.AutoSize = true;
-            compare.CheckedChanged += delegate { grid.Invalidate(); };
-            tools.Controls.Add(LabelFor("Level"));
-            tools.Controls.Add(level);
-            tools.Controls.Add(MakeButton("Add", AddClicked));
-            tools.Controls.Add(MakeButton("Scale %", ScaleClicked));
-            tools.Controls.Add(amount);
-            tools.Controls.Add(MakeButton("Smooth", delegate { Run(delegate { TableMath.Smooth(current, grid.SelectedCells); }, "Smoothed the selected cells."); }));
-            tools.Controls.Add(MakeButton("Interpolate", delegate { InterpolateSelection(); }));
+            amount.Width = 64;
+            bottomRow.Controls.Add(amount);
+            bottomRow.Controls.Add(MakeButton("Add", AddClicked));
+            bottomRow.Controls.Add(MakeButton("Scale %", ScaleClicked));
+            bottomRow.Controls.Add(MakeButton("Smooth", delegate { Run(delegate { TableMath.Smooth(current, grid.SelectedCells); }, "Smoothed the selected cells."); }));
+            bottomRow.Controls.Add(MakeButton("Interpolate", delegate { InterpolateSelection(); }));
+
+            bottomRow.Controls.Add(MakeSeparator());
+
+            bottomRow.Controls.Add(LabelFor("Cmd"));
             commandBox = new TextBox();
-            commandBox.Width = 110;
+            commandBox.Width = 90;
             commandBox.AccessibleName = "Cell command";
             commandBox.KeyDown += CommandKeyDown;
-            tools.Controls.Add(commandBox);
-            tools.Controls.Add(MakeButton("Apply", ApplyClicked));
-            tableViewButton = MakeButton("Table", delegate { ShowTableView(); });
-            switchViewButton = MakeButton("Switches", delegate { ShowSwitchView(); });
-            tools.Controls.Add(tableViewButton);
-            tools.Controls.Add(switchViewButton);
-            PaintViewButtons();
-            tools.Controls.Add(compare);
-            tools.Controls.Add(LabelFor("Trace"));
-            tools.Controls.Add(traceX);
-            tools.Controls.Add(traceY);
+            bottomRow.Controls.Add(commandBox);
+            bottomRow.Controls.Add(MakeButton("Apply", ApplyClicked));
 
-            var sidebar = new Panel();
-            sidebar.Dock = DockStyle.Left;
-            sidebar.Width = 260;
-            sidebar.BackColor = BackColor;
+            var statusBar = new Panel();
+            statusBar.Dock = DockStyle.Bottom;
+            statusBar.Height = 28;
+            statusBar.BackColor = Theme.Panel;
+            statusBar.Padding = new Padding(8, 4, 8, 4);
+
+            status = new Label();
+            status.Dock = DockStyle.Left;
+            status.AutoSize = true;
+            status.Font = new Font(Font, FontStyle.Bold);
+            status.ForeColor = Theme.Ink;
+            status.Text = "Choose a table.";
+
+            note = new Label();
+            note.Dock = DockStyle.Fill;
+            note.TextAlign = ContentAlignment.MiddleLeft;
+            note.Padding = new Padding(12, 0, 0, 0);
+            note.ForeColor = Theme.Muted;
+            note.Text = document.Note;
+
+            statusBar.Controls.Add(note);
+            statusBar.Controls.Add(status);
+
             var findLabel = new Label();
             findLabel.Text = "Find";
             findLabel.Dock = DockStyle.Top;
             findLabel.Height = 22;
+            findLabel.ForeColor = Theme.Muted;
+
             searchBox = new TextBox();
             searchBox.Dock = DockStyle.Top;
             searchBox.AccessibleName = "Parameter search";
@@ -715,42 +805,65 @@ namespace Wideband
                 parameterFilter = searchBox.Text.Trim();
                 FillList();
             };
+
             tree = new TreeView();
             tree.Dock = DockStyle.Fill;
             tree.BorderStyle = BorderStyle.None;
             tree.HideSelection = false;
             tree.ShowPlusMinus = true;
             tree.ShowRootLines = true;
-            tree.BackColor = BackColor;
+            tree.ItemHeight = 30;
+            tree.BackColor = Theme.Panel;
             tree.AccessibleName = "Parameter tree";
+
+            var sidebar = new Panel();
+            sidebar.Dock = DockStyle.Fill;
+            sidebar.BackColor = Theme.Panel;
             sidebar.Controls.Add(tree);
             sidebar.Controls.Add(searchBox);
             sidebar.Controls.Add(findLabel);
 
             mesh = new SurfaceMesh();
-            mesh.Dock = DockStyle.Right;
-            mesh.Width = 260;
+            mesh.Dock = DockStyle.Fill;
+
+            monoFont = new Font("Consolas", 9.5f, FontStyle.Regular);
+            boldFont = new Font("Consolas", 9.5f, FontStyle.Bold);
 
             grid = new TuneGrid();
             grid.Dock = DockStyle.Fill;
             grid.AllowUserToAddRows = false;
             grid.AllowUserToDeleteRows = false;
             grid.RowHeadersWidth = 72;
-            grid.BackgroundColor = BackColor;
+            grid.BackgroundColor = Theme.Panel;
+            grid.GridColor = Theme.Border;
             grid.BorderStyle = BorderStyle.None;
             grid.SelectionMode = DataGridViewSelectionMode.CellSelect;
             grid.CellEndEdit += CellEdited;
             grid.CellFormatting += FormatCell;
             grid.Nudge += Nudge;
             grid.Gesture += GridGesture;
-            boldFont = new Font(grid.Font, FontStyle.Bold);
+            grid.DefaultCellStyle.BackColor = Theme.Panel;
+            grid.DefaultCellStyle.ForeColor = Theme.Ink;
+            grid.DefaultCellStyle.SelectionBackColor = Theme.Accent;
+            grid.DefaultCellStyle.SelectionForeColor = Color.White;
+            grid.DefaultCellStyle.Font = monoFont;
+            grid.DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleRight;
+            grid.ColumnHeadersDefaultCellStyle.BackColor = Theme.SlateHeader;
+            grid.ColumnHeadersDefaultCellStyle.ForeColor = Color.White;
+            grid.ColumnHeadersDefaultCellStyle.Font = boldFont;
+            grid.ColumnHeadersDefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleRight;
+            grid.RowHeadersDefaultCellStyle.BackColor = Theme.SlateHeader;
+            grid.RowHeadersDefaultCellStyle.ForeColor = Color.White;
+            grid.RowHeadersDefaultCellStyle.Font = boldFont;
+            grid.EnableHeadersVisualStyles = false;
+
             traceX.ValueChanged += delegate { Trace(); };
             traceY.ValueChanged += delegate { Trace(); };
-
-            status = new Label();
-            status.Dock = DockStyle.Bottom;
-            status.Height = 36;
-            status.Text = "Choose a table.";
+            grid.CurrentCellChanged += delegate
+            {
+                if (grid.CurrentCell != null)
+                    mesh.SetActiveCell(grid.CurrentCell.RowIndex, grid.CurrentCell.ColumnIndex);
+            };
 
             switchSearch = new TextBox();
             switchSearch.Dock = DockStyle.Top;
@@ -763,28 +876,113 @@ namespace Wideband
             switchList = new Panel();
             switchList.Dock = DockStyle.Fill;
             switchList.AutoScroll = true;
-            switchList.BackColor = BackColor;
+            switchList.BackColor = Theme.Panel;
+
             var switchBoard = new Panel();
             switchBoard.Dock = DockStyle.Fill;
             switchBoard.Visible = false;
-            switchBoard.BackColor = BackColor;
+            switchBoard.BackColor = Theme.Panel;
             switchBoard.AccessibleName = "Switch board";
             switchBoard.Controls.Add(switchList);
             switchBoard.Controls.Add(switchSearch);
 
-            var workspace = new Panel();
-            workspace.Dock = DockStyle.Fill;
-            workspace.BackColor = BackColor;
-            workspace.Controls.Add(grid);
-            workspace.Controls.Add(switchBoard);
-            workspace.Controls.Add(mesh);
+            var centerWorkspace = new Panel();
+            centerWorkspace.Dock = DockStyle.Fill;
+            centerWorkspace.BackColor = Theme.Panel;
+            centerWorkspace.Controls.Add(grid);
+            centerWorkspace.Controls.Add(switchBoard);
 
-            Controls.Add(workspace);
-            Controls.Add(sidebar);
-            Controls.Add(status);
-            Controls.Add(tools);
-            Controls.Add(note);
+            var telemCard = new Panel();
+            telemCard.Dock = DockStyle.Bottom;
+            telemCard.Height = 90;
+            telemCard.BackColor = Color.FromArgb(17, 21, 28);
+            telemCard.Padding = new Padding(10, 8, 10, 8);
+            telemCard.Paint += delegate(object s, PaintEventArgs pe)
+            {
+                using (var pen = new Pen(Color.FromArgb(48, 54, 61), 1f))
+                {
+                    pe.Graphics.DrawRectangle(pen, 0, 0, telemCard.Width - 1, telemCard.Height - 1);
+                }
+            };
+
+            var telemHeader = new Label();
+            telemHeader.Dock = DockStyle.Top;
+            telemHeader.Height = 20;
+            telemHeader.Text = "LIVE CELL TELEMETRY TRACKING";
+            telemHeader.Font = new Font("Segoe UI", 8.25f, FontStyle.Bold);
+            telemHeader.ForeColor = Color.FromArgb(140, 150, 165);
+
+            telemReadout = new Label();
+            telemReadout.Dock = DockStyle.Fill;
+            telemReadout.Font = new Font("Consolas", 9.5f, FontStyle.Bold);
+            telemReadout.ForeColor = Color.FromArgb(0, 229, 255);
+            telemReadout.Text = "RPM: 3000   MAP: 60.0 kPa\r\nTracked Cell: Row 0, Col 0";
+
+            telemCard.Controls.Add(telemReadout);
+            telemCard.Controls.Add(telemHeader);
+
+            innerSplit = new SplitContainer();
+            innerSplit.Size = new Size(740, 580);
+            innerSplit.Dock = DockStyle.Fill;
+            innerSplit.Orientation = Orientation.Vertical;
+            innerSplit.SplitterWidth = 5;
+            innerSplit.BackColor = Theme.Border;
+            innerSplit.Panel1MinSize = 200;
+            innerSplit.Panel2MinSize = 240;
+            innerSplit.Panel1.Controls.Add(centerWorkspace);
+            innerSplit.Panel2.Controls.Add(mesh);
+            innerSplit.Panel2.Controls.Add(telemCard);
+            try
+            {
+                if (innerSplit.Width >= 500) innerSplit.SplitterDistance = Math.Max(200, innerSplit.Width - 300);
+            }
+            catch { }
+
+            outerSplit = new SplitContainer();
+            outerSplit.Size = new Size(1000, 580);
+            outerSplit.Dock = DockStyle.Fill;
+            outerSplit.Orientation = Orientation.Vertical;
+            outerSplit.SplitterWidth = 5;
+            outerSplit.BackColor = Theme.Border;
+            outerSplit.Panel1MinSize = 140;
+            outerSplit.Panel2MinSize = 250;
+            outerSplit.Panel1.Controls.Add(sidebar);
+            outerSplit.Panel2.Controls.Add(innerSplit);
+            try
+            {
+                if (outerSplit.Width >= 450) outerSplit.SplitterDistance = 240;
+            }
+            catch { }
+
+            Controls.Add(outerSplit);
+            Controls.Add(statusBar);
+            Controls.Add(commandStrip);
             FillList();
+        }
+
+        protected override void OnSizeChanged(EventArgs e)
+        {
+            base.OnSizeChanged(e);
+            if (innerSplit != null && innerSplit.Width > 500)
+            {
+                try
+                {
+                    int target = innerSplit.Width - 280;
+                    if (target >= innerSplit.Panel1MinSize && target <= innerSplit.Width - innerSplit.Panel2MinSize)
+                        innerSplit.SplitterDistance = target;
+                }
+                catch { }
+            }
+        }
+
+        static Control MakeSeparator()
+        {
+            var sep = new Panel();
+            sep.Width = 1;
+            sep.Height = 22;
+            sep.Margin = new Padding(6, 4, 6, 2);
+            sep.BackColor = Theme.Border;
+            return sep;
         }
 
         public void RefreshTable(string id)
@@ -829,6 +1027,42 @@ namespace Wideband
             return WriteTable(table, message);
         }
 
+        public long RomOrigin
+        {
+            get { return romOrigin; }
+        }
+
+        public bool HasRom
+        {
+            get { return rom != null && rom.Bytes != null && rom.Bytes.Length > 0; }
+        }
+
+        public void UpdateTrace(double rpm, double map, double load)
+        {
+            if (InvokeRequired)
+            {
+                try { BeginInvoke((Action)delegate { UpdateTrace(rpm, map, load); }); }
+                catch { }
+                return;
+            }
+            double yVal = map;
+            if (current != null && current.YName != null)
+            {
+                if (current.YName.IndexOf("load", StringComparison.OrdinalIgnoreCase) >= 0)
+                    yVal = load;
+                else if (current.YName.IndexOf("map", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                         current.YName.IndexOf("kpa", StringComparison.OrdinalIgnoreCase) >= 0)
+                    yVal = map;
+                else if (map <= 0 && load > 0)
+                    yVal = load;
+            }
+            decimal clampedX = (decimal)Math.Max((double)traceX.Minimum, Math.Min((double)traceX.Maximum, rpm));
+            decimal clampedY = (decimal)Math.Max((double)traceY.Minimum, Math.Min((double)traceY.Maximum, yVal));
+            if (traceX.Value != clampedX) traceX.Value = clampedX;
+            if (traceY.Value != clampedY) traceY.Value = clampedY;
+            Trace();
+        }
+
         static Font BadgeFont()
         {
             var face = new Font("Bahnschrift", 11f, FontStyle.Bold, GraphicsUnit.Point);
@@ -839,21 +1073,21 @@ namespace Wideband
 
         void SetMark(string text)
         {
-            checksumMark.Text = text == null ? "" : text;
+            checksumMark.Text = text == null || text.Length == 0 ? "Checksum Not Set" : text;
             if (checksumMark.Text == PlatformSecurityAndChecksum.ValidText)
             {
-                checksumMark.BackColor = Color.FromArgb(214, 236, 214);
-                checksumMark.ForeColor = Color.FromArgb(12, 110, 74);
+                checksumMark.BackColor = Theme.ValidGreen;
+                checksumMark.ForeColor = Theme.Accent;
             }
             else if (checksumMark.Text == PlatformSecurityAndChecksum.UpdatedText)
             {
-                checksumMark.BackColor = Color.FromArgb(244, 228, 196);
+                checksumMark.BackColor = Theme.WarningAmber;
                 checksumMark.ForeColor = Color.FromArgb(90, 62, 18);
             }
             else
             {
-                checksumMark.BackColor = Color.FromArgb(247, 248, 246);
-                checksumMark.ForeColor = Color.FromArgb(40, 44, 42);
+                checksumMark.BackColor = Theme.Panel;
+                checksumMark.ForeColor = Theme.Muted;
             }
         }
 
@@ -873,12 +1107,13 @@ namespace Wideband
         {
             var button = new Button();
             button.Text = text;
-            button.Height = 30;
+            button.Height = 28;
             button.AutoSize = true;
             button.FlatStyle = FlatStyle.Flat;
             button.FlatAppearance.BorderSize = 0;
-            button.BackColor = Color.FromArgb(12, 110, 74);
-            button.ForeColor = Color.FromArgb(244, 250, 247);
+            button.BackColor = Theme.Accent;
+            button.ForeColor = Theme.TextLight;
+            button.Margin = new Padding(2, 2, 2, 2);
             button.AccessibleRole = AccessibleRole.PushButton;
             button.Click += click;
             return button;
@@ -1145,10 +1380,10 @@ namespace Wideband
 
         void PaintViewButtons()
         {
-            Color on = Color.FromArgb(12, 110, 74);
-            Color off = Color.FromArgb(223, 227, 222);
-            Color onText = Color.FromArgb(244, 250, 247);
-            Color offText = Color.FromArgb(23, 33, 28);
+            Color on = Theme.Accent;
+            Color off = Theme.Panel;
+            Color onText = Theme.TextLight;
+            Color offText = Theme.Ink;
             tableViewButton.BackColor = showSwitches ? off : on;
             tableViewButton.ForeColor = showSwitches ? offText : onText;
             switchViewButton.BackColor = showSwitches ? on : off;
@@ -1458,7 +1693,16 @@ namespace Wideband
             if (current == null || grid.Columns.Count == 0 || grid.Rows.Count == 0) return;
             int x = TableMath.Nearest(current.X, (double)traceX.Value);
             int y = current.Y.Length > 1 ? TableMath.Nearest(current.Y, (double)traceY.Value) : 0;
-            if (y < grid.Rows.Count && x < grid.Columns.Count) grid.CurrentCell = grid.Rows[y].Cells[x];
+            if (y < grid.Rows.Count && x < grid.Columns.Count)
+            {
+                grid.CurrentCell = grid.Rows[y].Cells[x];
+                mesh.SetActiveCell(y, x);
+                if (telemReadout != null)
+                {
+                    telemReadout.Text = string.Format("RPM: {0:F0}   MAP: {1:F1} kPa\r\nTracked Cell: Row {2}, Col {3}",
+                        (double)traceX.Value, (double)traceY.Value, y, x);
+                }
+            }
         }
     }
 
@@ -1469,7 +1713,11 @@ namespace Wideband
         readonly LogChart chart;
         readonly TextBox formula;
         readonly Label result;
+        readonly Button startLive;
+        readonly Button stopLive;
+        readonly Button exportCsv;
         LogTable log;
+        LiveTelemetryPoller livePoller;
 
         public LogPanel(TuneDocument document, CalibratePanel calibrate, string savePath)
         {
@@ -1487,7 +1735,9 @@ namespace Wideband
 
             var tools = new FlowLayoutPanel();
             tools.Dock = DockStyle.Top;
-            tools.Height = 40;
+            tools.Height = 44;
+            tools.WrapContents = true;
+
             var open = new Button();
             open.Text = "Open log";
             open.Height = 30;
@@ -1498,6 +1748,7 @@ namespace Wideband
             open.ForeColor = Color.FromArgb(244, 250, 247);
             open.AccessibleRole = AccessibleRole.PushButton;
             open.Click += OpenClicked;
+
             var suggest = new Button();
             suggest.Text = "Suggest VE";
             suggest.Height = 30;
@@ -1508,6 +1759,7 @@ namespace Wideband
             suggest.ForeColor = Color.FromArgb(244, 250, 247);
             suggest.AccessibleRole = AccessibleRole.PushButton;
             suggest.Click += SuggestClicked;
+
             var calculate = new Button();
             calculate.Text = "Calculate channel";
             calculate.Height = 30;
@@ -1518,7 +1770,45 @@ namespace Wideband
             calculate.ForeColor = Color.FromArgb(244, 250, 247);
             calculate.AccessibleRole = AccessibleRole.PushButton;
             calculate.Click += CalculateClicked;
+
+            startLive = new Button();
+            startLive.Text = "Start Live Log";
+            startLive.Height = 30;
+            startLive.AutoSize = true;
+            startLive.FlatStyle = FlatStyle.Flat;
+            startLive.FlatAppearance.BorderSize = 0;
+            startLive.BackColor = Color.FromArgb(12, 110, 74);
+            startLive.ForeColor = Color.FromArgb(244, 250, 247);
+            startLive.AccessibleRole = AccessibleRole.PushButton;
+            startLive.Click += StartLiveClicked;
+
+            stopLive = new Button();
+            stopLive.Text = "Stop Live Log";
+            stopLive.Height = 30;
+            stopLive.AutoSize = true;
+            stopLive.FlatStyle = FlatStyle.Flat;
+            stopLive.FlatAppearance.BorderSize = 0;
+            stopLive.BackColor = Color.FromArgb(223, 227, 222);
+            stopLive.ForeColor = Color.FromArgb(23, 33, 28);
+            stopLive.AccessibleRole = AccessibleRole.PushButton;
+            stopLive.Enabled = false;
+            stopLive.Click += StopLiveClicked;
+
+            exportCsv = new Button();
+            exportCsv.Text = "Export CSV";
+            exportCsv.Height = 30;
+            exportCsv.AutoSize = true;
+            exportCsv.FlatStyle = FlatStyle.Flat;
+            exportCsv.FlatAppearance.BorderSize = 0;
+            exportCsv.BackColor = Color.FromArgb(12, 110, 74);
+            exportCsv.ForeColor = Color.FromArgb(244, 250, 247);
+            exportCsv.AccessibleRole = AccessibleRole.PushButton;
+            exportCsv.Click += ExportCsvClicked;
+
             tools.Controls.Add(open);
+            tools.Controls.Add(startLive);
+            tools.Controls.Add(stopLive);
+            tools.Controls.Add(exportCsv);
             tools.Controls.Add(suggest);
             tools.Controls.Add(calculate);
 
@@ -1538,6 +1828,103 @@ namespace Wideband
             Controls.Add(formula);
             Controls.Add(tools);
             Controls.Add(title);
+        }
+
+        void StartLiveClicked(object sender, EventArgs e)
+        {
+            if (!VehicleLink.Current.IsConnected)
+            {
+                result.Text = "Connect the cable on the Cable tab before starting live logging.";
+                return;
+            }
+            if (log == null)
+            {
+                log = new LogTable();
+                log.Headers = ObdTelemetrySample.Headers();
+            }
+            if (livePoller == null)
+            {
+                livePoller = new LiveTelemetryPoller(OnLiveSample);
+            }
+            livePoller.Start();
+            startLive.Enabled = false;
+            startLive.BackColor = Color.FromArgb(223, 227, 222);
+            startLive.ForeColor = Color.FromArgb(23, 33, 28);
+            stopLive.Enabled = true;
+            stopLive.BackColor = Color.FromArgb(12, 110, 74);
+            stopLive.ForeColor = Color.FromArgb(244, 250, 247);
+            result.Text = "Live logging started. Polling SAE J1979 Mode 01 telemetry.";
+        }
+
+        void StopLiveClicked(object sender, EventArgs e)
+        {
+            if (livePoller != null)
+            {
+                livePoller.Stop();
+            }
+            startLive.Enabled = true;
+            startLive.BackColor = Color.FromArgb(12, 110, 74);
+            startLive.ForeColor = Color.FromArgb(244, 250, 247);
+            stopLive.Enabled = false;
+            stopLive.BackColor = Color.FromArgb(223, 227, 222);
+            stopLive.ForeColor = Color.FromArgb(23, 33, 28);
+            result.Text = "Live logging stopped. " + (log == null ? 0 : log.Rows.Count) + " rows recorded.";
+        }
+
+        void OnLiveSample(ObdTelemetrySample sample)
+        {
+            if (sample == null) return;
+            if (InvokeRequired)
+            {
+                try { BeginInvoke((Action)delegate { OnLiveSample(sample); }); }
+                catch { }
+                return;
+            }
+            if (log == null)
+            {
+                log = new LogTable();
+                log.Headers = ObdTelemetrySample.Headers();
+            }
+            log.Rows.Add(sample.ToRow());
+            if (log.Rows.Count > 10000)
+            {
+                log.Rows.RemoveRange(0, 1000);
+            }
+            chart.ShowLog(log);
+            calibrate.UpdateTrace(sample.Rpm, sample.MapKpa, sample.LoadPct);
+            result.Text = "Live: " + log.Rows.Count + " rows. RPM: " + sample.Rpm.ToString("0", CultureInfo.InvariantCulture)
+                + "  MAP: " + sample.MapKpa.ToString("0", CultureInfo.InvariantCulture) + " kPa"
+                + "  Load: " + sample.LoadPct.ToString("0.0", CultureInfo.InvariantCulture) + "%"
+                + "  Advance: " + sample.TimingAdvance.ToString("0.0", CultureInfo.InvariantCulture) + "°"
+                + "  ECT: " + sample.CoolantC.ToString("0", CultureInfo.InvariantCulture) + "°C"
+                + "  Lambda: " + sample.Lambda.ToString("0.00", CultureInfo.InvariantCulture);
+        }
+
+        void ExportCsvClicked(object sender, EventArgs e)
+        {
+            if (log == null || log.Rows.Count == 0)
+            {
+                result.Text = "No log data to export.";
+                return;
+            }
+            using (var dialog = new SaveFileDialog())
+            {
+                dialog.Title = "Export CSV Log";
+                dialog.Filter = "CSV logs (*.csv)|*.csv|All files (*.*)|*.*";
+                dialog.FileName = "telemetry-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".csv";
+                if (dialog.ShowDialog(this) != DialogResult.OK) return;
+                var sb = new StringBuilder();
+                sb.AppendLine(string.Join(",", log.Headers));
+                foreach (double[] row in log.Rows)
+                {
+                    var line = new string[row.Length];
+                    for (int i = 0; i < row.Length; i++)
+                        line[i] = row[i].ToString("0.###", CultureInfo.InvariantCulture);
+                    sb.AppendLine(string.Join(",", line));
+                }
+                File.WriteAllText(dialog.FileName, sb.ToString());
+                result.Text = "Exported " + log.Rows.Count + " rows to " + Path.GetFileName(dialog.FileName) + ".";
+            }
         }
 
         void OpenClicked(object sender, EventArgs e)
@@ -1653,11 +2040,16 @@ namespace Wideband
     sealed class LogChart : Control
     {
         LogTable log;
+        int hoverRow = -1;
+        int mouseX = -1;
+        int mouseY = -1;
+        bool isHovering = false;
 
         public LogChart()
         {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
             DoubleBuffered = true;
-            BackColor = Color.FromArgb(247, 248, 246);
+            BackColor = Color.FromArgb(24, 28, 26);
         }
 
         public void ShowLog(LogTable value)
@@ -1666,37 +2058,208 @@ namespace Wideband
             Invalidate();
         }
 
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            mouseX = e.X;
+            mouseY = e.Y;
+            isHovering = true;
+            if (log != null && log.Rows.Count > 1)
+            {
+                float chartLeft = 55f;
+                float chartWidth = Width - chartLeft - 20f;
+                if (chartWidth > 0 && e.X >= chartLeft && e.X <= chartLeft + chartWidth)
+                {
+                    float ratio = (e.X - chartLeft) / chartWidth;
+                    hoverRow = (int)Math.Round(ratio * (log.Rows.Count - 1));
+                    if (hoverRow < 0) hoverRow = 0;
+                    if (hoverRow >= log.Rows.Count) hoverRow = log.Rows.Count - 1;
+                }
+                else
+                {
+                    hoverRow = -1;
+                }
+            }
+            Invalidate();
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            isHovering = false;
+            hoverRow = -1;
+            Invalidate();
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
             base.OnPaint(e);
-            if (log == null || log.Rows.Count < 2) return;
-            int rpm = log.Index("rpm");
-            int lambda = log.Index("lambda");
-            if (rpm < 0) rpm = Math.Min(1, log.Headers.Length - 1);
-            if (lambda < 0) lambda = rpm;
-            DrawSeries(e.Graphics, rpm, Color.FromArgb(23, 33, 28));
-            if (lambda != rpm) DrawSeries(e.Graphics, lambda, Color.FromArgb(12, 110, 74));
+            Graphics g = e.Graphics;
+            g.Clear(BackColor);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+
+            using (var borderPen = new Pen(Color.FromArgb(45, 55, 48), 1f))
+            {
+                g.DrawRectangle(borderPen, 0, 0, Width - 1, Height - 1);
+            }
+
+            if (log == null || log.Rows.Count < 2)
+            {
+                using (var brush = new SolidBrush(Color.FromArgb(120, 140, 130)))
+                {
+                    g.DrawString("No log loaded. Open a CSV or click 'Start Live Log'.", Font, brush, 16, 16);
+                }
+                return;
+            }
+
+            float chartLeft = 55f;
+            float chartRight = Width - 20f;
+            float chartTop = 32f;
+            float chartBottom = Height - 28f;
+            float chartWidth = chartRight - chartLeft;
+            float chartHeight = chartBottom - chartTop;
+
+            if (chartWidth <= 10 || chartHeight <= 10) return;
+
+            using (var gridPen = new Pen(Color.FromArgb(40, 50, 44), 1f))
+            using (var gridTextBrush = new SolidBrush(Color.FromArgb(120, 140, 130)))
+            using (var smFont = new Font(Font.FontFamily, 8f, FontStyle.Regular))
+            {
+                gridPen.DashStyle = DashStyle.Dash;
+                for (int i = 0; i <= 4; i++)
+                {
+                    float gy = chartTop + chartHeight * (i / 4f);
+                    g.DrawLine(gridPen, chartLeft, gy, chartRight, gy);
+                    int pct = 100 - i * 25;
+                    g.DrawString(pct.ToString(CultureInfo.InvariantCulture) + "%", smFont, gridTextBrush, 12, gy - 6);
+                }
+            }
+
+            int rpmCol = FindColumn("rpm");
+            int mapCol = FindColumn("map");
+            int loadCol = FindColumn("load");
+            int lambdaCol = FindColumn("lambda");
+            int targetCol = FindColumn("target");
+
+            Color rpmColor = Color.FromArgb(235, 80, 80);
+            Color mapColor = Color.FromArgb(80, 175, 240);
+            Color loadColor = Color.FromArgb(240, 190, 60);
+            Color lambdaColor = Color.FromArgb(60, 220, 140);
+            Color targetColor = Color.FromArgb(210, 130, 240);
+
+            if (rpmCol >= 0) DrawSeries(g, rpmCol, rpmColor, chartLeft, chartTop, chartWidth, chartHeight);
+            if (mapCol >= 0) DrawSeries(g, mapCol, mapColor, chartLeft, chartTop, chartWidth, chartHeight);
+            else if (loadCol >= 0) DrawSeries(g, loadCol, loadColor, chartLeft, chartTop, chartWidth, chartHeight);
+            if (lambdaCol >= 0) DrawSeries(g, lambdaCol, lambdaColor, chartLeft, chartTop, chartWidth, chartHeight);
+            if (targetCol >= 0) DrawSeries(g, targetCol, targetColor, chartLeft, chartTop, chartWidth, chartHeight);
+
+            float legendX = chartLeft + 4;
+            using (var smFont = new Font(Font.FontFamily, 8.5f, FontStyle.Bold))
+            {
+                if (rpmCol >= 0) legendX = DrawLegendBadge(g, "RPM", rpmColor, legendX, 8, smFont);
+                if (mapCol >= 0) legendX = DrawLegendBadge(g, "MAP", mapColor, legendX, 8, smFont);
+                else if (loadCol >= 0) legendX = DrawLegendBadge(g, "Load", loadColor, legendX, 8, smFont);
+                if (lambdaCol >= 0) legendX = DrawLegendBadge(g, "Lambda", lambdaColor, legendX, 8, smFont);
+                if (targetCol >= 0) legendX = DrawLegendBadge(g, "Target", targetColor, legendX, 8, smFont);
+            }
+
+            if (isHovering && hoverRow >= 0 && hoverRow < log.Rows.Count)
+            {
+                float cursorX = chartLeft + chartWidth * (hoverRow / (float)(log.Rows.Count - 1));
+                using (var crossPen = new Pen(Color.FromArgb(160, 255, 255, 255), 1f))
+                {
+                    crossPen.DashStyle = DashStyle.Dot;
+                    g.DrawLine(crossPen, cursorX, chartTop, cursorX, chartBottom);
+                    if (mouseY >= chartTop && mouseY <= chartBottom)
+                    {
+                        g.DrawLine(crossPen, chartLeft, mouseY, chartRight, mouseY);
+                    }
+                }
+
+                double[] row = log.Rows[hoverRow];
+                var sb = new StringBuilder();
+                sb.Append("Row ").Append((hoverRow + 1).ToString(CultureInfo.InvariantCulture)).Append("/").Append(log.Rows.Count.ToString(CultureInfo.InvariantCulture));
+                if (rpmCol >= 0 && rpmCol < row.Length) sb.Append(" | RPM: ").Append(row[rpmCol].ToString("0", CultureInfo.InvariantCulture));
+                if (mapCol >= 0 && mapCol < row.Length) sb.Append(" | MAP: ").Append(row[mapCol].ToString("0.0", CultureInfo.InvariantCulture)).Append(" kPa");
+                if (loadCol >= 0 && loadCol < row.Length) sb.Append(" | Load: ").Append(row[loadCol].ToString("0.0", CultureInfo.InvariantCulture)).Append("%");
+                if (lambdaCol >= 0 && lambdaCol < row.Length) sb.Append(" | \u03BB: ").Append(row[lambdaCol].ToString("0.00", CultureInfo.InvariantCulture));
+                if (targetCol >= 0 && targetCol < row.Length) sb.Append(" | Target: ").Append(row[targetCol].ToString("0.00", CultureInfo.InvariantCulture));
+
+                string readout = sb.ToString();
+                using (var readoutFont = new Font(Font.FontFamily, 8.5f, FontStyle.Regular))
+                {
+                    SizeF sz = g.MeasureString(readout, readoutFont);
+                    float boxW = sz.Width + 14;
+                    float boxH = sz.Height + 8;
+                    float boxX = cursorX + 8;
+                    if (boxX + boxW > chartRight) boxX = cursorX - boxW - 8;
+                    float boxY = chartTop + 6;
+
+                    using (var boxBrush = new SolidBrush(Color.FromArgb(220, 16, 20, 18)))
+                    using (var borderP = new Pen(Color.FromArgb(80, 100, 90), 1f))
+                    using (var textB = new SolidBrush(Color.FromArgb(240, 250, 245)))
+                    {
+                        g.FillRectangle(boxBrush, boxX, boxY, boxW, boxH);
+                        g.DrawRectangle(borderP, boxX, boxY, boxW, boxH);
+                        g.DrawString(readout, readoutFont, textB, boxX + 7, boxY + 4);
+                    }
+                }
+            }
         }
 
-        void DrawSeries(Graphics graphics, int column, Color color)
+        int FindColumn(string term)
         {
+            if (log == null || log.Headers == null) return -1;
+            for (int i = 0; i < log.Headers.Length; i++)
+            {
+                if (log.Headers[i].IndexOf(term, StringComparison.OrdinalIgnoreCase) >= 0)
+                    return i;
+            }
+            return -1;
+        }
+
+        float DrawLegendBadge(Graphics g, string label, Color color, float x, float y, Font font)
+        {
+            using (var dotBrush = new SolidBrush(color))
+            {
+                g.FillEllipse(dotBrush, x, y + 4, 8, 8);
+            }
+            using (var textBrush = new SolidBrush(Color.FromArgb(210, 220, 215)))
+            {
+                g.DrawString(label, font, textBrush, x + 12, y);
+            }
+            SizeF sz = g.MeasureString(label, font);
+            return x + 12 + sz.Width + 16;
+        }
+
+        void DrawSeries(Graphics graphics, int column, Color color, float left, float top, float width, float height)
+        {
+            if (column < 0 || column >= log.Headers.Length) return;
             double min = log.Rows[0][column];
             double max = min;
             foreach (double[] row in log.Rows)
             {
-                if (row[column] < min) min = row[column];
-                if (row[column] > max) max = row[column];
+                if (column < row.Length)
+                {
+                    if (row[column] < min) min = row[column];
+                    if (row[column] > max) max = row[column];
+                }
             }
             if (Math.Abs(max - min) < 0.0001) max = min + 1;
+
             var points = new PointF[log.Rows.Count];
             for (int i = 0; i < log.Rows.Count; i++)
             {
-                float x = 12 + (Width - 24) * (i / (float)(log.Rows.Count - 1));
-                float y = Height - 16 - (float)((log.Rows[i][column] - min) / (max - min) * (Height - 32));
+                double val = column < log.Rows[i].Length ? log.Rows[i][column] : min;
+                float x = left + width * (i / (float)(log.Rows.Count - 1));
+                float y = top + height - (float)((val - min) / (max - min) * height);
                 points[i] = new PointF(x, y);
             }
-            using (var pen = new Pen(color, 2f)) graphics.DrawLines(pen, points);
-            using (var brush = new SolidBrush(color)) graphics.DrawString(log.Headers[column], Font, brush, 12, 8);
+            using (var pen = new Pen(color, 2f))
+            {
+                graphics.DrawLines(pen, points);
+            }
         }
     }
 
@@ -1750,11 +2313,14 @@ namespace Wideband
     sealed class SurfaceMesh : Control
     {
         TuneTable table;
+        int activeX = -1;
+        int activeY = -1;
 
         public SurfaceMesh()
         {
-            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
-            BackColor = Color.FromArgb(247, 248, 246);
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            BackColor = Color.FromArgb(28, 34, 30);
+            DoubleBuffered = true;
         }
 
         public void Show(TuneTable value)
@@ -1763,41 +2329,163 @@ namespace Wideband
             Invalidate();
         }
 
+        public void SetActiveCell(int y, int x)
+        {
+            activeY = y;
+            activeX = x;
+            Invalidate();
+        }
+
         protected override void OnPaint(PaintEventArgs e)
         {
             base.OnPaint(e);
-            e.Graphics.Clear(BackColor);
-            if (table == null || table.Values == null || table.Values.Length == 0 || table.Values[0].Length == 0) return;
+            Graphics g = e.Graphics;
+            g.Clear(BackColor);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+
+            using (var borderPen = new Pen(Color.FromArgb(45, 55, 48), 1f))
+            {
+                g.DrawRectangle(borderPen, 0, 0, Width - 1, Height - 1);
+            }
+
+            if (table == null || table.Values == null || table.Values.Length == 0 || table.Values[0].Length == 0)
+            {
+                using (var brush = new SolidBrush(Color.FromArgb(120, 140, 130)))
+                {
+                    g.DrawString("No table selected", Font, brush, 12, 12);
+                }
+                return;
+            }
+
+            int rows = table.Values.Length;
+            int cols = table.Values[0].Length;
+
             double min = table.Values[0][0];
             double max = min;
-            for (int y = 0; y < table.Values.Length; y++)
+            for (int r = 0; r < rows; r++)
             {
-                for (int x = 0; x < table.Values[y].Length; x++)
+                for (int c = 0; c < table.Values[r].Length; c++)
                 {
-                    double value = table.Values[y][x];
-                    if (value < min) min = value;
-                    if (value > max) max = value;
+                    double v = table.Values[r][c];
+                    if (v < min) min = v;
+                    if (v > max) max = v;
                 }
             }
             double span = max - min;
             if (span < 0.0001) span = 1;
-            int rows = table.Values.Length;
-            int columns = table.Values[0].Length;
-            float pitchX = Math.Max(10f, (Width - 28) / (float)columns);
-            float pitchY = Math.Max(8f, (Height - 36) / (float)rows);
-            float barLimit = Math.Max(12f, pitchY * 2.2f);
-            using (var label = new SolidBrush(Color.FromArgb(23, 33, 28)))
-                e.Graphics.DrawString(table.Name, Font, label, 8, 6);
-            for (int y = rows - 1; y >= 0; y--)
+
+            using (var titleBrush = new SolidBrush(Color.FromArgb(235, 242, 238)))
+            using (var boldFont = new Font(Font, FontStyle.Bold))
             {
-                for (int x = 0; x < table.Values[y].Length; x++)
+                g.DrawString(table.Name, boldFont, titleBrush, 10, 8);
+            }
+            using (var statBrush = new SolidBrush(Color.FromArgb(160, 180, 170)))
+            using (var smFont = new Font(Font.FontFamily, 8.5f, FontStyle.Regular))
+            {
+                string maxStr = "Max: " + CellDelta.FormatNumber(table, max) + (table.Unit.Length > 0 ? " " + table.Unit : "");
+                string minStr = "Min: " + CellDelta.FormatNumber(table, min) + (table.Unit.Length > 0 ? " " + table.Unit : "");
+                g.DrawString(maxStr, smFont, statBrush, 10, 26);
+                g.DrawString(minStr, smFont, statBrush, 10, 40);
+            }
+
+            float margin = 20f;
+            float topY = 56f;
+            float viewW = Width - margin * 2;
+            float viewH = Height - topY - margin;
+            if (viewW < 40 || viewH < 40) return;
+
+            float cx = Width * 0.5f;
+            float cy = topY + viewH * 0.65f;
+
+            float stepX = viewW / (float)(cols + rows + 1);
+            float stepY = (viewH * 0.45f) / (float)(cols + rows + 1);
+            float maxZHeight = viewH * 0.45f;
+
+            var pts = new PointF[rows, cols];
+            var zUnits = new double[rows, cols];
+
+            for (int r = 0; r < rows; r++)
+            {
+                for (int c = 0; c < cols; c++)
                 {
-                    double unit = (table.Values[y][x] - min) / span;
-                    float height = 4f + (float)unit * barLimit;
-                    float left = 10 + x * pitchX;
-                    float bottom = Height - 10 - (rows - 1 - y) * (pitchY * 0.45f);
-                    using (var brush = new SolidBrush(HeatColor.Deep(unit)))
-                        e.Graphics.FillRectangle(brush, left, bottom - height, Math.Max(4f, pitchX - 3f), height);
+                    double val = c < table.Values[r].Length ? table.Values[r][c] : min;
+                    double unit = (val - min) / span;
+                    if (unit < 0) unit = 0;
+                    if (unit > 1) unit = 1;
+                    zUnits[r, c] = unit;
+
+                    float isoX = (c - (cols - 1) * 0.5f) - (r - (rows - 1) * 0.5f);
+                    float isoY = ((c - (cols - 1) * 0.5f) + (r - (rows - 1) * 0.5f)) * 0.5f;
+
+                    float px = cx + isoX * stepX * 1.5f;
+                    float py = cy + isoY * stepY * 2.0f - (float)unit * maxZHeight;
+                    pts[r, c] = new PointF(px, py);
+                }
+            }
+
+            using (var axisPen = new Pen(Color.FromArgb(50, 70, 60), 1f))
+            {
+                axisPen.DashStyle = DashStyle.Dash;
+                PointF floor00 = new PointF(cx + (-(cols - 1) * 0.5f - -(rows - 1) * 0.5f) * stepX * 1.5f,
+                                            cy + (-(cols - 1) * 0.5f + -(rows - 1) * 0.5f) * 0.5f * stepY * 2.0f);
+                PointF floorC0 = new PointF(cx + ((cols - 1) * 0.5f - -(rows - 1) * 0.5f) * stepX * 1.5f,
+                                            cy + ((cols - 1) * 0.5f + -(rows - 1) * 0.5f) * 0.5f * stepY * 2.0f);
+                PointF floorCR = new PointF(cx + ((cols - 1) * 0.5f - (rows - 1) * 0.5f) * stepX * 1.5f,
+                                            cy + ((cols - 1) * 0.5f + (rows - 1) * 0.5f) * 0.5f * stepY * 2.0f);
+                PointF floor0R = new PointF(cx + (-(cols - 1) * 0.5f - (rows - 1) * 0.5f) * stepX * 1.5f,
+                                            cy + (-(cols - 1) * 0.5f + (rows - 1) * 0.5f) * 0.5f * stepY * 2.0f);
+                g.DrawLine(axisPen, floor00, floorC0);
+                g.DrawLine(axisPen, floorC0, floorCR);
+                g.DrawLine(axisPen, floorCR, floor0R);
+                g.DrawLine(axisPen, floor0R, floor00);
+            }
+
+            using (var wirePen = new Pen(Color.FromArgb(120, 255, 255, 255), 1f))
+            {
+                for (int r = 0; r < rows - 1; r++)
+                {
+                    for (int c = 0; c < cols - 1; c++)
+                    {
+                        PointF[] quad = new PointF[]
+                        {
+                            pts[r, c],
+                            pts[r, c + 1],
+                            pts[r + 1, c + 1],
+                            pts[r + 1, c]
+                        };
+
+                        double avgUnit = (zUnits[r, c] + zUnits[r, c + 1] + zUnits[r + 1, c + 1] + zUnits[r + 1, c]) / 4.0;
+                        Color quadColor = HeatColor.Deep(avgUnit);
+                        using (var brush = new SolidBrush(Color.FromArgb(215, quadColor.R, quadColor.G, quadColor.B)))
+                        {
+                            g.FillPolygon(brush, quad);
+                        }
+                        g.DrawPolygon(wirePen, quad);
+                    }
+                }
+            }
+
+            if (activeY >= 0 && activeY < rows && activeX >= 0 && activeX < cols)
+            {
+                PointF actP = pts[activeY, activeX];
+                float isoX = (activeX - (cols - 1) * 0.5f) - (activeY - (rows - 1) * 0.5f);
+                float isoY = ((activeX - (cols - 1) * 0.5f) + (activeY - (rows - 1) * 0.5f)) * 0.5f;
+                PointF floorP = new PointF(cx + isoX * stepX * 1.5f, cy + isoY * stepY * 2.0f);
+
+                using (var stemPen = new Pen(Color.FromArgb(255, 240, 100), 1.5f))
+                {
+                    stemPen.DashStyle = DashStyle.Dot;
+                    g.DrawLine(stemPen, floorP, actP);
+                }
+
+                using (var outerPen = new Pen(Color.FromArgb(255, 215, 0), 2.5f))
+                {
+                    g.DrawEllipse(outerPen, actP.X - 5, actP.Y - 5, 10, 10);
+                }
+                using (var innerBrush = new SolidBrush(Color.White))
+                {
+                    g.FillEllipse(innerBrush, actP.X - 3, actP.Y - 3, 6, 6);
                 }
             }
         }

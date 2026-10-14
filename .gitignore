@@ -1,0 +1,8 @@
+/target
+/mingw_compat
+*.pdb
+startup-error.txt
+datalog.csv
+.agent/
+.agents/
+skills-lock.json
