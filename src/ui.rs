@@ -1,8 +1,13 @@
 use crate::definitions::XdfDocument;
 use crate::j2534::{create_device, J2534DeviceInfo, J2534RegistryScanner, PassThruDevice};
 use crate::protocols::{ChecksumEngine, EcuIdentification, EcuIdentifier, EcuProfile, FlashDownload};
+use crate::surface_mesh;
 use crate::telemetry::TelemetryBuffer;
-use eframe::egui::{self, Color32, Pos2, Rect, Stroke, Vec2};
+use crate::theme::{
+    self, paint_live_cell_glow, paint_studio_badge, studio_tab_button, ACCENT_CYAN, CARD_FILL,
+    EMERALD, MUTED, STROKE, TEXT, heatmap_color,
+};
+use eframe::egui::{self, Color32, Pos2, Stroke, Vec2};
 use egui_extras::{Column, TableBuilder};
 use egui_plot::{Line, Plot, PlotPoints};
 use std::sync::{Arc, Mutex};
@@ -57,7 +62,8 @@ pub struct WidebandApp {
 }
 
 impl WidebandApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        theme::apply_motorsport_theme(&cc.egui_ctx);
         let devices = J2534RegistryScanner::scan();
         let profiles = EcuProfile::all();
         let xdf = XdfDocument::sample();
@@ -254,107 +260,43 @@ impl WidebandApp {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Heatmap Color Utilities
-// ---------------------------------------------------------------------------
-
-pub fn heatmap_color(val: f64, min: f64, max: f64) -> Color32 {
-    let norm = if max > min {
-        ((val - min) / (max - min)).clamp(0.0, 1.0)
-    } else {
-        0.5
-    };
-
-    if norm < 0.25 {
-        let t = norm / 0.25;
-        // Blue to Cyan
-        Color32::from_rgb(
-            (20.0 + t * 0.0) as u8,
-            (80.0 + t * 140.0) as u8,
-            (240.0 - t * 20.0) as u8,
-        )
-    } else if norm < 0.5 {
-        let t = (norm - 0.25) / 0.25;
-        // Cyan to Green
-        Color32::from_rgb(
-            (20.0 + t * 30.0) as u8,
-            (220.0 - t * 40.0) as u8,
-            (220.0 - t * 150.0) as u8,
-        )
-    } else if norm < 0.75 {
-        let t = (norm - 0.5) / 0.25;
-        // Green to Gold/Amber
-        Color32::from_rgb(
-            (50.0 + t * 200.0) as u8,
-            (180.0 + t * 30.0) as u8,
-            (70.0 - t * 60.0) as u8,
-        )
-    } else {
-        let t = (norm - 0.75) / 0.25;
-        // Gold to Crimson Red
-        Color32::from_rgb(
-            (250.0 - t * 20.0) as u8,
-            (210.0 - t * 170.0) as u8,
-            (10.0 + t * 30.0) as u8,
-        )
-    }
-}
-
 impl eframe::App for WidebandApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_telemetry();
-        ctx.request_repaint(); // 60 FPS repaint for smooth live oscilloscope & tracing
+        ctx.request_repaint();
 
-        // -------------------------------------------------------------------
-        // Dark Motorsport Theme Setup
-        // -------------------------------------------------------------------
-        let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = Color32::from_rgb(18, 21, 25);
-        visuals.window_fill = Color32::from_rgb(24, 28, 34);
-        visuals.extreme_bg_color = Color32::from_rgb(12, 14, 17);
-        visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(28, 33, 40);
-        visuals.widgets.inactive.bg_fill = Color32::from_rgb(34, 40, 48);
-        visuals.widgets.hovered.bg_fill = Color32::from_rgb(45, 54, 66);
-        visuals.widgets.active.bg_fill = Color32::from_rgb(30, 136, 229);
-        ctx.set_visuals(visuals);
-
-        // -------------------------------------------------------------------
-        // Top Studio Header Bar
-        // -------------------------------------------------------------------
-        // -------------------------------------------------------------------
-        // Top Studio Header Bar
-        // -------------------------------------------------------------------
-        let header_frame = egui::Frame::none()
-            .fill(Color32::from_rgb(18, 21, 25))
-            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(48, 54, 61))) // 1px #30363D border
-            .inner_margin(egui::Margin::symmetric(10.0, 5.0));
+        theme::apply_motorsport_theme(ctx);
 
         egui::TopBottomPanel::top("header_bar")
             .exact_height(46.0)
-            .frame(header_frame)
+            .frame(theme::header_frame())
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    ui.add_space(4.0);
-                    ui.heading(egui::RichText::new("⚡ WIDEBAND").strong().color(Color32::from_rgb(0, 229, 255)));
-                    ui.label(egui::RichText::new("MOTORSPORT STUDIO").small().color(Color32::from_rgb(140, 150, 165)));
-                    ui.add_space(12.0);
+                    paint_studio_badge(ui);
+                    ui.add_space(14.0);
 
-                    // Connection status pill with 6px horizontal, 3px vertical padding & glowing accent border
+                    ui.label(egui::RichText::new("Vehicle").size(11.0).color(MUTED));
+                    egui::ComboBox::from_id_salt("profile_select")
+                        .width(200.0)
+                        .selected_text(&self.profiles[self.selected_profile_idx].name)
+                        .show_ui(ui, |ui| {
+                            for (idx, prof) in self.profiles.iter().enumerate() {
+                                ui.selectable_value(&mut self.selected_profile_idx, idx, &prof.name);
+                            }
+                        });
+
+                    ui.add_space(10.0);
+
                     let (status_text, status_color) = if self.is_connected {
-                        if self.devices[self.selected_device_idx].is_virtual {
-                            ("SIMULATOR ACTIVE", Color32::from_rgb(0, 229, 255))
-                        } else {
-                            ("CONNECTED", Color32::from_rgb(0, 230, 118))
-                        }
+                        ("ONLINE", EMERALD)
                     } else {
-                        ("DISCONNECTED", Color32::from_rgb(255, 23, 68))
+                        ("OFFLINE", Color32::from_rgb(0xF8, 0x51, 0x49))
                     };
-
                     egui::Frame::none()
-                        .fill(status_color.gamma_multiply(0.15))
-                        .stroke(Stroke::new(1.0_f32, status_color))
-                        .rounding(4.0)
-                        .inner_margin(egui::Margin::symmetric(6.0, 3.0))
+                        .fill(status_color.gamma_multiply(0.12))
+                        .stroke(Stroke::new(1.0, status_color))
+                        .rounding(egui::Rounding::same(4.0))
+                        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label(egui::RichText::new("●").size(9.0).color(status_color));
@@ -367,50 +309,34 @@ impl eframe::App for WidebandApp {
                             });
                         });
 
-                    ui.add_space(6.0);
-                    if self.is_connected {
-                        if ui.button(egui::RichText::new("Disconnect").size(11.0)).clicked() {
-                            self.disconnect_cable();
-                        }
+                    ui.add_space(8.0);
+
+                    let batt_v = if self.is_connected { 13.4 } else { 0.0 };
+                    let batt_label = if self.is_connected {
+                        format!("{:.1}V", batt_v)
                     } else {
-                        if ui.button(egui::RichText::new("Connect Cable").size(11.0).strong().color(Color32::from_rgb(0, 229, 255))).clicked() {
-                            self.connect_cable();
-                        }
-                    }
-
-                    ui.add_space(10.0);
-                    ui.label(egui::RichText::new("Device:").size(11.0).color(Color32::from_rgb(140, 150, 165)));
-                    egui::ComboBox::from_id_salt("device_select")
-                        .width(180.0)
-                        .selected_text(&self.devices[self.selected_device_idx].name)
-                        .show_ui(ui, |ui| {
-                            for (idx, dev) in self.devices.iter().enumerate() {
-                                ui.selectable_value(&mut self.selected_device_idx, idx, &dev.name);
-                            }
-                        });
-
-                    ui.label(egui::RichText::new("Profile:").size(11.0).color(Color32::from_rgb(140, 150, 165)));
-                    egui::ComboBox::from_id_salt("profile_select")
-                        .width(170.0)
-                        .selected_text(&self.profiles[self.selected_profile_idx].name)
-                        .show_ui(ui, |ui| {
-                            for (idx, prof) in self.profiles.iter().enumerate() {
-                                ui.selectable_value(&mut self.selected_profile_idx, idx, &prof.name);
-                            }
-                        });
-
-                    ui.add_space(10.0);
-                    // Checksum status badge
-                    let ck_color = if self.checksum_status.contains("Valid") {
-                        Color32::from_rgb(0, 230, 118)
-                    } else {
-                        Color32::from_rgb(255, 214, 0)
+                        "—".to_string()
                     };
-                    ui.label(egui::RichText::new(&self.checksum_status).size(11.0).color(ck_color).strong());
+                    egui::Frame::none()
+                        .fill(theme::WIDGET_BG)
+                        .stroke(Stroke::new(1.0, STROKE))
+                        .rounding(egui::Rounding::same(4.0))
+                        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("VBATT").size(10.0).color(MUTED));
+                                ui.label(
+                                    egui::RichText::new(batt_label)
+                                        .size(12.0)
+                                        .strong()
+                                        .monospace()
+                                        .color(ACCENT_CYAN),
+                                );
+                            });
+                        });
 
-                    // Navigation Tabs with proper horizontal margins and flex spacing
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_space(4.0);
+                        ui.add_space(6.0);
                         let tabs = [
                             (WorkspaceTab::Switchboard, "Switchboard"),
                             (WorkspaceTab::FlashDiagnostics, "Flash & Diag"),
@@ -418,17 +344,39 @@ impl eframe::App for WidebandApp {
                             (WorkspaceTab::Calibration, "Calibration"),
                         ];
                         for (tab, title) in tabs {
-                            let is_selected = self.active_tab == tab;
-                            let text = if is_selected {
-                                egui::RichText::new(title).size(12.0).strong().color(Color32::from_rgb(0, 229, 255))
-                            } else {
-                                egui::RichText::new(title).size(12.0).color(Color32::from_rgb(175, 185, 195))
-                            };
-                            if ui.add(egui::Button::new(text).min_size(Vec2::new(88.0, 26.0))).clicked() {
+                            if studio_tab_button(ui, title, self.active_tab == tab).clicked() {
                                 self.active_tab = tab;
                             }
-                            ui.add_space(4.0);
+                            ui.add_space(6.0);
                         }
+
+                        ui.add_space(12.0);
+                        if self.is_connected {
+                            if ui
+                                .button(egui::RichText::new("Disconnect").size(11.0).color(MUTED))
+                                .clicked()
+                            {
+                                self.disconnect_cable();
+                            }
+                        } else if ui
+                            .button(egui::RichText::new("Connect").size(11.0).strong().color(ACCENT_CYAN))
+                            .clicked()
+                        {
+                            self.connect_cable();
+                        }
+                        ui.add_space(8.0);
+                        egui::ComboBox::from_id_salt("device_select")
+                            .width(160.0)
+                            .selected_text(
+                                egui::RichText::new(&self.devices[self.selected_device_idx].name)
+                                    .size(11.0)
+                                    .color(MUTED),
+                            )
+                            .show_ui(ui, |ui| {
+                                for (idx, dev) in self.devices.iter().enumerate() {
+                                    ui.selectable_value(&mut self.selected_device_idx, idx, &dev.name);
+                                }
+                            });
                     });
                 });
             });
@@ -453,114 +401,154 @@ impl WidebandApp {
     fn render_calibration_tab(&mut self, ctx: &egui::Context) {
         // Left Parameter Tree
         egui::SidePanel::left("param_tree")
-            .min_width(280.0)
-            .max_width(340.0)
-            .frame(
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(18, 21, 25))
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(48, 54, 61)))
-                    .inner_margin(egui::Margin::symmetric(10.0, 8.0)),
-            )
+            .resizable(true)
+            .default_width(260.0)
+            .width_range(200.0..=350.0)
+            .frame(theme::panel_frame())
             .show(ctx, |ui| {
-                ui.add_space(2.0);
-                // Search input box with rounded corner and clean inset border
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(12, 14, 18))
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(48, 54, 61)))
-                    .rounding(5.0)
-                    .inner_margin(egui::Margin::symmetric(8.0, 5.0))
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("🔍").size(12.0).color(Color32::from_rgb(130, 140, 155)));
-                            let edit = egui::TextEdit::singleline(&mut self.search_query)
-                                .hint_text("Search parameters...")
-                                .frame(false)
-                                .desired_width(ui.available_width());
-                            ui.add(edit);
-                        });
-                    });
+                        ui.set_min_width(ui.available_width());
+                        ui.add_space(2.0);
+                        egui::Frame::none()
+                            .fill(theme::BG_FILL)
+                            .stroke(Stroke::new(1.0, STROKE))
+                            .rounding(egui::Rounding::same(4.0))
+                            .inner_margin(egui::Margin::symmetric(8.0, 5.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("🔍").size(12.0).color(MUTED));
+                                    let edit = egui::TextEdit::singleline(&mut self.search_query)
+                                        .hint_text("Search parameters...")
+                                        .frame(false)
+                                        .desired_width(ui.available_width());
+                                    ui.add(edit);
+                                });
+                            });
 
-                ui.add_space(6.0);
-                ui.separator();
-                ui.add_space(4.0);
-                ui.heading(egui::RichText::new("Calibration Tables").size(13.0).color(Color32::from_rgb(160, 175, 195)));
-                ui.add_space(4.0);
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.add_space(4.0);
 
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (idx, table) in self.xdf.tables.iter().enumerate() {
-                        if !self.search_query.is_empty()
-                            && !table.title.to_lowercase().contains(&self.search_query.to_lowercase())
-                        {
-                            continue;
-                        }
+                        egui::ScrollArea::both()
+                            .id_salt("param_tree_inner")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.heading(
+                                    egui::RichText::new("Calibration Tables").size(13.0).color(MUTED),
+                                );
+                                ui.add_space(4.0);
 
-                        let is_selected = self.selected_table_idx == idx;
-                        let badge = if table.y_axis.dim > 1 { "[3D]" } else { "[2D]" };
+                                for (idx, table) in self.xdf.tables.iter().enumerate() {
+                                    if !self.search_query.is_empty()
+                                        && !table
+                                            .title
+                                            .to_lowercase()
+                                            .contains(&self.search_query.to_lowercase())
+                                    {
+                                        continue;
+                                    }
 
-                        // 30px row height for breathing room
-                        ui.allocate_ui(Vec2::new(ui.available_width(), 30.0), |ui| {
-                            ui.horizontal_centered(|ui| {
-                                ui.add_space(2.0);
-                                ui.label(egui::RichText::new(badge).strong().color(Color32::from_rgb(0, 229, 255)));
-                                let title_color = if is_selected { Color32::WHITE } else { Color32::from_rgb(200, 210, 225) };
-                                if ui.selectable_label(is_selected, egui::RichText::new(&table.title).color(title_color)).clicked() {
-                                    self.selected_table_idx = idx;
-                                    self.active_cell = (0, 0);
+                                    let is_selected = self.selected_table_idx == idx;
+                                    let badge = if table.y_axis.dim > 1 { "[3D]" } else { "[2D]" };
+
+                                    ui.allocate_ui(Vec2::new(ui.available_width(), 30.0), |ui| {
+                                        ui.horizontal_centered(|ui| {
+                                            ui.add_space(2.0);
+                                            ui.label(
+                                                egui::RichText::new(badge).strong().color(ACCENT_CYAN),
+                                            );
+                                            let title_color = if is_selected { TEXT } else { MUTED };
+                                            if ui
+                                                .selectable_label(
+                                                    is_selected,
+                                                    egui::RichText::new(&table.title).color(title_color),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.selected_table_idx = idx;
+                                                self.active_cell = (0, 0);
+                                            }
+                                        });
+                                    });
+                                }
+
+                                ui.add_space(8.0);
+                                ui.separator();
+                                ui.add_space(4.0);
+                                ui.heading(
+                                    egui::RichText::new("Scalar Constants").size(13.0).color(MUTED),
+                                );
+                                ui.add_space(4.0);
+                                for c in &self.xdf.constants {
+                                    ui.allocate_ui(Vec2::new(ui.available_width(), 28.0), |ui| {
+                                        ui.horizontal_centered(|ui| {
+                                            ui.add_space(2.0);
+                                            ui.label(
+                                                egui::RichText::new("[1D]")
+                                                    .strong()
+                                                    .color(Color32::from_rgb(255, 193, 7)),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "{}: {:.0} {}",
+                                                    c.title, c.value, c.units
+                                                ))
+                                                .color(TEXT),
+                                            );
+                                        });
+                                    });
                                 }
                             });
-                        });
-                    }
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(4.0);
-                    ui.heading(egui::RichText::new("Scalar Constants").size(13.0).color(Color32::from_rgb(160, 175, 195)));
-                    ui.add_space(4.0);
-                    for c in &self.xdf.constants {
-                        ui.allocate_ui(Vec2::new(ui.available_width(), 28.0), |ui| {
-                            ui.horizontal_centered(|ui| {
-                                ui.add_space(2.0);
-                                ui.label(egui::RichText::new("[1D]").strong().color(Color32::from_rgb(255, 193, 7)));
-                                ui.label(
-                                    egui::RichText::new(format!("{}: {:.0} {}", c.title, c.value, c.units))
-                                        .color(Color32::from_rgb(220, 225, 230)),
-                                );
-                            });
-                        });
-                    }
-                });
+                    });
             });
 
         // Right 3D Isometric Surface Mesh
         egui::SidePanel::right("surface_mesh_panel")
-            .min_width(340.0)
-            .max_width(460.0)
-            .frame(
-                egui::Frame::none()
-                    .fill(Color32::from_rgb(18, 21, 25))
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(48, 54, 61)))
-                    .inner_margin(egui::Margin::symmetric(12.0, 10.0)),
-            )
+            .resizable(true)
+            .default_width(260.0)
+            .width_range(200.0..=350.0)
+            .frame(theme::panel_frame())
             .show(ctx, |ui| {
-                ui.heading(egui::RichText::new("3D Surface Visualizer").size(14.0).color(Color32::from_rgb(0, 229, 255)));
-                ui.label(egui::RichText::new("Drag mouse to rotate pitch & yaw").small().color(Color32::GRAY));
+                ui.heading(egui::RichText::new("3D Surface Mesh").size(14.0).color(ACCENT_CYAN));
+                ui.label(egui::RichText::new("Drag to rotate pitch & yaw").small().color(MUTED));
                 ui.add_space(4.0);
 
-                let (response, painter) = ui.allocate_painter(Vec2::new(ui.available_width(), 310.0), egui::Sense::drag());
+                let avail = ui.available_size();
+                let telemetry_reserve = 128.0;
+                let mesh_size = Vec2::new(
+                    avail.x.max(120.0),
+                    (avail.y - telemetry_reserve).max(140.0),
+                );
+                let (response, painter) =
+                    ui.allocate_painter(mesh_size, egui::Sense::drag());
                 if response.dragged() {
                     self.mesh_yaw += response.drag_delta().x * 0.01;
                     self.mesh_pitch = (self.mesh_pitch + response.drag_delta().y * 0.01).clamp(0.1, 1.4);
                 }
 
-                self.render_3d_mesh(&painter, response.rect);
+                if !self.xdf.tables.is_empty() {
+                    let table = &self.xdf.tables[self.selected_table_idx];
+                    surface_mesh::paint_surface_mesh(
+                        &painter,
+                        response.rect,
+                        table,
+                        self.mesh_yaw,
+                        self.mesh_pitch,
+                        self.active_cell,
+                    );
+                } else {
+                    painter.rect_filled(response.rect, 4.0, theme::BG_FILL);
+                }
 
-                ui.add_space(12.0);
+                ui.add_space(8.0);
 
                 // Telemetry card styling: #11151C background, 1px #30363D border, bright cyan #00E5FF numbers
                 egui::Frame::none()
-                    .fill(Color32::from_rgb(17, 21, 28)) // #11151C
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(48, 54, 61))) // #30363D
-                    .rounding(6.0)
+                    .fill(CARD_FILL)
+                    .stroke(Stroke::new(1.0, STROKE))
+                    .rounding(egui::Rounding::same(4.0))
                     .inner_margin(egui::Margin::symmetric(12.0, 10.0))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
@@ -568,85 +556,111 @@ impl WidebandApp {
                                 egui::RichText::new("LIVE CELL TELEMETRY TRACKING")
                                     .small()
                                     .strong()
-                                    .color(Color32::from_rgb(140, 150, 165)),
+                                    .color(MUTED),
                             );
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(egui::RichText::new("● LIVE").small().strong().color(Color32::from_rgb(0, 230, 118)));
+                                ui.label(egui::RichText::new("● LIVE").small().strong().color(EMERALD));
                             });
                         });
                         ui.add_space(6.0);
 
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Engine RPM:").color(Color32::from_rgb(200, 210, 225)));
+                            ui.label(egui::RichText::new("Engine RPM:").color(MUTED));
                             ui.label(
                                 egui::RichText::new(format!("{:.0}", self.trace_rpm))
                                     .monospace()
                                     .strong()
-                                    .color(Color32::from_rgb(0, 229, 255)),
+                                    .color(ACCENT_CYAN),
                             );
                             ui.add_space(10.0);
-                            ui.label(egui::RichText::new("MAP:").color(Color32::from_rgb(200, 210, 225)));
+                            ui.label(egui::RichText::new("MAP:").color(MUTED));
                             ui.label(
                                 egui::RichText::new(format!("{:.1} kPa", self.trace_map))
                                     .monospace()
                                     .strong()
-                                    .color(Color32::from_rgb(0, 229, 255)),
+                                    .color(ACCENT_CYAN),
                             );
                         });
                         ui.add_space(4.0);
 
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Active Tracked Cell:").color(Color32::from_rgb(200, 210, 225)));
+                            ui.label(egui::RichText::new("Active Tracked Cell:").color(MUTED));
                             ui.label(
                                 egui::RichText::new(format!("Row {}, Col {}", self.active_cell.0, self.active_cell.1))
                                     .monospace()
                                     .strong()
-                                    .color(Color32::from_rgb(0, 229, 255)),
+                                    .color(ACCENT_CYAN),
                             );
                         });
                     });
             });
 
         // Center Heatmap Table Grid
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if self.xdf.tables.is_empty() {
-                ui.label("No calibration tables loaded.");
-                return;
-            }
+        egui::CentralPanel::default()
+            .frame(theme::panel_frame())
+            .show(ctx, |ui| {
+                if self.xdf.tables.is_empty() {
+                    ui.label(egui::RichText::new("No calibration tables loaded.").color(MUTED));
+                    return;
+                }
 
-            let table_title = self.xdf.tables[self.selected_table_idx].title.clone();
-            let table_desc = self.xdf.tables[self.selected_table_idx].description.clone();
-            let z_units = self.xdf.tables[self.selected_table_idx].z_units.clone();
+                let table_title = self.xdf.tables[self.selected_table_idx].title.clone();
+                let table_desc = self.xdf.tables[self.selected_table_idx].description.clone();
+                let z_units = self.xdf.tables[self.selected_table_idx].z_units.clone();
 
-            ui.horizontal(|ui| {
-                ui.heading(egui::RichText::new(&table_title).size(16.0).color(Color32::WHITE));
-                ui.label(egui::RichText::new(format!("({})", z_units)).color(Color32::from_rgb(0, 229, 255)));
-            });
-            ui.label(egui::RichText::new(&table_desc).small().color(Color32::from_rgb(140, 150, 165)));
-            ui.add_space(4.0);
-
-            // 1px subtle horizontal rule separator between title/desc and math toolbar
-            ui.separator();
-            ui.add_space(4.0);
-
-            // Table Math Toolbar
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Math Step:").strong());
-                ui.add(egui::DragValue::new(&mut self.math_amount).speed(0.5).range(0.1..=100.0));
-
-                if ui.button("  +  ").clicked() { self.run_table_math('+'); }
-                if ui.button("  -  ").clicked() { self.run_table_math('-'); }
-                if ui.button("  *  ").clicked() { self.run_table_math('*'); }
-                if ui.button("  =  ").clicked() { self.run_table_math('='); }
+                ui.horizontal(|ui| {
+                    ui.heading(egui::RichText::new(&table_title).size(16.0).color(TEXT));
+                    ui.label(egui::RichText::new(format!("({})", z_units)).color(ACCENT_CYAN));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let ck_color = if self.checksum_status.contains("Valid") {
+                            EMERALD
+                        } else {
+                            Color32::from_rgb(0xF5, 0x88, 0x36)
+                        };
+                        ui.label(egui::RichText::new(&self.checksum_status).size(11.0).color(ck_color).strong());
+                    });
+                });
+                ui.label(egui::RichText::new(&table_desc).small().color(MUTED));
+                ui.add_space(4.0);
                 ui.separator();
-                if ui.button("Interpolate Row").clicked() { self.interpolate_active_row(); }
-                if ui.button("Smooth 3D").clicked() { self.smooth_table(); }
-            });
-            ui.add_space(8.0);
+                ui.add_space(6.0);
 
-            // Render TableBuilder Grid
-            self.render_table_grid(ui);
-        });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Math Step:").strong().color(TEXT));
+                    ui.add(egui::DragValue::new(&mut self.math_amount).speed(0.5).range(0.1..=100.0));
+
+                    if ui.button("  +  ").clicked() {
+                        self.run_table_math('+');
+                    }
+                    if ui.button("  -  ").clicked() {
+                        self.run_table_math('-');
+                    }
+                    if ui.button("  %  ").clicked() {
+                        self.run_table_math('%');
+                    }
+                    if ui.button("  =  ").clicked() {
+                        self.run_table_math('=');
+                    }
+                    if ui.button("Interpolate Row").clicked() {
+                        self.interpolate_active_row();
+                    }
+                    if ui.button("Smooth 3D").clicked() {
+                        self.smooth_table();
+                    }
+                });
+                ui.add_space(8.0);
+
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        egui::ScrollArea::both()
+                            .id_salt("tune_grid_inner")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                self.render_table_grid(ui);
+                            });
+                    });
+            });
     }
 
     fn render_table_grid(&mut self, ui: &mut egui::Ui) {
@@ -675,14 +689,23 @@ impl WidebandApp {
             .columns(Column::initial(70.0).resizable(true), num_cols);
 
         table_builder
-            .header(26.0, |mut header| {
+            .header(28.0, |mut header| {
                 header.col(|ui| {
-                    ui.label(egui::RichText::new(format!("Y / X")).strong().color(Color32::from_rgb(140, 160, 185)));
+                    let rect = ui.max_rect();
+                    ui.painter().rect_filled(rect, 0.0, theme::TABLE_HEADER);
+                    ui.label(egui::RichText::new("Y / X").strong().monospace().color(MUTED));
                 });
                 for c in 0..cols {
                     let lbl = if c < x_labels.len() { x_labels[c] } else { (c * 500) as f64 };
                     header.col(|ui| {
-                        ui.label(egui::RichText::new(format!("{:>6.0}", lbl)).monospace().strong().color(Color32::from_rgb(0, 229, 255)));
+                        let rect = ui.max_rect();
+                        ui.painter().rect_filled(rect, 0.0, theme::TABLE_HEADER);
+                        ui.label(
+                            egui::RichText::new(format!("{:>6.0}", lbl))
+                                .monospace()
+                                .strong()
+                                .color(ACCENT_CYAN),
+                        );
                     });
                 }
             })
@@ -692,7 +715,14 @@ impl WidebandApp {
                         // Y-Axis Row Header
                         let y_lbl = if r < y_labels.len() { y_labels[r] } else { (r * 10) as f64 };
                         row.col(|ui| {
-                            ui.label(egui::RichText::new(format!("{:>5.0}", y_lbl)).monospace().strong().color(Color32::from_rgb(0, 229, 255)));
+                            let rect = ui.max_rect();
+                            ui.painter().rect_filled(rect, 0.0, theme::TABLE_HEADER);
+                            ui.label(
+                                egui::RichText::new(format!("{:>5.0}", y_lbl))
+                                    .monospace()
+                                    .strong()
+                                    .color(ACCENT_CYAN),
+                            );
                         });
 
                         // Cell values with Heatmap color + Gold delta
@@ -703,22 +733,16 @@ impl WidebandApp {
                             let is_tracked = self.active_cell == (r, c);
 
                             let bg_color = heatmap_color(val, min_val, max_val);
-                            let text_color = if bg_color.r() > 180 && bg_color.g() > 180 {
-                                Color32::BLACK
-                            } else {
-                                Color32::WHITE
-                            };
+                            let text_color = Color32::from_rgb(0xFF, 0xFF, 0xFF);
 
                             row.col(|ui| {
                                 let rect = ui.available_rect_before_wrap();
                                 let painter = ui.painter();
 
-                                // Fill heatmap cell
                                 painter.rect_filled(rect, 2.0, bg_color);
 
-                                // If tracked by live telemetry: glowing cyan border
                                 if is_tracked {
-                                    painter.rect_stroke(rect, 2.0, Stroke::new(2.5_f32, Color32::from_rgb(0, 229, 255)));
+                                    paint_live_cell_glow(painter, rect);
                                 }
 
                                 // If delta from stock: draw small bold gold indicator
@@ -741,83 +765,6 @@ impl WidebandApp {
             });
     }
 
-    fn render_3d_mesh(&self, painter: &egui::Painter, rect: Rect) {
-        painter.rect_filled(rect, 4.0, Color32::from_rgb(14, 16, 20));
-        painter.rect_stroke(rect, 4.0, Stroke::new(1.0_f32, Color32::from_rgb(34, 40, 50)));
-
-        if self.xdf.tables.is_empty() {
-            return;
-        }
-
-        let table = &self.xdf.tables[self.selected_table_idx];
-        let rows = table.values.len();
-        let cols = table.values[0].len();
-
-        let mut min_val = f64::MAX;
-        let mut max_val = f64::MIN;
-        for r in 0..rows {
-            for c in 0..cols {
-                min_val = min_val.min(table.values[r][c]);
-                max_val = max_val.max(table.values[r][c]);
-            }
-        }
-
-        let center = rect.center();
-        let scale_x = (rect.width() * 0.35) / cols as f32;
-        let scale_y = (rect.height() * 0.35) / rows as f32;
-        let z_height = 80.0;
-
-        let cos_yaw = self.mesh_yaw.cos();
-        let sin_yaw = self.mesh_yaw.sin();
-        let cos_pitch = self.mesh_pitch.cos();
-        let sin_pitch = self.mesh_pitch.sin();
-
-        let project = |r: usize, c: usize| -> (Pos2, Color32) {
-            let x0 = (c as f32 - cols as f32 * 0.5) * scale_x;
-            let y0 = (r as f32 - rows as f32 * 0.5) * scale_y;
-            let val = table.values[r][c];
-            let norm_z = if max_val > min_val {
-                ((val - min_val) / (max_val - min_val)) as f32
-            } else {
-                0.5
-            };
-            let z0 = (norm_z - 0.5) * z_height;
-
-            // 3D rotation: Yaw around Z, Pitch around X
-            let rx = x0 * cos_yaw - y0 * sin_yaw;
-            let ry = x0 * sin_yaw + y0 * cos_yaw;
-            let rz = z0 * cos_pitch - ry * sin_pitch;
-
-            let screen_pos = Pos2::new(center.x + rx, center.y - rz);
-            let color = heatmap_color(val, min_val, max_val);
-            (screen_pos, color)
-        };
-
-        // Render quads and wireframe lines
-        for r in 0..rows - 1 {
-            for c in 0..cols - 1 {
-                let (p00, c00) = project(r, c);
-                let (p10, _) = project(r + 1, c);
-                let (p11, _) = project(r + 1, c + 1);
-                let (p01, _) = project(r, c + 1);
-
-                // Quad fill
-                painter.add(egui::Shape::convex_polygon(
-                    vec![p00, p10, p11, p01],
-                    Color32::from_rgba_unmultiplied(c00.r(), c00.g(), c00.b(), 180),
-                    Stroke::new(1.0_f32, Color32::from_rgb(20, 24, 30)),
-                ));
-            }
-        }
-
-        // Highlight active cell marker on 3D surface
-        let (r_active, c_active) = self.active_cell;
-        if r_active < rows && c_active < cols {
-            let (pos, _) = project(r_active, c_active);
-            painter.circle_filled(pos, 5.0, Color32::from_rgb(0, 229, 255));
-            painter.circle_stroke(pos, 8.0, Stroke::new(2.0_f32, Color32::WHITE));
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -2,6 +2,8 @@ pub mod definitions;
 pub mod j2534;
 pub mod protocols;
 pub mod telemetry;
+pub mod surface_mesh;
+pub mod theme;
 pub mod ui;
 
 use eframe::egui;
@@ -19,7 +21,10 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Wideband Motorsport Studio",
         native_options,
-        Box::new(|cc| Ok(Box::new(WidebandApp::new(cc)))),
+        Box::new(|cc| {
+            theme::apply_motorsport_theme(&cc.egui_ctx);
+            Ok(Box::new(WidebandApp::new(cc)))
+        }),
     )
 }
 
