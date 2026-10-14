@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "id": "sample-launch-bias",
+  "title": "Sample: launch flag + VE trim",
+  "description": "Declarative EROM-style recipe (no code). Preview diff before applying to active ROM.",
+  "operations": [
+    {
+      "kind": "flag_set",
+      "flag_id": "flag_launch_control",
+      "value": true
+    },
+    {
+      "kind": "table_offset_percent",
+      "table_id": "ve_main",
+      "percent": 1.5
+    }
+  ]
+}
