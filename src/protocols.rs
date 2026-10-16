@@ -371,14 +371,63 @@ impl IsoTpLink {
 #[derive(Clone, Debug, Default)]
 pub struct EcuIdentification {
     pub vin: String,
+    /// Every calibration ID the ECU reported, joined with ", " (Toyota ECMs often report two).
     pub cal_id: String,
+    /// Every CVN the ECU reported as hex, joined with ", ".
     pub cvn: String,
+    pub cal_ids: Vec<String>,
+    pub cvns: Vec<String>,
     pub details: String,
+}
+
+/// Printable text of one Mode 09 / DID string field: NUL and 0xFF padding and whitespace removed.
+pub fn clean_id_text(bytes: &[u8]) -> String {
+    let text: String = bytes
+        .iter()
+        .filter(|b| b.is_ascii_graphic() || **b == b' ')
+        .map(|b| *b as char)
+        .collect();
+    text.trim().to_string()
+}
+
+/// Splits an OBD Mode 09 response (`49 <pid> <count> <data>`) into its items.
+/// On ISO 15765 each Cal ID is 16 bytes and each CVN 4 bytes; when the data length does not
+/// match `count * item_len` the whole remainder is treated as one item.
+pub fn split_mode09_items(resp: &[u8], pid: u8, item_len: usize) -> Vec<Vec<u8>> {
+    if resp.len() < 4 || resp[0] != 0x49 || resp[1] != pid || item_len == 0 {
+        return Vec::new();
+    }
+    let count = resp[2] as usize;
+    let data = &resp[3..];
+    if count > 1 && data.len() == count * item_len {
+        data.chunks(item_len).map(|c| c.to_vec()).collect()
+    } else {
+        vec![data.to_vec()]
+    }
+}
+
+pub fn parse_mode09_cal_ids(resp: &[u8]) -> Vec<String> {
+    split_mode09_items(resp, 0x04, 16)
+        .iter()
+        .map(|item| clean_id_text(item))
+        .filter(|id| !id.is_empty())
+        .collect()
+}
+
+pub fn parse_mode09_cvns(resp: &[u8]) -> Vec<String> {
+    split_mode09_items(resp, 0x06, 4)
+        .iter()
+        .map(|item| item.iter().map(|b| format!("{:02X}", b)).collect::<String>())
+        .filter(|cvn| !cvn.is_empty())
+        .collect()
 }
 
 pub struct EcuIdentifier;
 
 impl EcuIdentifier {
+    /// Reads VIN, every Cal ID, and every CVN. The OBD Mode 09 requests come first because every
+    /// OBD-II engine ECU must answer them; the UDS identifiers are a fallback. A field the ECU does
+    /// not answer is listed in `details`; the call fails only when nothing at all was read.
     /// When `allow_demo_defaults` is true (Virtual ECU bench only), missing fields are filled with demo values.
     pub fn query(
         device: &mut dyn PassThruDevice,
@@ -388,60 +437,68 @@ impl EcuIdentifier {
     ) -> Result<EcuIdentification, String> {
         let mut id = EcuIdentification::default();
         let mut field_errors: Vec<String> = Vec::new();
+        let uds = profile.diagnostic == DiagnosticProtocol::Uds;
 
         let mut client = UdsClient::for_profile(device, channel, profile);
 
-        // 1. VIN: OBD Mode 09 02 or UDS 22 F1 90
-        let vin_req = if profile.diagnostic == DiagnosticProtocol::Kwp {
-            vec![0x09, 0x02]
-        } else {
-            vec![0x22, 0xF1, 0x90]
-        };
-        let vin_positive = if profile.diagnostic == DiagnosticProtocol::Kwp {
-            0x49
-        } else {
-            0x62
-        };
-        match client.request(device, &vin_req, vin_positive) {
-            Ok(resp) if resp.len() >= 4 => {
-                id.vin = String::from_utf8_lossy(&resp[3..]).trim().to_string();
+        // 1. VIN: OBD Mode 09 02, then UDS 22 F1 90
+        let mut vin_error = String::new();
+        match client.request(device, &[0x09, 0x02], 0x49) {
+            Ok(resp) if resp.len() >= 4 => id.vin = clean_id_text(&resp[3..]),
+            Ok(_) => vin_error = "Mode 09 response too short".to_string(),
+            Err(e) => vin_error = format!("Mode 09: {}", e),
+        }
+        if id.vin.is_empty() && uds {
+            match client.request(device, &[0x22, 0xF1, 0x90], 0x62) {
+                Ok(resp) if resp.len() >= 4 => id.vin = clean_id_text(&resp[3..]),
+                Ok(_) => vin_error = format!("{}; DID F190 response too short", vin_error),
+                Err(e) => vin_error = format!("{}; DID F190: {}", vin_error, e),
             }
-            Ok(_) => field_errors.push("VIN: ECU response too short".to_string()),
-            Err(e) => field_errors.push(format!("VIN: {}", e)),
+        }
+        if id.vin.is_empty() {
+            field_errors.push(format!("VIN: {}", vin_error));
         }
 
-        // 2. Cal ID
-        let cal_req = if profile.diagnostic == DiagnosticProtocol::Kwp {
-            vec![0x09, 0x04]
-        } else if profile.platform.contains("Toyota") {
-            vec![0x22, 0xF1, 0x81]
-        } else {
-            vec![0x22, 0x00, 0xC1]
-        };
-        let cal_positive = if profile.diagnostic == DiagnosticProtocol::Kwp {
-            0x49
-        } else {
-            0x62
-        };
-        match client.request(device, &cal_req, cal_positive) {
-            Ok(resp) if resp.len() >= 4 => {
-                id.cal_id = String::from_utf8_lossy(&resp[3..]).trim().to_string();
+        // 2. Cal IDs: OBD Mode 09 04, then the platform DID
+        let mut cal_error = String::new();
+        match client.request(device, &[0x09, 0x04], 0x49) {
+            Ok(resp) => {
+                id.cal_ids = parse_mode09_cal_ids(&resp);
+                if id.cal_ids.is_empty() {
+                    cal_error = "Mode 09 response had no calibration ID".to_string();
+                }
             }
-            Ok(_) => field_errors.push("Calibration ID: ECU response too short".to_string()),
-            Err(e) => field_errors.push(format!("Calibration ID: {}", e)),
+            Err(e) => cal_error = format!("Mode 09: {}", e),
+        }
+        if id.cal_ids.is_empty() && uds {
+            let did_req = if profile.platform.contains("Toyota") {
+                vec![0x22, 0xF1, 0x81]
+            } else {
+                vec![0x22, 0x00, 0xC1]
+            };
+            match client.request(device, &did_req, 0x62) {
+                Ok(resp) if resp.len() >= 4 => {
+                    let cal = clean_id_text(&resp[3..]);
+                    if !cal.is_empty() {
+                        id.cal_ids.push(cal);
+                    }
+                }
+                Ok(_) => cal_error = format!("{}; DID response too short", cal_error),
+                Err(e) => cal_error = format!("{}; DID: {}", cal_error, e),
+            }
+        }
+        if id.cal_ids.is_empty() {
+            field_errors.push(format!("Calibration ID: {}", cal_error));
         }
 
-        // 3. CVN (OBD Mode 09 06)
-        let cvn_req = vec![0x09, 0x06];
-        match client.request(device, &cvn_req, 0x49) {
-            Ok(resp) if resp.len() >= 4 => {
-                id.cvn = resp[3..]
-                    .iter()
-                    .map(|b| format!("{:02X}", b))
-                    .collect::<Vec<_>>()
-                    .join("");
+        // 3. CVNs: OBD Mode 09 06
+        match client.request(device, &[0x09, 0x06], 0x49) {
+            Ok(resp) => {
+                id.cvns = parse_mode09_cvns(&resp);
+                if id.cvns.is_empty() {
+                    field_errors.push("CVN: Mode 09 response had no CVN".to_string());
+                }
             }
-            Ok(_) => field_errors.push("CVN: ECU response too short".to_string()),
             Err(e) => field_errors.push(format!("CVN: {}", e)),
         }
 
@@ -449,26 +506,30 @@ impl EcuIdentifier {
             if id.vin.is_empty() {
                 id.vin = crate::j2534::VIRTUAL_TACOMA_VIN.to_string();
             }
-            if id.cal_id.is_empty() {
-                id.cal_id = crate::j2534::VIRTUAL_TACOMA_CAL_ID.to_string();
+            if id.cal_ids.is_empty() {
+                id.cal_ids.push(crate::j2534::VIRTUAL_TACOMA_CAL_ID.to_string());
             }
-            if id.cvn.is_empty() {
-                id.cvn = crate::j2534::VIRTUAL_TACOMA_CVN_HEX.to_string();
+            if id.cvns.is_empty() {
+                id.cvns.push(crate::j2534::VIRTUAL_TACOMA_CVN_HEX.to_string());
             }
-        } else if !field_errors.is_empty() {
-            return Err(field_errors.join("; "));
-        } else if id.vin.is_empty() && id.cal_id.is_empty() && id.cvn.is_empty() {
-            return Err(
-                "ECU did not respond to identification (ignition ON, Tacoma 2009+ CAN profile, and bus traffic required)."
-                    .to_string(),
-            );
-        } else if id.vin.contains("VIRT") || id.cal_id.contains("VIRT") {
+            field_errors.clear();
+        } else if id.vin.is_empty() && id.cal_ids.is_empty() && id.cvns.is_empty() {
+            let mut message =
+                "ECU did not respond to identification (ignition ON, matching profile, and bus traffic required)."
+                    .to_string();
+            if !field_errors.is_empty() {
+                message = format!("{} {}", message, field_errors.join("; "));
+            }
+            return Err(message);
+        } else if id.vin.contains("VIRT") || id.cal_ids.iter().any(|c| c.contains("VIRT")) {
             return Err(
                 "Identification looks like Virtual ECU bench data (VIRT markers). Select your Mini-VCI/VXDIAG device, not Virtual ECU."
                     .to_string(),
             );
         }
 
+        id.cal_id = id.cal_ids.join(", ");
+        id.cvn = id.cvns.join(", ");
         id.details = format!(
             "ECU Identification: VIN: {}, Cal ID: {}, CVN: {} [{}]",
             if id.vin.is_empty() { "(none)" } else { &id.vin },
@@ -476,6 +537,9 @@ impl EcuIdentifier {
             if id.cvn.is_empty() { "(none)" } else { &id.cvn },
             profile.name
         );
+        if !field_errors.is_empty() {
+            id.details = format!("{} — not read: {}", id.details, field_errors.join("; "));
+        }
 
         Ok(id)
     }

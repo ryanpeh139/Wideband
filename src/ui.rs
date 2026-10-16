@@ -10,6 +10,10 @@ use crate::diagnostics::{
 };
 use crate::flash_job::FlashJob;
 use crate::flash_layout::FlashLayoutMap;
+use crate::ecu_update::{
+    check_update_file, compare_snapshots, readiness, CheckLevel, PayloadKind, UpdateComparison,
+    UpdateFileCheck, UpdateSnapshot,
+};
 use crate::j2534::{connect_for_profile, PassThruDevice, READ_VBATT};
 use crate::transport::{TransportAvailability, TransportDevice, TransportRegistry};
 use crate::protocols::{EcuIdentification, EcuIdentifier, EcuProfile};
@@ -153,6 +157,13 @@ pub struct WidebandApp {
     pub connection_last_error: String,
     pub header_vbatt: Option<f32>,
 
+    // Toyota update assistant (Techstream / TIS hand-off)
+    pub update_before: Option<UpdateSnapshot>,
+    pub update_file_check: Option<UpdateFileCheck>,
+    pub update_file_name: String,
+    pub update_expected_cal: String,
+    pub update_result: Option<UpdateComparison>,
+
     // TCM (paired with ECM profile)
     pub tcm_profiles: Vec<TcmProfile>,
     pub selected_tcm_profile_idx: usize,
@@ -287,6 +298,11 @@ impl WidebandApp {
             diag_last_error: String::new(),
             connection_last_error: String::new(),
             header_vbatt: None,
+            update_before: UpdateSnapshot::load(&UpdateSnapshot::default_before_path()).ok(),
+            update_file_check: None,
+            update_file_name: String::new(),
+            update_expected_cal: String::new(),
+            update_result: None,
             tcm_profiles,
             selected_tcm_profile_idx: 0,
             tcm_id: EcuIdentification::default(),
@@ -2950,6 +2966,242 @@ impl WidebandApp {
 }
 
 // ---------------------------------------------------------------------------
+// Toyota update assistant: record before, check the update file, hand the cable
+// to Techstream, verify after. Read-only; Toyota's software performs the update.
+// ---------------------------------------------------------------------------
+
+fn check_level_color(level: CheckLevel) -> Color32 {
+    match level {
+        CheckLevel::Pass => EMERALD,
+        CheckLevel::Warn => Color32::from_rgb(255, 193, 7),
+        CheckLevel::Fail => Color32::from_rgb(255, 82, 82),
+    }
+}
+
+fn check_level_mark(level: CheckLevel) -> &'static str {
+    match level {
+        CheckLevel::Pass => "✔",
+        CheckLevel::Warn => "⚠",
+        CheckLevel::Fail => "✖",
+    }
+}
+
+impl WidebandApp {
+    /// Identifies the ECU, refreshes battery voltage, and returns a snapshot for `stage`.
+    fn capture_update_snapshot(&mut self, stage: &str) -> Option<UpdateSnapshot> {
+        let prof = self.profiles[self.selected_profile_idx].clone();
+        let allow_demo = self.active_device_virtual;
+        let device_name = self.devices[self.selected_device_idx].list_label();
+        let (result, vbatt) = match self.active_device.as_mut() {
+            Some(dev) => {
+                let channel = dev.channel_id();
+                let result = EcuIdentifier::query(dev.as_mut(), channel, &prof, allow_demo);
+                let vbatt = read_pass_thru_vbatt(dev.as_mut(), channel);
+                (result, vbatt)
+            }
+            None => {
+                self.log("Update assistant: connect the cable first.");
+                return None;
+            }
+        };
+        if vbatt.is_some() {
+            self.header_vbatt = vbatt;
+        }
+        match result {
+            Ok(id) => {
+                self.log(&id.details);
+                let snapshot = UpdateSnapshot::capture(stage, &id, &prof.id, &device_name, self.header_vbatt);
+                self.ecu_id = id;
+                if let Err(e) = snapshot.append_history(&UpdateSnapshot::history_path()) {
+                    self.log(&format!("Update assistant: {}", e));
+                }
+                Some(snapshot)
+            }
+            Err(e) => {
+                self.log(&format!("ECU identification failed: {}", e));
+                None
+            }
+        }
+    }
+
+    fn render_update_assistant(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.heading("Toyota Update Assistant (Techstream / TIS)");
+            ui.label(
+                egui::RichText::new(
+                    "Toyota's own software installs calibration updates. Wideband records the ECU before, checks the update file against your Cal ID, hands the cable to Techstream, and confirms the new Cal ID after. Nothing here writes to the ECU.",
+                )
+                .small()
+                .color(MUTED),
+            );
+            ui.add_space(6.0);
+
+            // Step 1: record before
+            ui.label(egui::RichText::new("1. Record the ECU before the update").strong());
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Record ECU (before)").clicked() {
+                    if let Some(snapshot) = self.capture_update_snapshot("before") {
+                        match snapshot.save(&UpdateSnapshot::default_before_path()) {
+                            Ok(()) => self.log(&format!(
+                                "Update assistant: before-update record saved to {} (Cal ID {}).",
+                                UpdateSnapshot::default_before_path().display(),
+                                snapshot.cal_ids.join(", ")
+                            )),
+                            Err(e) => self.log(&format!("Update assistant: {}", e)),
+                        }
+                        self.update_before = Some(snapshot);
+                        self.update_result = None;
+                    }
+                }
+                match &self.update_before {
+                    Some(b) => ui.label(
+                        egui::RichText::new(format!(
+                            "Recorded {} — Cal ID {}",
+                            b.taken_at.get(..19).unwrap_or(&b.taken_at).replace('T', " "),
+                            if b.cal_ids.is_empty() { "(none)".to_string() } else { b.cal_ids.join(", ") }
+                        ))
+                        .small()
+                        .color(TEXT),
+                    ),
+                    None => ui.label(egui::RichText::new("No before-update record yet.").small().color(MUTED)),
+                };
+            });
+            let cable_label = if self.is_connected {
+                self.devices[self.selected_device_idx].list_label()
+            } else {
+                String::new()
+            };
+            if self.is_connected {
+                for item in readiness(&self.ecu_id, self.header_vbatt, &cable_label) {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{} {}", check_level_mark(item.level), item.label))
+                                .color(check_level_color(item.level)),
+                        );
+                        ui.label(egui::RichText::new(&item.detail).small().color(MUTED));
+                    });
+                }
+            }
+            ui.add_space(6.0);
+
+            // Step 2: check update file
+            ui.label(egui::RichText::new("2. Check the update file").strong());
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Check update file (.cuw)…").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Toyota calibration update", &["cuw", "CUW"])
+                        .add_filter("All files", &["*"])
+                        .pick_file()
+                    {
+                        match fs::read(&path) {
+                            Ok(bytes) => {
+                                let cal_ids = if !self.ecu_id.cal_ids.is_empty() {
+                                    self.ecu_id.cal_ids.clone()
+                                } else {
+                                    self.update_before.as_ref().map(|b| b.cal_ids.clone()).unwrap_or_default()
+                                };
+                                let check = check_update_file(&bytes, &cal_ids);
+                                self.update_file_name = path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                self.log(&format!("Update file {}: {}", self.update_file_name, check.summary));
+                                self.update_file_check = Some(check);
+                            }
+                            Err(e) => self.log(&format!("Failed to read update file: {}", e)),
+                        }
+                    }
+                }
+                if !self.update_file_name.is_empty() {
+                    ui.label(egui::RichText::new(&self.update_file_name).small().color(TEXT));
+                }
+            });
+            if let Some(check) = &self.update_file_check {
+                ui.label(
+                    egui::RichText::new(format!("{} {}", check_level_mark(check.verdict), check.summary))
+                        .color(check_level_color(check.verdict)),
+                );
+                let payload = match check.payload {
+                    PayloadKind::SRecords => "Payload: plain S-records.",
+                    PayloadKind::Opaque => "Payload: binary or encrypted. Only Toyota's software can install it.",
+                    PayloadKind::None => "Payload: none found after the header.",
+                };
+                ui.label(egui::RichText::new(payload).small().color(MUTED));
+                if !check.header.is_empty() {
+                    egui::CollapsingHeader::new("File header").show(ui, |ui| {
+                        egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                            ui.label(egui::RichText::new(&check.header).monospace().small());
+                        });
+                    });
+                }
+            }
+            ui.add_space(6.0);
+
+            // Step 3: hand off to Techstream
+            ui.label(egui::RichText::new("3. Run the update in Techstream").strong());
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(self.is_connected, egui::Button::new("Release cable for Techstream"))
+                    .clicked()
+                {
+                    self.disconnect_cable();
+                    self.log(
+                        "Cable released for Techstream. Keep a charger in power-supply mode on the battery, run the update in Techstream, close Techstream, then Connect here again.",
+                    );
+                }
+                ui.label(
+                    egui::RichText::new("Only one program can use the cable at a time.")
+                        .small()
+                        .color(MUTED),
+                );
+            });
+            ui.add_space(6.0);
+
+            // Step 4: verify after
+            ui.label(egui::RichText::new("4. Verify after the update").strong());
+            ui.horizontal_wrapped(|ui| {
+                ui.label("New Cal ID from the bulletin:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.update_expected_cal)
+                        .hint_text("optional")
+                        .desired_width(140.0),
+                );
+                let can_verify = self.is_connected && self.update_before.is_some();
+                if ui
+                    .add_enabled(can_verify, egui::Button::new("Verify ECU (after)"))
+                    .clicked()
+                {
+                    if let Some(after) = self.capture_update_snapshot("after") {
+                        if let Some(before) = &self.update_before {
+                            let result = compare_snapshots(before, &after, &self.update_expected_cal);
+                            self.log(&format!("Update verification: {}", result.summary));
+                            self.update_result = Some(result);
+                        }
+                    }
+                }
+            });
+            if let Some(result) = &self.update_result {
+                ui.label(
+                    egui::RichText::new(format!("{} {}", check_level_mark(result.verdict), result.summary))
+                        .color(check_level_color(result.verdict)),
+                );
+                for (old, new) in &result.changes {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} → {}",
+                            if old.is_empty() { "(none)" } else { old },
+                            if new.is_empty() { "(none)" } else { new }
+                        ))
+                        .monospace()
+                        .small(),
+                    );
+                }
+            }
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tab 3: Diagnostics & ECU Flashing
 // ---------------------------------------------------------------------------
 
@@ -3081,6 +3333,9 @@ impl WidebandApp {
                     ui.label(format!("Calibration ID:    {}", if self.ecu_id.cal_id.is_empty() { "Not queried" } else { &self.ecu_id.cal_id }));
                     ui.label(format!("Verification CVN:  {}", if self.ecu_id.cvn.is_empty() { "Not queried" } else { &self.ecu_id.cvn }));
                 });
+
+                ui.add_space(8.0);
+                self.render_update_assistant(ui);
 
                 ui.add_space(8.0);
                 ui.label(format!("Flash Transfer Progress: {:.0}%", self.transfer_progress * 100.0));

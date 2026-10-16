@@ -26,6 +26,32 @@ pub const FAST_INIT: u32 = 5; // ISO 14230 fast init ioctl (SAE J2534-1; not REA
 pub const CLEAR_TX_BUFFER: u32 = 7;
 pub const CLEAR_RX_BUFFER: u32 = 8;
 
+pub const ERR_DEVICE_NOT_CONNECTED: u32 = 0x08;
+pub const ERR_DEVICE_IN_USE: u32 = 0x0E;
+pub const ERR_CHANNEL_IN_USE: u32 = 0x14;
+
+/// Plain-language next step for J2534 statuses a user can fix themselves.
+/// Only one program may hold a Pass-Thru cable, so Techstream holding it shows up here.
+pub fn pass_thru_status_hint(status: u32) -> Option<&'static str> {
+    match status {
+        ERR_DEVICE_IN_USE | ERR_CHANNEL_IN_USE => Some(
+            "Another program has this cable open. Close Techstream (or any other scan tool) and retry. Only one program can use the cable at a time.",
+        ),
+        ERR_DEVICE_NOT_CONNECTED => Some(
+            "The cable is not answering. Check the USB lead, the OBD-II plug, and that the ignition is ON.",
+        ),
+        _ => None,
+    }
+}
+
+/// Appends the status hint, when there is one, to a Pass-Thru error message.
+pub fn with_status_hint(message: String, status: u32) -> String {
+    match pass_thru_status_hint(status) {
+        Some(hint) => format!("{} — {}", message, hint),
+        None => message,
+    }
+}
+
 pub const ISO15765_BS: u32 = 0x10;
 pub const ISO15765_STMIN: u32 = 0x11;
 pub const DATA_RATE: u32 = 0x01;
@@ -162,6 +188,9 @@ fn classify_pass_thru_kind(name: &str, vendor: &str, library_path: &str) -> &'st
     let hay = format!("{} {} {}", name, vendor, library_path).to_lowercase();
     if hay.contains("mini") && (hay.contains("vci") || hay.contains("vxdiag") || hay.contains("xhorse")) {
         "Mini-VCI J2534"
+    } else if hay.contains("mvci") || hay.contains("xhorse") {
+        // Mini-VCI clone drivers register as "XHorse - MVCI" with MVCI32.dll and never say "mini".
+        "Mini-VCI J2534"
     } else if hay.contains("vxdiag") || hay.contains("vcx") || hay.contains("nano") {
         "VXDIAG / VCX Nano J2534"
     } else if hay.contains("tactrix") || hay.contains("openport") {
@@ -239,6 +268,8 @@ impl J2534RegistryScanner {
         scan_install_folder_dlls(&mut devices, r"C:\Program Files (x86)\Mini VCI", "Mini-VCI");
         #[cfg(target_os = "windows")]
         scan_install_folder_dlls(&mut devices, r"C:\Program Files (x86)\XHorse", "XHorse MVCI");
+        #[cfg(target_os = "windows")]
+        scan_install_folder_dlls(&mut devices, r"C:\Program Files (x86)\XHorse Electronics", "XHorse MVCI");
 
         devices
     }
@@ -290,6 +321,16 @@ pub(crate) fn known_passthru_dll_paths() -> Vec<(&'static str, &'static str, &'s
             "Mini-VCI J2534 (alternate)",
             "MVCI",
             r"C:\Program Files (x86)\MVCI\PassThruPro.dll",
+        ),
+        (
+            "Mini-VCI J2534 (XHorse MVCI for Toyota TIS)",
+            "XHorse Electronics",
+            r"C:\Program Files (x86)\XHorse Electronics\MVCI Driver for TOYOTA TIS\MVCI32.dll",
+        ),
+        (
+            "Mini-VCI J2534 (XHorse MVCI for Toyota)",
+            "XHorse Electronics",
+            r"C:\Program Files (x86)\XHorse Electronics\MVCI Driver for TOYOTA\MVCI32.dll",
         ),
         (
             "VXDIAG VCX Nano Toyota J2534",
@@ -1017,7 +1058,10 @@ mod native_passthru {
             let mut device_id = 0u32;
             let status = unsafe { (self.open)(ptr::null(), &mut device_id) };
             if status != STATUS_NOERROR {
-                return Err(format!("PassThruOpen failed: {}", status));
+                return Err(with_status_hint(
+                    format!("PassThruOpen failed: status 0x{:X}", status as u32),
+                    status as u32,
+                ));
             }
             Ok(device_id)
         }
@@ -1158,7 +1202,10 @@ impl PassThruDevice for NativePassThruDevice {
             let mut channel_id = 0u32;
             let status = api.connect_channel(self.device_id, protocol, flags, baud, &mut channel_id);
             if status != STATUS_NOERROR {
-                return Err(format!("PassThruConnect failed: {}", status));
+                return Err(with_status_hint(
+                    format!("PassThruConnect failed: status 0x{:X}", status as u32),
+                    status as u32,
+                ));
             }
             self.channel_id = channel_id;
             self.connected = true;

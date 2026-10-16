@@ -10,3 +10,6 @@ datalog.csv
 .agent/
 .agents/
 skills-lock.json
+# ECU update assistant records (contain the VIN)
+wideband-ecu-before-update.json
+wideband-ecu-update-history.jsonl

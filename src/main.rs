@@ -6,6 +6,7 @@ pub mod definitions;
 pub mod rom_image;
 pub mod diagnostics;
 pub mod ecu_bus;
+pub mod ecu_update;
 pub mod flash_job;
 pub mod flash_layout;
 pub mod managers;
@@ -119,6 +120,40 @@ mod tests {
             joined.contains("mvci") && joined.contains("vxdiag"),
             "discovery fallbacks should list Mini-VCI and VXDIAG install paths"
         );
+    }
+
+    #[test]
+    fn test_mini_vci_clone_driver_labelled_and_in_use_hint() {
+        let clone = j2534::J2534DeviceInfo {
+            name: "XHorse - MVCI".to_string(),
+            vendor: "XHorse Electronics".to_string(),
+            library_path: r"C:\Program Files (x86)\XHorse Electronics\MVCI Driver for TOYOTA TIS\MVCI32.dll".to_string(),
+            is_virtual: false,
+            exists: true,
+        };
+        assert!(clone.list_label().starts_with("[Mini-VCI J2534]"));
+
+        let busy = j2534::with_status_hint("PassThruOpen failed (status 0xE)".to_string(), j2534::ERR_DEVICE_IN_USE);
+        assert!(busy.contains("Techstream"));
+        let other = j2534::with_status_hint("PassThruOpen failed (status 0x7)".to_string(), 0x07);
+        assert_eq!(other, "PassThruOpen failed (status 0x7)");
+    }
+
+    #[test]
+    fn test_mode09_parses_every_cal_id_and_cvn() {
+        use protocols::{parse_mode09_cal_ids, parse_mode09_cvns};
+        // ISO 15765: two 16-byte NUL-padded Cal IDs (engine + transmission).
+        let mut resp = vec![0x49, 0x04, 0x02];
+        resp.extend_from_slice(b"34715000\0\0\0\0\0\0\0\0");
+        resp.extend_from_slice(b"A0123000\0\0\0\0\0\0\0\0");
+        assert_eq!(parse_mode09_cal_ids(&resp), vec!["34715000".to_string(), "A0123000".to_string()]);
+        // Short single item (bench simulator layout).
+        let mut single = vec![0x49, 0x04, 0x01];
+        single.extend_from_slice(b"89663-VIRT01");
+        assert_eq!(parse_mode09_cal_ids(&single), vec!["89663-VIRT01".to_string()]);
+        let cvns = vec![0x49, 0x06, 0x02, 0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
+        assert_eq!(parse_mode09_cvns(&cvns), vec!["DEADBEEF".to_string(), "01020304".to_string()]);
+        assert!(parse_mode09_cal_ids(&[0x7F, 0x09, 0x12]).is_empty());
     }
 
     #[test]

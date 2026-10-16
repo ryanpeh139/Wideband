@@ -139,7 +139,10 @@ mod imp {
             let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("J2534Host error");
             if let Some(st) = v.get("status").and_then(|s| s.as_i64()) {
                 if st >= 0 {
-                    return Err(format!("{} (status 0x{:X})", err, st as u32));
+                    return Err(crate::j2534::with_status_hint(
+                        format!("{} (status 0x{:X})", err, st as u32),
+                        st as u32,
+                    ));
                 }
             }
             Err(err.to_string())
