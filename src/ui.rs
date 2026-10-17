@@ -49,6 +49,10 @@ use egui_plot::{Line, Plot, PlotPoints, PlotUi};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+/// How long one live-data poll waits for its reply. The ECM answers in ~15–30 ms through
+/// J2534Host; a shorter wait left late replies in the cable buffer for the next request.
+const LIVE_REPLY_MS: u32 = 100;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceTab {
     Calibration,
@@ -906,7 +910,7 @@ impl WidebandApp {
             for (idx, req, decode_id) in poll_list {
                 let mut ok = false;
                 if let Ok(resp) =
-                    crate::protocols::IsoTpLink::exchange_for_profile(dev.as_mut(), channel, prof, &req, 10)
+                    crate::protocols::IsoTpLink::exchange_for_profile(dev.as_mut(), channel, prof, &req, LIVE_REPLY_MS)
                 {
                     if let Some(value) = decode_channel_value(&decode_id, &resp) {
                         let mut buf = self.telemetry.lock().unwrap();

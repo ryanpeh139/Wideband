@@ -137,6 +137,12 @@ impl UdsClient {
                 pending += 1;
                 continue;
             }
+            // Late reply to another request (a live-data `41 0C` still in the cable's buffer when
+            // Identify sends `09 02`): drop it and keep waiting for this service's answer.
+            if is_reply_for_other_service(&response, service) {
+                pending += 1;
+                continue;
+            }
             if response.len() >= 3 && response[0] == NEGATIVE && response[2] == RESPONSE_PENDING {
                 if response[1] != service {
                     return Err("Pending response for different service".to_string());
@@ -211,6 +217,16 @@ fn encode_be(value: u64, bytes: usize) -> Vec<u8> {
     out
 }
 
+/// A positive reply (`service | 0x40`) or negative reply (`7F service ..`) that answers some
+/// other service than the one just requested.
+fn is_reply_for_other_service(response: &[u8], service: u8) -> bool {
+    match response.first() {
+        None => false,
+        Some(&NEGATIVE) => response.len() >= 2 && response[1] != service,
+        Some(&first) => first != (service | 0x40),
+    }
+}
+
 fn extended_wait(p2_star_ms: u32) -> u32 {
     if p2_star_ms < 5000 {
         5000
@@ -249,6 +265,19 @@ mod tests {
         client.apply_server_timing(50, 5000);
         assert!(client.p2_ms() >= 1000, "50 ms server P2 must not become the client deadline");
         assert!(client.p2_star_ms() >= 5000);
+    }
+
+    #[test]
+    fn stale_reply_for_another_service_is_skipped() {
+        // A late live-data reply still buffered when Identify asks for the VIN.
+        let mut dev = ScriptCan::new(0x7E0, 0x7E8);
+        dev.enqueue_rx(&[0x04, 0x41, 0x0C, 0x00, 0x00, 0xAA, 0xAA, 0xAA]);
+        dev.enqueue_rx(&[0x04, 0x49, 0x02, 0x01, b'3', 0xAA, 0xAA, 0xAA]);
+        let prof = EcuProfile::tacoma_can();
+        let mut client = UdsClient::for_obd(1, &prof);
+        client.set_timers(200, 200);
+        let resp = client.request(&mut dev, &[0x09, 0x02], 0x49).expect("stale 41 0C must be skipped");
+        assert_eq!(resp, vec![0x49, 0x02, 0x01, b'3']);
     }
 
     #[test]
