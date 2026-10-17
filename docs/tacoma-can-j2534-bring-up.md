@@ -31,6 +31,10 @@ Wideband discovers devices from `PassThruSupport.04.04` registry keys and common
 6. **Identify ECU** — Real VIN / Cal IDs / CVNs from the bus (OBD Mode 09 first, UDS identifiers as fallback); empty bus **fails** (no demo VIN on real hardware). Fields the ECU does not answer are listed in the log instead of failing the whole read.
 7. **Flash** — Only after `security-config.json` has your allowed masks/checksums configured; brick risk.
 
+## How Wideband talks to the cable on CAN
+
+On CAN profiles Wideband opens the cable in **ISO 15765** mode (J2534 protocol 6) with a flow-control filter, the same way Techstream does: the cable segments and reassembles diagnostic messages and answers flow control itself. Clone Mini-VCI cables are tested for this mode by their makers; several do not answer reliably in raw CAN mode. The Connect log line ends with `ISO 15765 (cable ISO-TP)` when this mode is active. If a cable refuses it, Wideband falls back to raw CAN (protocol 5) with its own ISO-TP and the log says `raw CAN (cable refused ISO 15765: …)`. Set the environment variable `WIDEBAND_RAW_CAN=1` before starting Wideband to force raw CAN.
+
 ## Sharing the cable with Techstream
 
 Techstream and Wideband use the same J2534 driver, but only one program can hold the cable open. Click **Disconnect** (or **Release cable for Techstream**) before opening Techstream, and close Techstream before **Connect** in Wideband. If the cable is still held, Connect reports *Another program has this cable open*.

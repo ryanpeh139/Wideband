@@ -15,10 +15,19 @@ sealed class J2534Host
 {
     const int MessageBytes = 4152;
     const int ProtocolCan = 5;
+    // SAE J2534-1 ISO15765: the cable segments, reassembles, and answers flow control itself.
+    const int ProtocolIso15765 = 6;
     const int ProtocolKLine = 4;
     const int ProtocolVpw = 1;
     const uint Can29Bit = 0x100;
     const uint PassFilter = 1;
+    const uint FlowControlFilter = 3;
+    const uint Iso15765FramePad = 0x40;
+    // RxStatus TX_MSG_TYPE, START_OF_MESSAGE, and TX_INDICATION mark echoes and progress
+    // indications on an ISO15765 channel, not a message from the ECU.
+    const uint RxIndicationMask = 0x01 | 0x02 | 0x08;
+    // PASSTHRU_MSG: 24-byte header, then the 4-byte CAN id and the payload.
+    const int MaxIsoTpPayload = MessageBytes - 28;
     // SAE J2534-1: FAST_INIT is 0x05. 0x03 is READ_VBATT.
     const uint ReadVbatt = 0x03;
     const uint FastInit = 0x05;
@@ -226,8 +235,9 @@ sealed class J2534Host
         if (parts.Length >= 3)
         {
             if (!uint.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out protocolId)
-                || (protocolId != ProtocolVpw && protocolId != ProtocolKLine && protocolId != ProtocolCan))
-                return Fail("Protocol must be 1 (J1850 VPW), 4 (ISO 14230), or 5 (CAN).", -1);
+                || (protocolId != ProtocolVpw && protocolId != ProtocolKLine && protocolId != ProtocolCan
+                    && protocolId != ProtocolIso15765))
+                return Fail("Protocol must be 1 (J1850 VPW), 4 (ISO 14230), 5 (CAN), or 6 (ISO 15765).", -1);
         }
         uint flags = 0;
         if (parts.Length >= 4)
@@ -236,7 +246,7 @@ sealed class J2534Host
                 return Fail("CONNECT flags must be hexadecimal.", -1);
         }
         DropChannel();
-        extended = protocolId == ProtocolCan && parts[1] == "1";
+        extended = (protocolId == ProtocolCan || protocolId == ProtocolIso15765) && parts[1] == "1";
         if (extended) flags |= Can29Bit;
         protocol = protocolId;
         wireFlags = flags;
@@ -333,17 +343,30 @@ sealed class J2534Host
             + ",\"api\":" + Quote(api.ToString()) + "}";
     }
 
+    bool IsCan
+    {
+        get { return protocol == ProtocolCan || protocol == ProtocolIso15765; }
+    }
+
     string Filter(string rest)
     {
         if (!channelOpen) return Fail("The channel is not open.", -1);
         string[] parts = Parts(rest);
-        if (protocol != ProtocolCan) return FilterRaw(parts);
+        if (!IsCan) return FilterRaw(parts);
         if (parts.Length < 2) return Fail("FILTER needs an id and a mask.", -1);
         uint id = ParseHex(parts[0]);
         uint mask = ParseHex(parts[1]);
         uint cap = extended ? 0x1FFFFFFFu : 0x7FFu;
         if (id > cap || mask > cap)
             return Fail("The acceptance filter does not fit the selected identifier size.", -1);
+        bool isoTp = protocol == ProtocolIso15765;
+        uint flowId = 0;
+        if (isoTp)
+        {
+            if (parts.Length < 3) return Fail("An ISO 15765 filter needs the response id, mask, and request id.", -1);
+            flowId = ParseHex(parts[2]);
+            if (flowId > cap) return Fail("The request id does not fit the selected identifier size.", -1);
+        }
         if (filterOpen)
         {
             int stop = stopFilterFn(channelId, filterId);
@@ -352,13 +375,15 @@ sealed class J2534Host
         }
         IntPtr maskMsg = AllocMessage();
         IntPtr patternMsg = AllocMessage();
+        IntPtr flowMsg = isoTp ? AllocMessage() : IntPtr.Zero;
         try
         {
-            uint txFlags = extended ? Can29Bit : 0;
-            FillId(maskMsg, mask, txFlags);
-            FillId(patternMsg, id, txFlags);
+            uint txFlags = (extended ? Can29Bit : 0) | (isoTp ? Iso15765FramePad : 0);
+            FillId(maskMsg, protocol, mask, txFlags);
+            FillId(patternMsg, protocol, id, txFlags);
+            if (isoTp) FillId(flowMsg, protocol, flowId, txFlags);
             uint created;
-            int status = startFilterFn(channelId, PassFilter, maskMsg, patternMsg, IntPtr.Zero, out created);
+            int status = startFilterFn(channelId, isoTp ? FlowControlFilter : PassFilter, maskMsg, patternMsg, flowMsg, out created);
             if (status != 0) return Fail(Describe(status), status);
             filterId = created;
             filterOpen = true;
@@ -368,13 +393,14 @@ sealed class J2534Host
         {
             Marshal.FreeHGlobal(maskMsg);
             Marshal.FreeHGlobal(patternMsg);
+            if (flowMsg != IntPtr.Zero) Marshal.FreeHGlobal(flowMsg);
         }
     }
 
     string Read()
     {
         if (!channelOpen) return Fail("The channel is not open.", -1);
-        if (protocol != ProtocolCan) return ReadRaw();
+        if (!IsCan) return ReadRaw();
         IntPtr message = AllocMessage();
         try
         {
@@ -383,12 +409,18 @@ sealed class J2534Host
             if (status == 0x09 || status == 0x10 || (status == 0 && count == 0))
                 return "{\"ok\":true,\"empty\":true}";
             if (status != 0) return Fail(Describe(status), status);
+            uint rxStatusBits = ReadUInt(message, 4);
+            if (protocol == ProtocolIso15765 && (rxStatusBits & RxIndicationMask) != 0)
+                return "{\"ok\":true,\"empty\":true}";
             uint dataSize = ReadUInt(message, 16);
             uint extra = ReadUInt(message, 20);
             uint end = dataSize;
             if (extra >= 4 && extra < end) end = extra;
-            if (end < 4 || end > 12)
+            uint maxEnd = protocol == ProtocolIso15765 ? (uint)(4 + MaxIsoTpPayload) : 12u;
+            if (end < 4 || end > maxEnd)
                 return Fail("The cable returned a CAN frame with an unexpected length.", -1);
+            if (protocol == ProtocolIso15765 && end == 4)
+                return "{\"ok\":true,\"empty\":true}";
             int payloadLength = (int)end - 4;
             var payload = new byte[payloadLength];
             if (payloadLength > 0)
@@ -411,11 +443,13 @@ sealed class J2534Host
     string Write(string rest)
     {
         if (!channelOpen) return Fail("The channel is not open.", -1);
-        if (protocol != ProtocolCan) return WriteRaw(rest);
+        if (!IsCan) return WriteRaw(rest);
         string[] parts = Parts(rest);
         if (parts.Length < 1) return Fail("WRITE needs a CAN id.", -1);
         uint id = ParseHex(parts[0]);
-        byte[] payload = parts.Length > 1 ? ParsePayload(parts[1]) : new byte[0];
+        bool isoTp = protocol == ProtocolIso15765;
+        byte[] payload = parts.Length > 1 ? ParsePayload(parts[1], isoTp ? MaxIsoTpPayload : 8) : new byte[0];
+        if (isoTp && payload.Length == 0) return Fail("An ISO 15765 message needs at least one data byte.", -1);
         if (!extended && id > 0x7FF)
             return Fail("An 11-bit CAN id must be 0x7FF or below.", -1);
         if (extended && id > 0x1FFFFFFF)
@@ -423,8 +457,8 @@ sealed class J2534Host
         IntPtr message = AllocMessage();
         try
         {
-            uint txFlags = extended ? Can29Bit : 0;
-            WriteUInt(message, 0, ProtocolCan);
+            uint txFlags = (extended ? Can29Bit : 0) | (isoTp ? Iso15765FramePad : 0);
+            WriteUInt(message, 0, protocol);
             WriteUInt(message, 8, txFlags);
             WriteUInt(message, 16, (uint)(4 + payload.Length));
             WriteId(message, id);
@@ -656,9 +690,9 @@ sealed class J2534Host
         return data;
     }
 
-    static void FillId(IntPtr message, uint id, uint txFlags)
+    static void FillId(IntPtr message, uint protocolId, uint id, uint txFlags)
     {
-        WriteUInt(message, 0, ProtocolCan);
+        WriteUInt(message, 0, protocolId);
         WriteUInt(message, 8, txFlags);
         WriteUInt(message, 16, 4);
         WriteId(message, id);
@@ -705,11 +739,13 @@ sealed class J2534Host
         return uint.Parse(text, NumberStyles.HexNumber, CultureInfo.InvariantCulture);
     }
 
-    static byte[] ParsePayload(string hex)
+    static byte[] ParsePayload(string hex, int maxBytes)
     {
         if (hex == null || hex.Length == 0) return new byte[0];
-        if ((hex.Length % 2) != 0 || hex.Length > 16)
-            throw new FormatException("A classic CAN frame holds at most 8 data bytes.");
+        if ((hex.Length % 2) != 0 || hex.Length > maxBytes * 2)
+            throw new FormatException(maxBytes == 8
+                ? "A classic CAN frame holds at most 8 data bytes."
+                : "The message is longer than the cable accepts.");
         var data = new byte[hex.Length / 2];
         for (int i = 0; i < data.Length; i++)
             data[i] = byte.Parse(hex.Substring(i * 2, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture);

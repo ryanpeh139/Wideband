@@ -51,6 +51,11 @@ impl IsoTpLink {
         if payload.is_empty() {
             return Err("ISO-TP cannot send an empty payload".to_string());
         }
+        if device.cable_isotp() {
+            // The cable segments and pads the message and handles flow control itself.
+            device.write_msgs(self.channel, &[PassThruMsg::new_can(self.config.tx_id, payload)], self.config.timeout_ms)?;
+            return Ok(());
+        }
         if payload.len() <= 7 {
             let mut buf = vec![payload.len() as u8];
             buf.extend_from_slice(payload);
@@ -140,6 +145,9 @@ impl IsoTpLink {
     }
 
     pub fn receive(&self, device: &mut dyn PassThruDevice) -> Result<Vec<u8>, String> {
+        if device.cable_isotp() {
+            return self.receive_whole(device);
+        }
         let deadline = Duration::from_millis(self.config.timeout_ms as u64);
         let start = std::time::Instant::now();
         while start.elapsed() < deadline {
@@ -170,6 +178,24 @@ impl IsoTpLink {
                     }
                     let pending: Vec<PassThruMsg> = iter.collect();
                     return self.receive_consecutive(device, assembled, len, pending);
+                }
+            }
+        }
+        Err("No ISO-TP response within timeout".to_string())
+    }
+
+    /// Cable-side ISO-TP: each read is one complete, reassembled message.
+    fn receive_whole(&self, device: &mut dyn PassThruDevice) -> Result<Vec<u8>, String> {
+        let deadline = Duration::from_millis(self.config.timeout_ms as u64);
+        let start = Instant::now();
+        while start.elapsed() < deadline {
+            for msg in device.read_msgs(self.channel, 50)? {
+                if msg.read_id() != self.config.rx_id {
+                    continue;
+                }
+                let p = msg.payload();
+                if !p.is_empty() {
+                    return Ok(p.to_vec());
                 }
             }
         }
@@ -259,6 +285,8 @@ pub(crate) mod mock {
         pub connected: bool,
         pub rx_script: VecDeque<Vec<u8>>,
         pub tx_captured: Vec<Vec<u8>>,
+        /// Behave like a J2534 ISO15765 channel: whole messages, no padding.
+        pub cable_isotp: bool,
     }
 
     impl ScriptCan {
@@ -269,6 +297,7 @@ pub(crate) mod mock {
                 connected: true,
                 rx_script: VecDeque::new(),
                 tx_captured: Vec::new(),
+                cable_isotp: false,
             }
         }
 
@@ -299,7 +328,7 @@ pub(crate) mod mock {
             let mut out = Vec::new();
             if let Some(p) = self.rx_script.pop_front() {
                 let mut buf = p;
-                while buf.len() < 8 {
+                while !self.cable_isotp && buf.len() < 8 {
                     buf.push(0xAA);
                 }
                 out.push(PassThruMsg::new_can(self.rx_id, &buf));
@@ -334,6 +363,9 @@ pub(crate) mod mock {
         fn firmware_version(&self) -> String {
             "mock".to_string()
         }
+        fn cable_isotp(&self) -> bool {
+            self.cable_isotp
+        }
     }
 }
 
@@ -341,6 +373,20 @@ pub(crate) mod mock {
 mod tests {
     use super::*;
     use mock::ScriptCan;
+
+    #[test]
+    fn cable_isotp_sends_and_receives_whole_messages() {
+        let mut dev = ScriptCan::new(0x7E0, 0x7E8);
+        dev.cable_isotp = true;
+        let long_reply: Vec<u8> = (0..20u8).collect();
+        dev.enqueue_rx(&long_reply);
+        let link = IsoTpLink::new(1, IsoTpConfig::default());
+
+        let request = [0x22, 0xF1, 0x90, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+        link.send(&mut dev, &request).unwrap();
+        assert_eq!(dev.tx_captured, vec![request.to_vec()], "no PCI bytes or padding in cable ISO-TP mode");
+        assert_eq!(link.receive(&mut dev).unwrap(), long_reply);
+    }
 
     #[test]
     fn isotp_multiframe_receive_reassembles() {

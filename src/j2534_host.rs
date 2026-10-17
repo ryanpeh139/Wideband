@@ -15,6 +15,8 @@ mod imp {
     /// Floor for any host reply. READ itself is non-blocking in the host, so hitting this means
     /// the host or vendor DLL is wedged — not that the bus is quiet.
     const MIN_HOST_REPLY_MS: u32 = 5000;
+    /// SAE J2534-1 protocol id for ISO15765 on the host wire (raw CAN is 5).
+    const WIRE_ISO15765: u32 = 6;
 
     pub struct HostPassThruDevice {
         lib_path: String,
@@ -31,7 +33,10 @@ mod imp {
         connect_extended: bool,
         connect_filter_id: u32,
         connect_filter_mask: u32,
+        connect_request_id: u32,
         active_protocol: u32,
+        /// The channel is J2534 ISO15765 (protocol 6) and the cable runs ISO-TP.
+        cable_isotp: bool,
     }
 
     impl HostPassThruDevice {
@@ -50,7 +55,9 @@ mod imp {
                 connect_extended: false,
                 connect_filter_id: 0x7E8,
                 connect_filter_mask: 0x7FF,
+                connect_request_id: 0x7E0,
                 active_protocol: 5,
+                cable_isotp: false,
             }
         }
 
@@ -132,6 +139,22 @@ mod imp {
             self.channel_id = 0;
         }
 
+        /// Opens a J2534 ISO15765 channel with a flow-control filter, as Techstream does.
+        fn connect_cable_isotp(&mut self, flags: u32, baud: u32) -> Result<u32, String> {
+            let ext_flag = if self.connect_extended { 1 } else { 0 };
+            let line = format!("CONNECT {} {} {} {:X}", baud, ext_flag, WIRE_ISO15765, flags);
+            let resp = self.command(&line, 15_000)?;
+            Self::require_ok(&resp)?;
+            let channel = resp.get("channel_id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let filter_line = format!(
+                "FILTER {:X} {:X} {:X}",
+                self.connect_filter_id, self.connect_filter_mask, self.connect_request_id
+            );
+            let f = self.command(&filter_line, 15_000)?;
+            Self::require_ok(&f)?;
+            Ok(channel)
+        }
+
         fn require_ok(v: &Value) -> Result<(), String> {
             if v.get("ok").and_then(|b| b.as_bool()) == Some(true) {
                 return Ok(());
@@ -162,6 +185,14 @@ mod imp {
             self.connect_extended = extended;
             self.connect_filter_id = filter_id;
             self.connect_filter_mask = filter_mask;
+        }
+
+        fn set_flow_control_id(&mut self, request_id: u32) {
+            self.connect_request_id = request_id;
+        }
+
+        fn cable_isotp(&self) -> bool {
+            self.cable_isotp
         }
 
         fn open(&mut self) -> Result<(), String> {
@@ -239,6 +270,25 @@ mod imp {
         }
 
         fn connect(&mut self, protocol: u32, flags: u32, baud: u32) -> Result<u32, String> {
+            self.cable_isotp = false;
+            if protocol == 5 && std::env::var_os("WIDEBAND_RAW_CAN").is_none() {
+                match self.connect_cable_isotp(flags, baud) {
+                    Ok(channel) => {
+                        self.channel_id = channel;
+                        self.active_protocol = protocol;
+                        self.extended = self.connect_extended;
+                        self.cable_isotp = true;
+                        self.version_str = format!("{} · ISO 15765 (cable ISO-TP)", self.version_str);
+                        return Ok(self.channel_id);
+                    }
+                    Err(e) => {
+                        self.version_str = format!(
+                            "{} · raw CAN (cable refused ISO 15765: {})",
+                            self.version_str, e
+                        );
+                    }
+                }
+            }
             let ext_flag = if self.connect_extended { 1 } else { 0 };
             let line = format!(
                 "CONNECT {} {} {} {:X}",

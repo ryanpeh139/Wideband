@@ -440,6 +440,15 @@ pub trait PassThruDevice: Send + Sync {
     /// Host bridge uses FILTER during CONNECT; native uses this before filters.
     fn set_connect_hints(&mut self, _extended: bool, _filter_id: u32, _filter_mask: u32) {}
 
+    /// Request id the cable answers flow control with when it runs ISO-TP itself.
+    fn set_flow_control_id(&mut self, _request_id: u32) {}
+
+    /// True when the channel is a J2534 ISO15765 channel: the cable segments, reassembles, and
+    /// answers flow control, so each message is written and read whole.
+    fn cable_isotp(&self) -> bool {
+        false
+    }
+
     /// ISO 14230 fast init after connect (K-Line). Default uses `FAST_INIT` ioctl.
     fn kline_fast_init(&mut self, channel: u32, frame: &[u8]) -> Result<Vec<u8>, String> {
         self.ioctl(channel, FAST_INIT, frame)
@@ -1364,6 +1373,7 @@ pub fn connect_for_profile(
 ) -> Result<u32, String> {
     use crate::protocols::VehicleBus;
     device.set_connect_hints(profile.extended_id, profile.response_id, profile.filter_mask);
+    device.set_flow_control_id(profile.request_id);
     let channel = device.connect(profile.protocol_id, profile.connect_flags, profile.bitrate)?;
     if profile.bus == VehicleBus::CanIsoTp {
         let mut pass_mask = PassThruMsg::new_can(profile.filter_mask, &[]);

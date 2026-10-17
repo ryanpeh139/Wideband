@@ -163,6 +163,8 @@ pub struct WidebandApp {
     pub update_file_name: String,
     pub update_expected_cal: String,
     pub update_result: Option<UpdateComparison>,
+    /// Label of the cable actually connected; the dropdown can change while connected.
+    pub connected_device_label: String,
 
     // TCM (paired with ECM profile)
     pub tcm_profiles: Vec<TcmProfile>,
@@ -303,6 +305,7 @@ impl WidebandApp {
             update_file_name: String::new(),
             update_expected_cal: String::new(),
             update_result: None,
+            connected_device_label: String::new(),
             tcm_profiles,
             selected_tcm_profile_idx: 0,
             tcm_id: EcuIdentification::default(),
@@ -689,6 +692,7 @@ impl WidebandApp {
         self.active_device_virtual = is_virtual;
         self.active_device = Some(dev);
         self.is_connected = true;
+        self.connected_device_label = dev_name.clone();
         self.connection_last_error.clear();
         if is_virtual {
             self.idle_tester_present.disarm();
@@ -2991,7 +2995,7 @@ impl WidebandApp {
     fn capture_update_snapshot(&mut self, stage: &str) -> Option<UpdateSnapshot> {
         let prof = self.profiles[self.selected_profile_idx].clone();
         let allow_demo = self.active_device_virtual;
-        let device_name = self.devices[self.selected_device_idx].list_label();
+        let device_name = self.connected_device_label.clone();
         let (result, vbatt) = match self.active_device.as_mut() {
             Some(dev) => {
                 let channel = dev.channel_id();
@@ -3067,7 +3071,7 @@ impl WidebandApp {
                 };
             });
             let cable_label = if self.is_connected {
-                self.devices[self.selected_device_idx].list_label()
+                self.connected_device_label.clone()
             } else {
                 String::new()
             };
