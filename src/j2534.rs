@@ -839,8 +839,8 @@ impl VirtualEcuSimulator {
                 }
                 match req[1] {
                     0x02 => {
-                        // P0171 confirmed
-                        vec![0x59, 0x02, 0xFF, 0x01, 0x01, 0x71, 0x00, 0x09]
+                        // P0171 confirmed: availability mask, DTC 01 71 00, status 09
+                        vec![0x59, 0x02, 0xFF, 0x01, 0x71, 0x00, 0x09]
                     }
                     0x04 => {
                         if req.len() >= 6 {
@@ -1380,7 +1380,8 @@ pub fn connect_for_profile(
     profile: &crate::protocols::EcuProfile,
 ) -> Result<u32, String> {
     use crate::protocols::VehicleBus;
-    // One acceptance filter covers both the diagnostic and the OBD response ids.
+    // One acceptance filter covers the diagnostic and OBD response ids. (The Mini-VCI driver
+    // applies only the last PASS filter started, so a second filter cannot narrow this.)
     let rx_mask = profile.rx_filter_mask();
     device.set_connect_hints(profile.extended_id, profile.response_id, rx_mask);
     device.set_flow_control_id(profile.request_id);

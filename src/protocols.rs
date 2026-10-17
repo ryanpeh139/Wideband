@@ -99,9 +99,8 @@ impl EcuProfile {
             response_id: 0x708,
             obd_request_id: 0x7E0,
             obd_response_id: 0x7E8,
-            // Passes 0x708–0x70F and 0x7E8–0x7EF so the TCM (0x709 / 0x7E9) answers on the same
-            // connection; ISO-TP still checks the exact response id.
-            filter_mask: 0x718,
+            // Diagnostic replies from the ECM (0x708) and TCM (0x709); see connect_for_profile.
+            filter_mask: 0x7FE,
             tester: 0xF1,
             ecu: 0x10,
             max_chunk: 1024,

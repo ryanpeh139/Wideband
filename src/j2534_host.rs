@@ -245,7 +245,6 @@ mod imp {
         fn cable_isotp(&self) -> bool {
             self.cable_isotp
         }
-
         fn open(&mut self) -> Result<(), String> {
             if !self.host_path.exists() {
                 return Err(format!("J2534Host.exe not found (expected {})", self.host_path.display()));
@@ -567,6 +566,64 @@ mod hardware {
         println!("{} ({} ms)", id.details, elapsed.as_millis());
         tester.expect("TCM TesterPresent");
         assert!(!id.cal_ids.is_empty(), "no TCM Cal ID");
+    }
+
+    /// Read-only: Read DTCs (OBD monitor status, stored and pending codes, UDS 19 02). Never
+    /// clears anything.
+    #[test]
+    #[ignore]
+    fn hardware_read_dtcs() {
+        let dll = match std::env::var("WIDEBAND_HW_DLL") {
+            Ok(path) => path,
+            Err(_) => return,
+        };
+        let profile = EcuProfile::tacoma_can();
+        let mut dev = super::create_host_device(&dll);
+        dev.open().expect("open cable");
+        let channel = crate::j2534::connect_for_profile(dev.as_mut(), &profile).expect("connect");
+        let started = Instant::now();
+        let snap = crate::diagnostics::DiagnosticsReader::read(dev.as_mut(), channel, &profile);
+        let ms = started.elapsed().as_millis();
+        let _ = dev.close();
+        let snap = snap.expect("read DTCs");
+        println!(
+            "MIL {} · stored {:?} · pending {:?} · monitors {} ({} ms)",
+            if snap.mil_on { "ON" } else { "OFF" },
+            snap.stored_dtcs.iter().map(|d| d.code.clone()).collect::<Vec<_>>(),
+            snap.pending_dtcs.iter().map(|d| d.code.clone()).collect::<Vec<_>>(),
+            snap.readiness.monitors.len(),
+            ms
+        );
+        for m in &snap.readiness.monitors {
+            println!("   {:<28} supported={} complete={}", m.name, m.supported, m.complete);
+        }
+    }
+
+    /// Read-only: OBD values as ECM DIDs 1Fxx on the diagnostic id, one DID and then several
+    /// DIDs in one `22` request.
+    #[test]
+    #[ignore]
+    fn hardware_multi_did_request() {
+        let dll = match std::env::var("WIDEBAND_HW_DLL") {
+            Ok(path) => path,
+            Err(_) => return,
+        };
+        let profile = EcuProfile::tacoma_can();
+        let mut dev = super::create_host_device(&dll);
+        dev.open().expect("open cable");
+        let channel = crate::j2534::connect_for_profile(dev.as_mut(), &profile).expect("connect");
+        let mut client = crate::uds::UdsClient::for_profile(dev.as_mut(), channel, &profile);
+        client.set_timers(300, 1000);
+        for req in [
+            vec![0x22, 0x1F, 0x0C],
+            vec![0x22, 0x1F, 0x0C, 0x1F, 0x11],
+            vec![0x22, 0x1F, 0x0C, 0x1F, 0x11, 0x1F, 0x0D, 0x1F, 0x24, 0x1F, 0x0E, 0x1F, 0x04],
+        ] {
+            let started = Instant::now();
+            let resp = client.request(dev.as_mut(), &req, 0x62);
+            println!("{:02X?} -> {:02X?} ({} ms)", req, resp, started.elapsed().as_millis());
+        }
+        let _ = dev.close();
     }
 
     /// Read-only: one multi-PID Mode 01 request (RPM, TPS, speed, lambda, timing, load).

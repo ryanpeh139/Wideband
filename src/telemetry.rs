@@ -177,16 +177,11 @@ impl TelemetryChannelFile {
         })
     }
 
+    /// The shipped channel list, built in, so a missing file beside the program (running
+    /// `target\release\wideband.exe` directly) still polls every channel instead of RPM only.
     fn builtin_fallback() -> Self {
         serde_json::from_str(
-            r#"{
-            "version": 1,
-            "channels": [
-              {"id":"rpm","label":"RPM","unit":"RPM","priority":1,"interval_ms":50,
-               "request":{"service":"mode01","pid":12},"decode":"pid_0c_rpm","gauge":true,
-               "plot":{"scale":1.0,"color":[0,229,255]}}
-            ]
-          }"#,
+            include_str!("../telemetry-channels.json"),
         )
         .expect("builtin telemetry fallback")
     }

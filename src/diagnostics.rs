@@ -1,6 +1,6 @@
-use crate::ecu_bus;
 use crate::j2534::PassThruDevice;
 use crate::protocols::{DiagnosticProtocol, EcuProfile, VehicleBus};
+use crate::uds::UdsClient;
 
 /// Read-only emissions / OBD diagnostics. No clear-DTC, MIL defeat, or monitor disable paths.
 pub struct DiagnosticsReader;
@@ -103,12 +103,18 @@ impl DiagnosticsReader {
     ) -> Result<(), String> {
         Self::read_obd_modes(device, channel, profile, snap)?;
 
-        let uds_dtcs = Self::uds_report_dtcs(device, channel, profile, 0xFF)?;
+        // Only pending (0x04) and confirmed (0x08) codes. Mask 0xFF returned all 86 DTCs the
+        // Tacoma ECM monitors, most with status "test not completed", none of them faults.
+        let uds_dtcs = Self::uds_report_dtcs(device, channel, profile, 0x0C)?;
         for entry in uds_dtcs {
-            if snap.stored_dtcs.iter().any(|d| d.code == entry.code) {
-                continue;
+            let list = match entry.status {
+                DtcStatus::Confirmed => &mut snap.stored_dtcs,
+                DtcStatus::Pending => &mut snap.pending_dtcs,
+                _ => continue,
+            };
+            if !list.iter().any(|d| d.code == entry.code) {
+                list.push(entry);
             }
-            snap.stored_dtcs.push(entry);
         }
 
         for dtc in &snap.stored_dtcs {
@@ -125,7 +131,7 @@ impl DiagnosticsReader {
         profile: &EcuProfile,
         snap: &mut DiagnosticsSnapshot,
     ) -> Result<(), String> {
-        if let Ok(resp) = Self::exchange(device, channel, profile, &[0x01, 0x01]) {
+        if let Ok(resp) = Self::obd(device, channel, profile, &[0x01, 0x01]) {
             if resp.len() >= 2 && resp[0] == 0x41 && resp[1] == 0x01 && resp.len() >= 6 {
                 let a = resp[2];
                 snap.mil_on = (a & 0x80) != 0;
@@ -133,16 +139,16 @@ impl DiagnosticsReader {
             }
         }
 
-        if let Ok(resp) = Self::exchange(device, channel, profile, &[0x03]) {
+        if let Ok(resp) = Self::obd(device, channel, profile, &[0x03]) {
             snap.stored_dtcs = parse_obd_dtc_list(&resp, 0x43, DtcStatus::Confirmed);
         }
 
-        if let Ok(resp) = Self::exchange(device, channel, profile, &[0x07]) {
+        if let Ok(resp) = Self::obd(device, channel, profile, &[0x07]) {
             snap.pending_dtcs = parse_obd_dtc_list(&resp, 0x47, DtcStatus::Pending);
         }
 
         if let Some(first) = snap.stored_dtcs.first() {
-            if let Ok(resp) = Self::exchange(device, channel, profile, &[0x02, 0x02]) {
+            if let Ok(resp) = Self::obd(device, channel, profile, &[0x02, 0x02]) {
                 if let Some(ff) = parse_obd_freeze_frame(&resp, &first.code) {
                     if !snap.freeze_frames.iter().any(|f| f.dtc_code == ff.dtc_code) {
                         snap.freeze_frames.push(ff);
@@ -160,12 +166,14 @@ impl DiagnosticsReader {
         status_mask: u8,
     ) -> Result<Vec<DiagnosticTroubleCode>, String> {
         let req = vec![0x19, 0x02, status_mask];
-        let resp = Self::exchange(device, channel, profile, &req)?;
+        let resp = Self::uds(device, channel, profile, &req)?;
         if resp.len() < 3 || resp[0] != 0x59 || resp[1] != 0x02 {
             return Err("UDS ReadDTCInformation (0x19 02) failed".to_string());
         }
+        // 59 02 <availability mask>, then 4-byte records: DTC high, mid, low (failure type),
+        // status. The 2-byte SAE code is high + mid.
         let mut out = Vec::new();
-        let mut i = 4usize;
+        let mut i = 3usize;
         while i + 3 < resp.len() {
             let raw = [resp[i], resp[i + 1]];
             let status_byte = resp[i + 3];
@@ -190,7 +198,7 @@ impl DiagnosticsReader {
         record: u8,
     ) -> Result<FreezeFrame, String> {
         let req = vec![0x19, 0x04, dtc_raw[0], dtc_raw[1], 0xFF, record];
-        let resp = Self::exchange(device, channel, profile, &req)?;
+        let resp = Self::uds(device, channel, profile, &req)?;
         if resp.len() < 6 || resp[0] != 0x59 || resp[1] != 0x04 {
             return Err("UDS snapshot record failed".to_string());
         }
@@ -210,13 +218,27 @@ impl DiagnosticsReader {
         })
     }
 
-    fn exchange(
+    /// OBD services (`01`/`02`/`03`/`07`): sent as scan tools do (functional `0x7DF` on CAN)
+    /// and read from the OBD response id. The 2017 Tacoma ECM refuses OBD services on its
+    /// diagnostic id `0x700` with `7F xx 11`.
+    fn obd(
         device: &mut dyn PassThruDevice,
         channel: u32,
         profile: &EcuProfile,
         request: &[u8],
     ) -> Result<Vec<u8>, String> {
-        ecu_bus::exchange(device, channel, profile, request)
+        UdsClient::for_obd(channel, profile).request(device, request, request[0] | 0x40)
+    }
+
+    /// UDS services on the diagnostic ids. Waits out "response pending" (`7F 19 78`), which the
+    /// Tacoma ECM sends before answering `19 02`.
+    fn uds(
+        device: &mut dyn PassThruDevice,
+        channel: u32,
+        profile: &EcuProfile,
+        request: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        UdsClient::for_profile(device, channel, profile).request(device, request, request[0] | 0x40)
     }
 }
 
@@ -231,13 +253,13 @@ pub fn decode_dtc_bytes(high: u8, low: u8) -> String {
     format!("{}{:04X}", prefix, code & 0x3FFF)
 }
 
+/// ISO 14229 DTC status: bit 3 confirmed, bit 2 pending. Other bits (test not completed,
+/// warning indicator history, ...) do not make a code a fault on their own.
 fn uds_status_to_enum(status: u8) -> DtcStatus {
     if status & 0x08 != 0 {
         DtcStatus::Confirmed
     } else if status & 0x04 != 0 {
         DtcStatus::Pending
-    } else if status & 0x10 != 0 {
-        DtcStatus::Permanent
     } else {
         DtcStatus::Unknown
     }

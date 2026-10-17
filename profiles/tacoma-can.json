@@ -16,7 +16,7 @@
     "response_id": "0x708",
     "obd_request_id": "0x7E0",
     "obd_response_id": "0x7E8",
-    "filter_mask": "0x718"
+    "filter_mask": "0x7FE"
   },
   "kline": {
     "tester": "0xF1",

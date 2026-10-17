@@ -397,13 +397,23 @@ impl TcmIdentifier {
             ));
         }
 
-        let mut id = EcuIdentification::default();
-        let mut field_errors: Vec<String> = Vec::new();
         let mut client = UdsClient::for_profile(device, channel, &transport);
         // OBD Mode 09 first, as for the ECM: functional request, reply from the TCM's OBD id.
         // A TCM that lacks a PID stays silent, so do not wait the full 2 s P2 for it.
         let mut obd = UdsClient::for_obd(channel, &transport);
         obd.set_timers(OBD_REPLY_MS, OBD_REPLY_MS);
+        Self::read_ids(device, profile, &mut client, &mut obd, allow_demo_defaults)
+    }
+
+    fn read_ids(
+        device: &mut dyn PassThruDevice,
+        profile: &TcmProfile,
+        client: &mut UdsClient,
+        obd: &mut UdsClient,
+        allow_demo_defaults: bool,
+    ) -> Result<EcuIdentification, String> {
+        let mut id = EcuIdentification::default();
+        let mut field_errors: Vec<String> = Vec::new();
 
         // VIN: Mode 09 02, then DID F190.
         let mut vin_error = String::new();
