@@ -569,6 +569,106 @@ mod hardware {
         assert!(!id.cal_ids.is_empty(), "no TCM Cal ID");
     }
 
+    /// Read-only: one multi-PID Mode 01 request (RPM, TPS, speed, lambda, timing, load).
+    #[test]
+    #[ignore]
+    fn hardware_multi_pid_request() {
+        let dll = match std::env::var("WIDEBAND_HW_DLL") {
+            Ok(path) => path,
+            Err(_) => return,
+        };
+        let profile = EcuProfile::tacoma_can();
+        let mut dev = super::create_host_device(&dll);
+        dev.open().expect("open cable");
+        let channel = crate::j2534::connect_for_profile(dev.as_mut(), &profile).expect("connect");
+        let req = [0x01, 0x0C, 0x11, 0x0D, 0x24, 0x0E, 0x04];
+        let started = Instant::now();
+        let resp = crate::protocols::IsoTpLink::exchange_for_profile(dev.as_mut(), channel, &profile, &req, 300);
+        let ms = started.elapsed().as_millis();
+        let _ = dev.close();
+        println!("{:02X?} -> {:02X?} ({} ms)", req, resp, ms);
+        let parts = crate::telemetry::split_mode01_reply(&resp.expect("multi-PID reply"));
+        println!("PIDs answered: {:02X?}", parts.iter().map(|(p, _)| *p).collect::<Vec<_>>());
+        assert!(parts.len() >= 4);
+    }
+
+    /// Read-only: lists the TCM DIDs in 0x1000-0x10FF and 0x1600-0x16FF that answer `22`.
+    #[test]
+    #[ignore]
+    fn hardware_scan_tcm_dids() {
+        let dll = match std::env::var("WIDEBAND_HW_DLL") {
+            Ok(path) => path,
+            Err(_) => return,
+        };
+        let profile = EcuProfile::tacoma_can();
+        let tcm = crate::tcm::TcmProfile::tacoma_can_tcm().to_diagnostic_profile();
+        let mut dev = super::create_host_device(&dll);
+        dev.open().expect("open cable");
+        let channel = crate::j2534::connect_for_profile(dev.as_mut(), &profile).expect("connect");
+        let mut client = crate::uds::UdsClient::for_profile(dev.as_mut(), channel, &tcm);
+        client.set_timers(250, 1000);
+        let mut found = 0;
+        let ranges: Vec<std::ops::RangeInclusive<u16>> = match std::env::var("WIDEBAND_SCAN") {
+            // e.g. "1C00-1CFF,2A00-2AFF"
+            Ok(spec) => spec
+                .split(',')
+                .filter_map(|r| {
+                    let (a, b) = r.trim().split_once('-')?;
+                    Some(u16::from_str_radix(a, 16).ok()?..=u16::from_str_radix(b, 16).ok()?)
+                })
+                .collect(),
+            Err(_) => vec![0x1000..=0x10FF, 0x1600..=0x16FF],
+        };
+        for did in ranges.into_iter().flatten() {
+            let req = [0x22, (did >> 8) as u8, did as u8];
+            if let Ok(resp) = client.request(dev.as_mut(), &req, 0x62) {
+                found += 1;
+                println!("DID {:04X}: {:02X?}", did, &resp[3..]);
+            }
+        }
+        let _ = dev.close();
+        println!("{} TCM DIDs answered", found);
+    }
+
+    /// Read-only: samples the DIDs in `WIDEBAND_SAMPLE` ("tcm:1601,tcm:1602,ecm:107B") for
+    /// `WIDEBAND_SAMPLE_SECS` seconds (default 40) and prints every change with its time.
+    #[test]
+    #[ignore]
+    fn hardware_sample_dids() {
+        let (dll, list) = match (std::env::var("WIDEBAND_HW_DLL"), std::env::var("WIDEBAND_SAMPLE")) {
+            (Ok(d), Ok(l)) => (d, l),
+            _ => return,
+        };
+        let secs: u64 = std::env::var("WIDEBAND_SAMPLE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
+        let profile = EcuProfile::tacoma_can();
+        let tcm = crate::tcm::TcmProfile::tacoma_can_tcm().to_diagnostic_profile();
+        let targets: Vec<(String, u16)> = list
+            .split(',')
+            .filter_map(|item| {
+                let (module, did) = item.trim().split_once(':')?;
+                Some((module.to_string(), u16::from_str_radix(did, 16).ok()?))
+            })
+            .collect();
+        let mut dev = super::create_host_device(&dll);
+        dev.open().expect("open cable");
+        let channel = crate::j2534::connect_for_profile(dev.as_mut(), &profile).expect("connect");
+        let mut last: Vec<Option<Vec<u8>>> = vec![None; targets.len()];
+        let started = Instant::now();
+        while started.elapsed().as_secs() < secs {
+            for (i, (module, did)) in targets.iter().enumerate() {
+                let target = if module == "tcm" { &tcm } else { &profile };
+                let req = [0x22, (did >> 8) as u8, *did as u8];
+                if let Ok(resp) = crate::protocols::IsoTpLink::exchange_for_profile(dev.as_mut(), channel, target, &req, 200) {
+                    if resp.first() == Some(&0x62) && last[i].as_ref() != Some(&resp) {
+                        println!("{:6.1}s {}:{:04X} {:02X?}", started.elapsed().as_secs_f32(), module, did, &resp[3..]);
+                        last[i] = Some(resp);
+                    }
+                }
+            }
+        }
+        let _ = dev.close();
+    }
+
     /// Read-only: UDS TesterPresent on the diagnostic ids, then one OBD PID and one DID through
     /// the telemetry path.
     #[test]

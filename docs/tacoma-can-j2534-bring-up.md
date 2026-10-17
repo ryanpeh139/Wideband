@@ -60,6 +60,12 @@ Toyota channels matched against a logged Techstream Data List (All Data) on this
 | Oil temp | `22 10 7B`, byte 25 of the data | `A − 40` °C | 41 °C vs "Engine Oil Temperature 106 F" |
 | Cat temp B1S1 | `01 3C` | `(A·256+B)/10 − 40` °C | banks equal, ~420 °C vs 798 F |
 | ATF temp | `22 16 27` (ECM; the TCM has the same DID on `0x701`) | `A + B/256 − 40` °C | `52 80` = 42.5 °C vs "A/T Oil Temperature No.1 108.5 F" |
+| ATF temp 2 | `22 16 28` on the TCM (`"module": "tcm"`) | `A + B/256 − 40` °C | "A/T Oil Temperature No.2" |
+| Turbine speed | `22 16 01` (ECM; same DID on the TCM) | `A × 50` rpm | `0C` = 600 rpm vs "NT Sensor Speed 600" |
+
+Live data sends due Mode 01 channels up to six PIDs per request (`01 0C 11 0D 24 0E 04` answers all six in ~100 ms; a PID the ECM lacks is left out of the reply). With six channels per scheduler tick, RPM and TPS update ~6 Hz and the other fast channels ~3 Hz. Each J2534 call through the Mini-VCI takes ~15 ms, which matches the FTDI USB chip's default 16 ms latency timer. Channels marked `"module": "tcm"` are read from the transmission profile paired with the vehicle, on the same connection.
+
+The transmission's other live values (shift lever position, current gear, output shaft speed) are not mapped yet. Gear and output speed only change while driving.
 
 Techstream's All Data view reads block DIDs `F301`/`F302`, which concatenate single DIDs (`F301` starts with `107B`, `109E`, `107F`, …). Intake VVT angle and torque request were not identified with confidence, so they are not in the channel file.
 

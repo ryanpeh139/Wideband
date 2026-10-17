@@ -378,10 +378,12 @@ pub struct IsoTpLink;
 
 /// True when `resp` answers `request`: a negative reply for the same service, or a positive
 /// reply that echoes the request's PID / DID bytes (`41 0C ..` for `01 0C`, `62 01 03 ..` for
-/// `22 01 03`).
+/// `22 01 03`). A multi-PID Mode 01 reply interleaves data between PIDs and leaves out PIDs
+/// the ECU lacks, so it only has to start with one of the requested PIDs.
 fn reply_answers(request: &[u8], resp: &[u8]) -> bool {
     match (request.first(), resp.first()) {
         (Some(&service), Some(&0x7F)) => resp.len() >= 2 && resp[1] == service,
+        (Some(&0x01), Some(&0x41)) => resp.len() >= 2 && request[1..].contains(&resp[1]),
         (Some(&service), Some(&first)) => {
             first == (service | 0x40) && resp.len() >= request.len() && resp[1..request.len()] == request[1..]
         }
@@ -742,6 +744,9 @@ mod tests {
         let resp = IsoTpLink::exchange_for_profile(&mut obd, 1, &prof, &[0x01, 0x0C], 100).unwrap();
         assert_eq!(resp, vec![0x41, 0x0C, 0x1A, 0xF8]);
         assert!(reply_answers(&[0x22, 0x18, 0x10], &[0x7F, 0x22, 0x31]));
+        // The truck's ECM leaves out MAP (0B) and starts its reply at speed (0D).
+        assert!(reply_answers(&[0x01, 0x0B, 0x0D, 0x06], &[0x41, 0x0D, 0x00, 0x06, 0x80]));
+        assert!(!reply_answers(&[0x01, 0x0B, 0x0D], &[0x41, 0x0C, 0x00, 0x00]));
         assert!(!reply_answers(&[0x22, 0x01, 0x03], &[0x62, 0x01, 0x04, 0x00]));
     }
 

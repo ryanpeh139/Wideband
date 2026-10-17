@@ -82,6 +82,8 @@ pub struct TelemetryChannelDef {
     pub priority: u8,
     pub interval_ms: u64,
     pub request: ChannelRequestDef,
+    #[serde(default)]
+    pub module: ChannelModule,
     pub decode: String,
     #[serde(default = "default_true")]
     pub gauge: bool,
@@ -93,6 +95,50 @@ pub struct TelemetryChannelDef {
 
 fn default_true() -> bool {
     true
+}
+
+/// Which module a live-data channel is read from.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelModule {
+    /// The engine ECU (the connected vehicle profile).
+    #[default]
+    Ecm,
+    /// The transmission ECU (the selected TCM profile, on the same connection).
+    Tcm,
+}
+
+/// Data bytes in a Mode 01 reply for the PIDs live data uses (SAE J1979). PIDs not listed are
+/// never batched with others.
+pub fn mode01_data_len(pid: u8) -> Option<usize> {
+    match pid {
+        0x04 | 0x05 | 0x06 | 0x07 | 0x0B | 0x0D | 0x0E | 0x0F | 0x11 | 0x2F | 0x33 => Some(1),
+        0x0C | 0x10 | 0x1F | 0x3C | 0x3D | 0x3E | 0x3F | 0x42 => Some(2),
+        0x24..=0x2B => Some(4),
+        _ => None,
+    }
+}
+
+/// Splits a multi-PID Mode 01 reply (`41 p1 d.. p2 d..`) into one `41 pid data` reply per PID.
+/// Stops at the first PID it cannot size; PIDs the ECU does not support are simply absent.
+pub fn split_mode01_reply(resp: &[u8]) -> Vec<(u8, Vec<u8>)> {
+    let mut out = Vec::new();
+    if resp.first() != Some(&0x41) {
+        return out;
+    }
+    let mut i = 1;
+    while i < resp.len() {
+        let pid = resp[i];
+        let Some(len) = mode01_data_len(pid) else { break };
+        if i + 1 + len > resp.len() {
+            break;
+        }
+        let mut single = vec![0x41, pid];
+        single.extend_from_slice(&resp[i + 1..i + 1 + len]);
+        out.push((pid, single));
+        i += 1 + len;
+    }
+    out
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -320,6 +366,22 @@ pub fn decode_channel_value(decode: &str, resp: &[u8]) -> Option<f32> {
         "did_1627_atf_temp" => {
             if resp[0] == 0x62 && resp.len() >= 5 && resp[1] == 0x16 && resp[2] == 0x27 {
                 Some(resp[3] as f32 + resp[4] as f32 / 256.0 - 40.0)
+            } else {
+                None
+            }
+        }
+        "did_1628_atf_temp2" => {
+            if resp[0] == 0x62 && resp.len() >= 5 && resp[1] == 0x16 && resp[2] == 0x28 {
+                Some(resp[3] as f32 + resp[4] as f32 / 256.0 - 40.0)
+            } else {
+                None
+            }
+        }
+        // Toyota DID 1601 (ECM and TCM): turbine (NT) sensor speed, A * 50 rpm. Matched to
+        // Techstream: 0C = 600 rpm and 0B = 550 rpm in Park.
+        "did_1601_nt_speed" => {
+            if resp[0] == 0x62 && resp.len() >= 4 && resp[1] == 0x16 && resp[2] == 0x01 {
+                Some(resp[3] as f32 * 50.0)
             } else {
                 None
             }
@@ -766,6 +828,7 @@ mod tests {
                 priority: 1,
                 interval_ms: 50,
                 request: ChannelRequestDef::Mode01 { pid: 0x0C },
+                module: ChannelModule::Ecm,
                 decode: "pid_0c_rpm".into(),
                 gauge: true,
                 plot: None,
@@ -778,6 +841,7 @@ mod tests {
                 priority: 1,
                 interval_ms: 50,
                 request: ChannelRequestDef::Mode01 { pid: 0x0B },
+                module: ChannelModule::Ecm,
                 decode: "pid_0b_map_kpa".into(),
                 gauge: true,
                 plot: None,
@@ -790,6 +854,7 @@ mod tests {
                 priority: 2,
                 interval_ms: 50,
                 request: ChannelRequestDef::Mode01 { pid: 0x05 },
+                module: ChannelModule::Ecm,
                 decode: "pid_05_ect".into(),
                 gauge: false,
                 plot: None,
@@ -802,6 +867,7 @@ mod tests {
                 priority: 3,
                 interval_ms: 50,
                 request: ChannelRequestDef::Mode01 { pid: 0x0F },
+                module: ChannelModule::Ecm,
                 decode: "pid_0f_iat".into(),
                 gauge: false,
                 plot: None,
@@ -918,6 +984,20 @@ mod tests {
         let v = decode_channel_value("pid_42_ecu_v", &[0x41, 0x42, 0x35, 0x80]).unwrap();
         assert!((v - 13.696).abs() < 0.01, "Techstream: 13.7 V");
         assert_eq!(decode_channel_value("did_107b_oil_temp", &[0x62, 0x10, 0x7B, 0x00]), None, "short reply");
+    }
+
+    #[test]
+    fn test_split_multi_pid_reply() {
+        // 01 0C 11 0D 24: RPM, TPS, speed, lambda; the ECU leaves out a PID it lacks.
+        let resp = [0x41, 0x0C, 0x1A, 0xF8, 0x11, 0x30, 0x24, 0x80, 0x19, 0x69, 0xD7];
+        let parts = split_mode01_reply(&resp);
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0], (0x0C, vec![0x41, 0x0C, 0x1A, 0xF8]));
+        assert_eq!(parts[1], (0x11, vec![0x41, 0x11, 0x30]));
+        assert_eq!(parts[2].0, 0x24);
+        assert_eq!(decode_channel_value("pid_0c_rpm", &parts[0].1), Some(1726.0));
+        assert!(split_mode01_reply(&[0x7F, 0x01, 0x12]).is_empty());
+        assert!(split_mode01_reply(&[0x41, 0x0C, 0x1A]).is_empty(), "truncated reply");
     }
 
     #[test]

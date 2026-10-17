@@ -8,7 +8,7 @@
 
 use crate::j2534::PassThruDevice;
 use crate::protocols::{EcuProfile, IsoTpLink};
-use crate::telemetry::{decode_channel_value, TelemetryBuffer};
+use crate::telemetry::{decode_channel_value, mode01_data_len, split_mode01_reply, ChannelModule, TelemetryBuffer};
 use crate::tester_present::{IdleTesterOutcome, IdleTesterPresent};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -48,6 +48,13 @@ impl LiveStatus {
     }
 }
 
+/// Who live data talks to: the engine ECU (the connected profile) and, for channels marked
+/// `"module": "tcm"`, the transmission ECU on the same connection.
+pub struct Profiles {
+    pub ecm: EcuProfile,
+    pub tcm: Option<EcuProfile>,
+}
+
 pub struct LivePoller {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -58,7 +65,7 @@ impl LivePoller {
     pub fn start(
         device: SharedDevice,
         telemetry: Arc<Mutex<TelemetryBuffer>>,
-        profile: EcuProfile,
+        profiles: Profiles,
         status: Arc<LiveStatus>,
         keepalive: bool,
     ) -> Self {
@@ -66,7 +73,7 @@ impl LivePoller {
         let stop_flag = stop.clone();
         let handle = std::thread::Builder::new()
             .name("live-poller".into())
-            .spawn(move || run(device, telemetry, profile, status, keepalive, stop_flag))
+            .spawn(move || run(device, telemetry, profiles, status, keepalive, stop_flag))
             .ok();
         Self { stop, handle }
     }
@@ -100,11 +107,13 @@ fn let_ui_in() {
 fn run(
     device: SharedDevice,
     telemetry: Arc<Mutex<TelemetryBuffer>>,
-    profile: EcuProfile,
+    profiles: Profiles,
     status: Arc<LiveStatus>,
     keepalive: bool,
     stop: Arc<AtomicBool>,
 ) {
+    let mut batching = true;
+    let mut failed_batches = 0u32;
     let mut keeper = IdleTesterPresent::new();
     if keepalive {
         keeper.arm_for_real_hardware();
@@ -137,7 +146,7 @@ fn run(
                     *lock(&status.vbatt) = Some(v);
                 }
             }
-            if let IdleTesterOutcome::Failed = keeper.tick(dev.as_mut(), &profile, true, !keepalive, false) {
+            if let IdleTesterOutcome::Failed = keeper.tick(dev.as_mut(), &profiles.ecm, true, !keepalive, false) {
                 status.say(
                     "TesterPresent was not answered; idle keepalive stopped (channel stays open). Reconnect to retry."
                         .to_string(),
@@ -147,20 +156,43 @@ fn run(
         let_ui_in();
 
         if status.enabled.load(Ordering::SeqCst) {
-            poll_channels(&device, &telemetry, &profile, &status, &stop);
+            poll_channels(&device, &telemetry, &profiles, &status, &stop, &mut batching, &mut failed_batches);
         }
     }
+}
+
+/// One channel due this tick.
+struct Poll {
+    idx: usize,
+    req: Vec<u8>,
+    decode: String,
+    label: String,
+    module: ChannelModule,
+}
+
+/// ECM Mode 01 channels whose reply length is known go out up to this many PIDs per request
+/// (SAE J1979 allows six). Each cable round trip costs ~30 ms, so batching multiplies the rate.
+const MAX_PIDS_PER_REQUEST: usize = 6;
+
+fn batchable(p: &Poll) -> bool {
+    p.module == ChannelModule::Ecm && p.req.len() == 2 && p.req[0] == 0x01 && mode01_data_len(p.req[1]).is_some()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ")
 }
 
 fn poll_channels(
     device: &SharedDevice,
     telemetry: &Arc<Mutex<TelemetryBuffer>>,
-    profile: &EcuProfile,
+    profiles: &Profiles,
     status: &LiveStatus,
     stop: &AtomicBool,
+    batching: &mut bool,
+    failed_batches: &mut u32,
 ) {
     let now = Instant::now();
-    let poll_list: Vec<(usize, Vec<u8>, String, String)> = {
+    let polls: Vec<Poll> = {
         let mut buf = lock(telemetry);
         let plan = buf.scheduler.plan(&buf.channels, now);
         buf.scheduler.apply_budget_skips(&plan.budget_skipped, now);
@@ -168,51 +200,151 @@ fn poll_channels(
             .into_iter()
             .map(|idx| {
                 let ch = &buf.channels[idx];
-                (idx, ch.build_request_bytes(), ch.decode.clone(), ch.label.clone())
+                Poll {
+                    idx,
+                    req: ch.build_request_bytes(),
+                    decode: ch.decode.clone(),
+                    label: ch.label.clone(),
+                    module: ch.module,
+                }
             })
             .collect()
     };
 
-    for (idx, req, decode_id, label) in poll_list {
+    let (mut batch, singles): (Vec<Poll>, Vec<Poll>) = if *batching {
+        polls.into_iter().partition(batchable)
+    } else {
+        (Vec::new(), polls)
+    };
+    while !batch.is_empty() {
         if stop.load(Ordering::SeqCst) || status.paused.load(Ordering::SeqCst) {
             return;
         }
-        let resp = {
-            let mut slot = lock(device);
-            let Some(dev) = slot.as_mut() else { return };
-            let channel = dev.channel_id();
-            IsoTpLink::exchange_for_profile(dev.as_mut(), channel, profile, &req, LIVE_REPLY_MS)
-        };
-        let_ui_in();
-        let value = resp.as_ref().ok().and_then(|r| decode_channel_value(&decode_id, r));
-        let mut buf = lock(telemetry);
-        if let Some(value) = value {
-            buf.set_channel_value(idx, value, now);
-            buf.scheduler.record_success(idx, now);
+        let rest = batch.split_off(batch.len().min(MAX_PIDS_PER_REQUEST));
+        let group = std::mem::replace(&mut batch, rest);
+        if group.len() == 1 {
+            poll_single(device, telemetry, profiles, status, group.into_iter().next().unwrap(), now);
             continue;
         }
-        buf.bus_fail_count += 1;
-        let refused = matches!(&resp, Ok(r) if r.len() >= 3 && r[0] == 0x7F && NRC_NOT_SUPPORTED.contains(&r[2]));
-        let dropped = if refused {
-            buf.scheduler.record_failure(idx, now);
-            buf.scheduler.mark_unsupported(idx);
-            true
-        } else {
-            buf.scheduler.record_failure(idx, now)
-        };
-        if dropped {
-            let why = match &resp {
-                Ok(r) => r.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" "),
-                Err(e) => e.clone(),
-            };
-            let request = req.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
-            status.say(format!(
-                "Live data: {} ({}) is not supported by this ECU ({}); stopped polling it. Clear live to retry.",
-                label, request, why
-            ));
+        let mut req = vec![0x01];
+        req.extend(group.iter().map(|p| p.req[1]));
+        let resp = exchange(device, &profiles.ecm, &req);
+        let parts = resp.as_ref().map(|r| split_mode01_reply(r)).unwrap_or_default();
+        if parts.is_empty() {
+            // No PID of this batch answered (all unsupported, or a lost reply): ask one PID at a
+            // time this round. If single PIDs answer while batches keep failing, the ECU does not
+            // take multi-PID requests, so stop batching.
+            let mut answered = false;
+            for p in group {
+                answered |= poll_single(device, telemetry, profiles, status, p, now);
+            }
+            if answered {
+                *failed_batches += 1;
+                if *failed_batches >= 3 {
+                    *batching = false;
+                    status.say(format!(
+                        "Live data: the ECU does not answer multi-PID requests ({} -> {}); polling one PID at a time.",
+                        hex(&req),
+                        match &resp {
+                            Ok(r) => hex(r),
+                            Err(e) => e.clone(),
+                        }
+                    ));
+                }
+            }
+            continue;
+        }
+        *failed_batches = 0;
+        for p in group {
+            let single = parts.iter().find(|(pid, _)| *pid == p.req[1]).map(|(_, r)| r.clone());
+            // A PID the ECU lacks is left out of a multi-PID reply rather than refused.
+            let outcome = single.ok_or_else(|| "not in the multi-PID reply".to_string());
+            record(telemetry, status, &p, &outcome, now);
         }
     }
+    for p in singles {
+        if stop.load(Ordering::SeqCst) || status.paused.load(Ordering::SeqCst) {
+            return;
+        }
+        poll_single(device, telemetry, profiles, status, p, now);
+    }
     lock(telemetry).push_frame();
+}
+
+fn poll_single(
+    device: &SharedDevice,
+    telemetry: &Arc<Mutex<TelemetryBuffer>>,
+    profiles: &Profiles,
+    status: &LiveStatus,
+    p: Poll,
+    now: Instant,
+) -> bool {
+    let resp = match p.module {
+        ChannelModule::Ecm => exchange(device, &profiles.ecm, &p.req),
+        ChannelModule::Tcm => match &profiles.tcm {
+            Some(tcm) => exchange(device, tcm, &p.req),
+            None => Err("no transmission profile is selected".to_string()),
+        },
+    };
+    record(telemetry, status, &p, &resp, now)
+}
+
+fn exchange(device: &SharedDevice, profile: &EcuProfile, req: &[u8]) -> Result<Vec<u8>, String> {
+    let resp = {
+        let mut slot = lock(device);
+        let Some(dev) = slot.as_mut() else {
+            return Err("cable closed".to_string());
+        };
+        let channel = dev.channel_id();
+        IsoTpLink::exchange_for_profile(dev.as_mut(), channel, profile, req, LIVE_REPLY_MS)
+    };
+    let_ui_in();
+    resp
+}
+
+/// Stores a decoded value (returns true), or counts a failure and drops the channel once it is
+/// clearly unsupported.
+fn record(
+    telemetry: &Arc<Mutex<TelemetryBuffer>>,
+    status: &LiveStatus,
+    p: &Poll,
+    resp: &Result<Vec<u8>, String>,
+    now: Instant,
+) -> bool {
+    let value = resp.as_ref().ok().and_then(|r| decode_channel_value(&p.decode, r));
+    let mut buf = lock(telemetry);
+    if let Some(value) = value {
+        buf.set_channel_value(p.idx, value, now);
+        buf.scheduler.record_success(p.idx, now);
+        return true;
+    }
+    buf.bus_fail_count += 1;
+    let refused = matches!(resp, Ok(r) if r.len() >= 3 && r[0] == 0x7F && NRC_NOT_SUPPORTED.contains(&r[2]));
+    let dropped = if refused {
+        buf.scheduler.record_failure(p.idx, now);
+        buf.scheduler.mark_unsupported(p.idx);
+        true
+    } else {
+        buf.scheduler.record_failure(p.idx, now)
+    };
+    if dropped {
+        let why = match resp {
+            Ok(r) => hex(r),
+            Err(e) => e.clone(),
+        };
+        let module = match p.module {
+            ChannelModule::Ecm => "ECU",
+            ChannelModule::Tcm => "transmission ECU",
+        };
+        status.say(format!(
+            "Live data: {} ({}) is not supported by this {} ({}); stopped polling it. Clear live to retry.",
+            p.label,
+            hex(&p.req),
+            module,
+            why
+        ));
+    }
+    false
 }
 
 
@@ -240,7 +372,8 @@ mod hardware {
         let telemetry = Arc::new(Mutex::new(TelemetryBuffer::from_definition(&def, None)));
         let status = Arc::new(LiveStatus::default());
         status.enabled.store(true, Ordering::SeqCst);
-        let mut poller = LivePoller::start(device.clone(), telemetry.clone(), profile.clone(), status.clone(), true);
+        let profiles = Profiles { ecm: profile.clone(), tcm: Some(crate::tcm::TcmProfile::tacoma_can_tcm().to_diagnostic_profile()) };
+        let mut poller = LivePoller::start(device.clone(), telemetry.clone(), profiles, status.clone(), true);
 
         // A 60 fps window only touches the telemetry buffer; measure its worst wait.
         let started = Instant::now();

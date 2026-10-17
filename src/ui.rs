@@ -712,11 +712,17 @@ impl WidebandApp {
         *self.live_status.vbatt.lock().unwrap() = None;
         self.telemetry.lock().unwrap().scheduler.reset_support();
         self.sync_live_flags();
-        let prof = self.profiles[self.selected_profile_idx].clone();
+        let ecm = self.profiles[self.selected_profile_idx].clone();
+        // TCM channels use the transmission profile paired with this vehicle, if there is one.
+        let tcm = self
+            .tcm_profiles
+            .get(self.selected_tcm_profile_idx)
+            .filter(|t| t.paired_ecm_profile_id == ecm.id)
+            .map(|t| t.to_diagnostic_profile());
         self.live_poller = Some(LivePoller::start(
             self.active_device.clone(),
             self.telemetry.clone(),
-            prof,
+            crate::live_poller::Profiles { ecm, tcm },
             self.live_status.clone(),
             !self.active_device_virtual,
         ));
