@@ -1,0 +1,14 @@
+[package]
+name = "j2534-sniff"
+version = "0.1.0"
+edition = "2021"
+description = "32-bit J2534 pass-through DLL that logs every PassThru call and forwards it unchanged"
+
+[lib]
+crate-type = ["cdylib"]
+
+# Standalone: built for i686-pc-windows-gnu, not part of the Wideband workspace.
+[workspace]
+
+[profile.release]
+panic = "abort"

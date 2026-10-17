@@ -1,0 +1,7 @@
+[build]
+target = "i686-pc-windows-gnu"
+
+[target.i686-pc-windows-gnu]
+linker = "i686-w64-mingw32-gcc"
+# Export PassThruOpen, not PassThruOpen@8: J2534 applications look up undecorated names.
+rustflags = ["-C", "link-arg=-Wl,--kill-at", "-C", "target-feature=+crt-static"]
