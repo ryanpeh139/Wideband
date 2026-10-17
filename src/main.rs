@@ -44,6 +44,10 @@ use eframe::egui;
 use ui::WidebandApp;
 
 fn main() -> eframe::Result<()> {
+    // `--raw-can` keeps CAN profiles on raw CAN with Wideband's own ISO-TP (same as WIDEBAND_RAW_CAN=1).
+    if std::env::args().any(|a| a == "--raw-can") {
+        std::env::set_var("WIDEBAND_RAW_CAN", "1");
+    }
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 880.0])

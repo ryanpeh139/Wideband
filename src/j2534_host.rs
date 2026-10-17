@@ -37,6 +37,9 @@ mod imp {
         active_protocol: u32,
         /// The channel is J2534 ISO15765 (protocol 6) and the cable runs ISO-TP.
         cable_isotp: bool,
+        /// `j2534-trace.log` beside the program: every host command, reply, and its duration.
+        trace: Option<std::fs::File>,
+        trace_lines: u32,
     }
 
     impl HostPassThruDevice {
@@ -58,6 +61,8 @@ mod imp {
                 connect_request_id: 0x7E0,
                 active_protocol: 5,
                 cable_isotp: false,
+                trace: None,
+                trace_lines: 0,
             }
         }
 
@@ -84,7 +89,48 @@ mod imp {
             PathBuf::from("J2534Host.exe")
         }
 
+        /// Starts a fresh trace for this cable session; tracing is best effort and never fails a call.
+        fn open_trace(&mut self) {
+            let dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .unwrap_or_else(|| PathBuf::from("."));
+            self.trace = std::fs::File::create(dir.join("j2534-trace.log")).ok();
+            self.trace_lines = 0;
+            let started = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            let note = format!("Wideband J2534 trace {} — {}", started, self.lib_path);
+            self.trace_line(&note);
+        }
+
+        fn trace_line(&mut self, text: &str) {
+            const MAX_TRACE_LINES: u32 = 50_000;
+            if let Some(file) = self.trace.as_mut() {
+                if self.trace_lines >= MAX_TRACE_LINES {
+                    return;
+                }
+                self.trace_lines += 1;
+                let stamp = chrono::Local::now().format("%H:%M:%S%.3f");
+                let _ = writeln!(file, "{} {}", stamp, text);
+                if self.trace_lines == MAX_TRACE_LINES {
+                    let _ = writeln!(file, "{} trace limit reached", stamp);
+                }
+                let _ = file.flush();
+            }
+        }
+
         fn command(&mut self, line: &str, timeout_ms: u32) -> Result<Value, String> {
+            let sent = Instant::now();
+            self.trace_line(&format!(">> {}", line));
+            let result = self.command_untraced(line, timeout_ms);
+            let ms = sent.elapsed().as_millis();
+            match &result {
+                Ok(v) => self.trace_line(&format!("<< {} ({} ms)", v, ms)),
+                Err(e) => self.trace_line(&format!("!! {} ({} ms)", e, ms)),
+            }
+            result
+        }
+
+        fn command_untraced(&mut self, line: &str, timeout_ms: u32) -> Result<Value, String> {
             let stdin = self.stdin.as_mut().ok_or("J2534Host stdin not open")?;
             writeln!(stdin, "{}", line).map_err(|e| format!("host write failed: {}", e))?;
             stdin.flush().map_err(|e| e.to_string())?;
@@ -211,6 +257,7 @@ mod imp {
             let stdin = child.stdin.take().ok_or("host stdin missing")?;
             let stdout = child.stdout.take().ok_or("host stdout missing")?;
             self.child = Some(child);
+            self.open_trace();
             self.stdin = Some(stdin);
             let (tx, rx) = mpsc::channel::<String>();
             std::thread::Builder::new()

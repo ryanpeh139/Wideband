@@ -93,6 +93,7 @@ Section "Wideband" SecMain
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   CreateDirectory "$SMPROGRAMS\Wideband"
   CreateShortCut "$SMPROGRAMS\Wideband\Wideband.lnk" "$INSTDIR\wideband.exe"
+  CreateShortCut "$SMPROGRAMS\Wideband\Wideband (raw CAN mode).lnk" "$INSTDIR\wideband.exe" "--raw-can"
   CreateShortCut "$SMPROGRAMS\Wideband\Uninstall Wideband.lnk" "$INSTDIR\Uninstall.exe"
   CreateShortCut "$DESKTOP\Wideband.lnk" "$INSTDIR\wideband.exe"
 
@@ -122,10 +123,12 @@ Section "Uninstall"
   RMDir /r "$INSTDIR\profiles"
   RMDir /r "$INSTDIR\definition-packs"
   Delete "$INSTDIR\Uninstall.exe"
+  Delete "$INSTDIR\j2534-trace.log"
   ; security-config.json, ECU records, and logs stay; the folder is removed only when empty.
   RMDir "$INSTDIR"
 
   Delete "$SMPROGRAMS\Wideband\Wideband.lnk"
+  Delete "$SMPROGRAMS\Wideband\Wideband (raw CAN mode).lnk"
   Delete "$SMPROGRAMS\Wideband\Uninstall Wideband.lnk"
   RMDir "$SMPROGRAMS\Wideband"
   Delete "$DESKTOP\Wideband.lnk"

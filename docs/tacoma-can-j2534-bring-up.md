@@ -33,7 +33,9 @@ Wideband discovers devices from `PassThruSupport.04.04` registry keys and common
 
 ## How Wideband talks to the cable on CAN
 
-On CAN profiles Wideband opens the cable in **ISO 15765** mode (J2534 protocol 6) with a flow-control filter, the same way Techstream does: the cable segments and reassembles diagnostic messages and answers flow control itself. Clone Mini-VCI cables are tested for this mode by their makers; several do not answer reliably in raw CAN mode. The Connect log line ends with `ISO 15765 (cable ISO-TP)` when this mode is active. If a cable refuses it, Wideband falls back to raw CAN (protocol 5) with its own ISO-TP and the log says `raw CAN (cable refused ISO 15765: …)`. Set the environment variable `WIDEBAND_RAW_CAN=1` before starting Wideband to force raw CAN.
+On CAN profiles Wideband opens the cable in **ISO 15765** mode (J2534 protocol 6) with a flow-control filter, the same way Techstream does: the cable segments and reassembles diagnostic messages and answers flow control itself. Clone Mini-VCI cables are tested for this mode by their makers; several do not answer reliably in raw CAN mode. The Connect log line ends with `ISO 15765 (cable ISO-TP)` when this mode is active. If a cable refuses it, Wideband falls back to raw CAN (protocol 5) with its own ISO-TP and the log says `raw CAN (cable refused ISO 15765: …)`. Start Wideband with `--raw-can` (Start menu: **Wideband (raw CAN mode)**) or set `WIDEBAND_RAW_CAN=1` to force raw CAN.
+
+Each cable session writes `j2534-trace.log` beside `wideband.exe`: every command sent to `J2534Host.exe`, its reply, and how long it took. If Wideband stops responding with a cable connected, the last lines show which call the cable driver did not return from.
 
 ## Sharing the cable with Techstream
 
