@@ -377,6 +377,35 @@ pub fn decode_channel_value(decode: &str, resp: &[u8]) -> Option<f32> {
                 None
             }
         }
+        // Toyota TCM DID 1011: data byte 3 holds the shift lever switches (0x20 P, 0x40 R,
+        // 0x80 N; 0x01 = "N or P") and byte 5 bit 0 is D. 0 = P, 1 = R, 2 = N, 3 = D,
+        // -1 = between positions. Mapped on a 2017 Tacoma by shifting P-R-N-D-N-P.
+        "did_1011_shift_lever" => {
+            if resp[0] == 0x62 && resp.len() >= 3 + 6 && resp[1] == 0x10 && resp[2] == 0x11 {
+                let (sw, d) = (resp[3 + 3], resp[3 + 5]);
+                Some(if sw & 0x20 != 0 {
+                    0.0
+                } else if sw & 0x40 != 0 {
+                    1.0
+                } else if sw & 0x80 != 0 {
+                    2.0
+                } else if d & 0x01 != 0 {
+                    3.0
+                } else {
+                    -1.0
+                })
+            } else {
+                None
+            }
+        }
+        // Toyota TCM DID 1011, data byte 1 bit 0: brake (stop light) switch, 1 = pressed.
+        "did_1011_brake" => {
+            if resp[0] == 0x62 && resp.len() >= 3 + 2 && resp[1] == 0x10 && resp[2] == 0x11 {
+                Some((resp[3 + 1] & 0x01) as f32)
+            } else {
+                None
+            }
+        }
         // Toyota DID 1601 (ECM and TCM): turbine (NT) sensor speed, A * 50 rpm. Matched to
         // Techstream: 0C = 600 rpm and 0B = 550 rpm in Park.
         "did_1601_nt_speed" => {
@@ -984,6 +1013,26 @@ mod tests {
         let v = decode_channel_value("pid_42_ecu_v", &[0x41, 0x42, 0x35, 0x80]).unwrap();
         assert!((v - 13.696).abs() < 0.01, "Techstream: 13.7 V");
         assert_eq!(decode_channel_value("did_107b_oil_temp", &[0x62, 0x10, 0x7B, 0x00]), None, "short reply");
+    }
+
+    #[test]
+    fn test_decode_shift_lever_from_shifting_capture() {
+        // TCM 1011 replies recorded while shifting P-R-N-D-N-P with the brake held.
+        let reply = |b: [u8; 10]| {
+            let mut r = vec![0x62, 0x10, 0x11];
+            r.extend_from_slice(&b);
+            r
+        };
+        let p = reply([0x03, 0x01, 0xE1, 0x21, 0x03, 0x00, 0x80, 0x00, 0x10, 0x00]);
+        let r = reply([0x03, 0x01, 0xE1, 0x40, 0x03, 0x00, 0x80, 0x00, 0x10, 0x00]);
+        let n = reply([0x03, 0x01, 0xE1, 0x81, 0x03, 0x00, 0x80, 0x00, 0x10, 0x00]);
+        let d = reply([0x03, 0x01, 0xE1, 0x00, 0x03, 0x01, 0x80, 0x00, 0x10, 0x00]);
+        let off = reply([0x03, 0x00, 0xE1, 0x21, 0x03, 0x00, 0x80, 0x00, 0x10, 0x00]);
+        let lever = |r: &[u8]| decode_channel_value("did_1011_shift_lever", r);
+        assert_eq!((lever(&p), lever(&r), lever(&n), lever(&d)), (Some(0.0), Some(1.0), Some(2.0), Some(3.0)));
+        assert_eq!(decode_channel_value("did_1011_brake", &p), Some(1.0));
+        assert_eq!(decode_channel_value("did_1011_brake", &off), Some(0.0));
+        assert_eq!(decode_channel_value("did_1601_nt_speed", &[0x62, 0x16, 0x01, 0x0C]), Some(600.0));
     }
 
     #[test]

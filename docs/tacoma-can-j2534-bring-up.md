@@ -65,7 +65,15 @@ Toyota channels matched against a logged Techstream Data List (All Data) on this
 
 Live data sends due Mode 01 channels up to six PIDs per request (`01 0C 11 0D 24 0E 04` answers all six in ~100 ms; a PID the ECM lacks is left out of the reply). With six channels per scheduler tick, RPM and TPS update ~6 Hz and the other fast channels ~3 Hz. Each J2534 call through the Mini-VCI takes ~15 ms, which matches the FTDI USB chip's default 16 ms latency timer. Channels marked `"module": "tcm"` are read from the transmission profile paired with the vehicle, on the same connection.
 
-The transmission's other live values (shift lever position, current gear, output shaft speed) are not mapped yet. Gear and output speed only change while driving.
+Shift lever and brake switch come from TCM DID `1011`, mapped by shifting P-R-N-D-N-P with the engine running and the brake held:
+
+| Data byte | Bits | Meaning |
+| --- | --- | --- |
+| 3 | `0x20` P, `0x40` R, `0x80` N, `0x01` "N or P" | lever switches (`21` P, `40` R, `81` N) |
+| 5 | `0x01` | D |
+| 1 | `0x01` | brake (stop light) switch |
+
+During that run turbine speed (`1601`) dropped to 0 in R and D with the brake held and read 550–650 rpm in P and N. Current gear and output shaft speed only change while driving and are not mapped yet.
 
 Techstream's All Data view reads block DIDs `F301`/`F302`, which concatenate single DIDs (`F301` starts with `107B`, `109E`, `107F`, …). Intake VVT angle and torque request were not identified with confidence, so they are not in the channel file.
 

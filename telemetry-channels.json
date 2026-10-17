@@ -235,6 +235,32 @@
       "oem_note": "Toyota TCM DID 0x1628 A/T oil temperature No.2 (2017 Tacoma TCM on 0x701)",
       "gauge": false,
       "plot": { "scale": 10.0, "color": [156, 39, 176] }
+        },
+    {
+      "id": "shift_lever",
+      "label": "SHIFT LEVER (0=P 1=R 2=N 3=D)",
+      "unit": "",
+      "priority": 3,
+      "interval_ms": 250,
+      "request": { "service": "uds22", "did": 4113 },
+      "module": "tcm",
+      "decode": "did_1011_shift_lever",
+      "oem_note": "Toyota TCM DID 0x1011 shift switches (mapped by shifting P-R-N-D on a 2017 Tacoma)",
+      "gauge": false,
+      "plot": { "scale": 500.0, "color": [255, 255, 255] }
+    },
+    {
+      "id": "brake_sw",
+      "label": "BRAKE SWITCH",
+      "unit": "",
+      "priority": 4,
+      "interval_ms": 500,
+      "request": { "service": "uds22", "did": 4113 },
+      "module": "tcm",
+      "decode": "did_1011_brake",
+      "oem_note": "Toyota TCM DID 0x1011 byte 1 bit 0 (stop light switch)",
+      "gauge": false,
+      "plot": { "scale": 500.0, "color": [244, 67, 54] }
     }
   ]
 }
