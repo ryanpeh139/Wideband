@@ -214,6 +214,8 @@ impl TcmProfile {
             extended_id: self.extended_id,
             request_id: self.request_id,
             response_id: self.response_id,
+            obd_request_id: self.request_id,
+            obd_response_id: self.response_id,
             filter_mask: self.filter_mask,
             tester: self.tester,
             ecu: self.ecu,

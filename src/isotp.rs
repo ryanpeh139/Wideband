@@ -51,6 +51,11 @@ impl IsoTpLink {
         }
     }
 
+    pub fn set_ids(&mut self, tx_id: u32, rx_id: u32) {
+        self.config.tx_id = tx_id;
+        self.config.rx_id = rx_id;
+    }
+
     pub fn set_functional_id(&mut self, functional_id: Option<u32>) {
         self.config.functional_id = functional_id;
     }

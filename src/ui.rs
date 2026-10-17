@@ -905,16 +905,14 @@ impl WidebandApp {
             let channel = dev.channel_id();
             for (idx, req, decode_id) in poll_list {
                 let mut ok = false;
-                if let Ok(()) =
-                    crate::protocols::IsoTpLink::send(dev.as_mut(), channel, prof.request_id, &req)
+                if let Ok(resp) =
+                    crate::protocols::IsoTpLink::exchange_for_profile(dev.as_mut(), channel, prof, &req, 10)
                 {
-                    if let Ok(resp) = crate::protocols::IsoTpLink::receive(dev.as_mut(), channel, 10) {
-                        if let Some(value) = decode_channel_value(&decode_id, &resp) {
-                            let mut buf = self.telemetry.lock().unwrap();
-                            buf.set_channel_value(idx, value, now);
-                            buf.scheduler.mark_polled(idx, now);
-                            ok = true;
-                        }
+                    if let Some(value) = decode_channel_value(&decode_id, &resp) {
+                        let mut buf = self.telemetry.lock().unwrap();
+                        buf.set_channel_value(idx, value, now);
+                        buf.scheduler.mark_polled(idx, now);
+                        ok = true;
                     }
                 }
                 if !ok {

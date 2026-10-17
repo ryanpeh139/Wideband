@@ -303,6 +303,11 @@ struct CanSection {
     request_id: String,
     response_id: String,
     filter_mask: String,
+    /// OBD-II physical ids of the engine ECU when they differ from the diagnostic ids.
+    #[serde(default)]
+    obd_request_id: Option<String>,
+    #[serde(default)]
+    obd_response_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -343,6 +348,16 @@ impl ProfilePackFile {
         if self.id.trim().is_empty() {
             return Err("id must not be empty".to_string());
         }
+        let request_id = parse_u32_hex(&self.can.request_id, "can.request_id")?;
+        let response_id = parse_u32_hex(&self.can.response_id, "can.response_id")?;
+        let obd_request_id = match &self.can.obd_request_id {
+            Some(raw) => parse_u32_hex(raw, "can.obd_request_id")?,
+            None => request_id,
+        };
+        let obd_response_id = match &self.can.obd_response_id {
+            Some(raw) => parse_u32_hex(raw, "can.obd_response_id")?,
+            None => response_id,
+        };
         Ok(EcuProfile {
             id: self.id.trim().to_string(),
             name: self.name,
@@ -353,8 +368,10 @@ impl ProfilePackFile {
             protocol_id: parse_j2534_protocol(&self.j2534.protocol)?,
             connect_flags: self.j2534.connect_flags,
             extended_id: self.j2534.extended_id,
-            request_id: parse_u32_hex(&self.can.request_id, "can.request_id")?,
-            response_id: parse_u32_hex(&self.can.response_id, "can.response_id")?,
+            request_id,
+            response_id,
+            obd_request_id,
+            obd_response_id,
             filter_mask: parse_u32_hex(&self.can.filter_mask, "can.filter_mask")?,
             tester: parse_u8_hex(&self.kline.tester, "kline.tester")?,
             ecu: parse_u8_hex(&self.kline.ecu, "kline.ecu")?,
@@ -433,8 +450,15 @@ mod tests {
             .iter()
             .find(|p| p.id == "tacoma-can")
             .expect("tacoma-can pack");
-        assert_eq!(tacoma.request_id, 0x7E0);
+        assert_eq!((tacoma.request_id, tacoma.response_id), (0x700, 0x708));
+        assert_eq!((tacoma.obd_request_id, tacoma.obd_response_id), (0x7E0, 0x7E8));
         assert_eq!(tacoma.security_profile_id, "tacoma-can");
+        let silverado = catalog
+            .profiles
+            .iter()
+            .find(|p| p.id == "silverado-can")
+            .expect("silverado-can pack");
+        assert_eq!(silverado.obd_request_id, silverado.request_id, "OBD ids default to the diagnostic ids");
     }
 
     #[test]

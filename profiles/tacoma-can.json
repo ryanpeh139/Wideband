@@ -12,8 +12,10 @@
     "extended_id": false
   },
   "can": {
-    "request_id": "0x7E0",
-    "response_id": "0x7E8",
+    "request_id": "0x700",
+    "response_id": "0x708",
+    "obd_request_id": "0x7E0",
+    "obd_response_id": "0x7E8",
     "filter_mask": "0x7FF"
   },
   "kline": {

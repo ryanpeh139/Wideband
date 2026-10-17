@@ -540,6 +540,32 @@ mod hardware {
         assert_eq!(id.vin.len(), 17, "VIN: {:?}", id.vin);
         assert!(!id.cal_ids.is_empty(), "no Cal ID");
     }
+
+    /// Read-only: UDS TesterPresent on the diagnostic ids, then one OBD PID and one DID through
+    /// the telemetry path.
+    #[test]
+    #[ignore]
+    fn hardware_diagnostic_and_obd_ids_answer() {
+        let dll = match std::env::var("WIDEBAND_HW_DLL") {
+            Ok(path) => path,
+            Err(_) => return,
+        };
+        let profile = EcuProfile::tacoma_can();
+        let mut dev = super::create_host_device(&dll);
+        dev.open().expect("open cable");
+        let channel = crate::j2534::connect_for_profile(dev.as_mut(), &profile).expect("connect");
+        let mut client = crate::uds::UdsClient::for_profile(dev.as_mut(), channel, &profile);
+        let tester = client.tester_present(dev.as_mut(), profile.diagnostic);
+        let rpm = crate::protocols::IsoTpLink::exchange_for_profile(dev.as_mut(), channel, &profile, &[0x01, 0x0C], 500);
+        let did = crate::protocols::IsoTpLink::exchange_for_profile(dev.as_mut(), channel, &profile, &[0x22, 0x01, 0x03], 500);
+        let _ = dev.close();
+        println!("3E 00 on 0x{:X}: {:?}", profile.request_id, tester);
+        println!("01 0C via 0x7DF: {:02X?}", rpm);
+        println!("22 01 03 on 0x{:X}: {:02X?}", profile.request_id, did);
+        tester.expect("TesterPresent on the diagnostic ids");
+        assert_eq!(rpm.expect("Mode 01 PID 0C")[..2], [0x41, 0x0C]);
+        assert_eq!(did.expect("DID 0103")[..3], [0x62, 0x01, 0x03]);
+    }
 }
 
 #[cfg(not(windows))]

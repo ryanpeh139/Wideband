@@ -368,6 +368,8 @@ mod tests {
             extended_id: false,
             request_id: 0x7E0,
             response_id: 0x7E8,
+            obd_request_id: 0x7E0,
+            obd_response_id: 0x7E8,
             filter_mask: 0x7FF,
             tester: 0xF1,
             ecu: 0x10,

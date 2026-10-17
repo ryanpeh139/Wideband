@@ -161,6 +161,17 @@ impl DiagnosticTransport {
         }
     }
 
+    /// OBD-II requests to the profile's engine ECU: functional request id, OBD response id, and
+    /// flow control to the OBD physical id. Non-CAN buses use the diagnostic link.
+    pub fn for_obd(channel: u32, profile: &EcuProfile) -> Self {
+        let mut link = Self::for_profile(channel, profile);
+        if let Transport::IsoTp(l) = &mut link.inner {
+            l.set_ids(profile.obd_request_id, profile.obd_response_id);
+            l.set_functional_id(profile.obd_functional_id());
+        }
+        link
+    }
+
     /// CAN only: send single-frame requests to this functional id (OBD `0x7DF`).
     pub fn set_functional_id(&mut self, functional_id: Option<u32>) {
         if let Transport::IsoTp(l) = &mut self.inner {

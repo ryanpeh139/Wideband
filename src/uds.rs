@@ -29,10 +29,15 @@ impl UdsClient {
         }
     }
 
-    /// CAN only: address single-frame requests to this functional id (OBD `0x7DF`); replies are
-    /// still read from the profile's response id.
-    pub fn set_functional_id(&mut self, functional_id: Option<u32>) {
-        self.link.set_functional_id(functional_id);
+    /// Client for OBD-II services (Mode 01/09) on the profile's engine ECU: functional requests,
+    /// replies from the OBD response id. See `DiagnosticTransport::for_obd`.
+    pub fn for_obd(channel: u32, profile: &EcuProfile) -> Self {
+        Self {
+            link: DiagnosticTransport::for_obd(channel, profile),
+            max_pending: 10,
+            p2_ms: 2000,
+            p2_star_ms: 5000,
+        }
     }
 
     pub fn set_timers(&mut self, p2_ms: u32, p2_star_ms: u32) {
@@ -222,7 +227,7 @@ mod tests {
 
     #[test]
     fn uds_handles_response_pending_nrc() {
-        let mut dev = ScriptCan::new(0x7E0, 0x7E8);
+        let mut dev = ScriptCan::new(0x700, 0x708);
         dev.enqueue_rx(&[0x03, 0x7F, 0x10, 0x78, 0xAA, 0xAA, 0xAA, 0xAA]);
         dev.enqueue_rx(&[0x06, 0x50, 0x03, 0x00, 0x32, 0x01, 0xF4, 0xAA]);
 
@@ -238,7 +243,7 @@ mod tests {
 
     #[test]
     fn server_timing_gets_client_margin() {
-        let mut dev = ScriptCan::new(0x7E0, 0x7E8);
+        let mut dev = ScriptCan::new(0x700, 0x708);
         let prof = EcuProfile::tacoma_can();
         let mut client = UdsClient::for_profile(&mut dev, 1, &prof);
         client.apply_server_timing(50, 5000);
@@ -248,7 +253,7 @@ mod tests {
 
     #[test]
     fn stale_tester_present_reply_is_skipped() {
-        let mut dev = ScriptCan::new(0x7E0, 0x7E8);
+        let mut dev = ScriptCan::new(0x700, 0x708);
         dev.enqueue_rx(&[0x02, 0x7E, 0x00, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA]);
         dev.enqueue_rx(&[0x06, 0x50, 0x03, 0x00, 0x32, 0x01, 0xF4, 0xAA]);
         let prof = EcuProfile::tacoma_can();

@@ -56,8 +56,14 @@ pub struct EcuProfile {
     pub protocol_id: u32,
     pub connect_flags: u32,
     pub extended_id: bool,
+    /// Diagnostic (UDS/KWP) request and response ids: sessions, DIDs, security, flash.
     pub request_id: u32,
     pub response_id: u32,
+    /// The engine ECU's OBD-II physical ids (ISO 15765-4). OBD requests go to the functional id
+    /// (`obd_functional_id`), replies come from `obd_response_id`, and flow control goes to
+    /// `obd_request_id`. Same as the diagnostic ids unless the ECU splits them.
+    pub obd_request_id: u32,
+    pub obd_response_id: u32,
     pub filter_mask: u32,
     pub tester: u8,
     pub ecu: u8,
@@ -87,8 +93,12 @@ impl EcuProfile {
             protocol_id: ISO15765,
             connect_flags: 0,
             extended_id: false,
-            request_id: 0x7E0,
-            response_id: 0x7E8,
+            // Techstream reaches the 2017 Tacoma 2GR-FKS ECM's diagnostics on 0x700/0x708;
+            // 0x7E0 answers no physical request there, only OBD flow control.
+            request_id: 0x700,
+            response_id: 0x708,
+            obd_request_id: 0x7E0,
+            obd_response_id: 0x7E8,
             filter_mask: 0x7FF,
             tester: 0xF1,
             ecu: 0x10,
@@ -117,6 +127,8 @@ impl EcuProfile {
             extended_id: false,
             request_id: 0x12,
             response_id: 0xF1,
+            obd_request_id: 0x12,
+            obd_response_id: 0xF1,
             filter_mask: 0xFF,
             tester: 0xF1,
             ecu: 0x10,
@@ -145,6 +157,8 @@ impl EcuProfile {
             extended_id: true,
             request_id: 0x18DA10F1,
             response_id: 0x18DAF110,
+            obd_request_id: 0x18DA10F1,
+            obd_response_id: 0x18DAF110,
             filter_mask: 0x1FFFFFFF,
             tester: 0xF1,
             ecu: 0x10,
@@ -173,6 +187,8 @@ impl EcuProfile {
             extended_id: false,
             request_id: 0x6C,
             response_id: 0x6C,
+            obd_request_id: 0x6C,
+            obd_response_id: 0x6C,
             filter_mask: 0xFF,
             tester: 0xF1,
             ecu: 0x10,
@@ -195,6 +211,11 @@ impl EcuProfile {
             return None;
         }
         Some(if self.extended_id { 0x18DB33F1 } else { 0x7DF })
+    }
+
+    /// CAN acceptance mask that passes both the diagnostic and the OBD response ids.
+    pub fn rx_filter_mask(&self) -> u32 {
+        self.filter_mask & !(self.response_id ^ self.obd_response_id)
     }
 
     pub fn builtin_defaults() -> Vec<Self> {
@@ -363,6 +384,38 @@ impl IsoTpLink {
         link.send(device, payload)
     }
 
+    /// One live-data request and its reply. OBD services (`0x01`–`0x0A`) go to the functional
+    /// OBD id and are read from the OBD response id; anything else (`0x22` DIDs) uses the
+    /// profile's diagnostic ids.
+    pub fn exchange_for_profile(
+        device: &mut dyn PassThruDevice,
+        channel: u32,
+        profile: &EcuProfile,
+        request: &[u8],
+        timeout_ms: u32,
+    ) -> Result<Vec<u8>, String> {
+        let obd = matches!(request.first(), Some(0x01..=0x0A));
+        let config = if obd {
+            IsoTpConfig {
+                tx_id: profile.obd_request_id,
+                rx_id: profile.obd_response_id,
+                functional_id: profile.obd_functional_id(),
+                timeout_ms,
+                ..IsoTpConfig::default()
+            }
+        } else {
+            IsoTpConfig {
+                tx_id: profile.request_id,
+                rx_id: profile.response_id,
+                timeout_ms,
+                ..IsoTpConfig::default()
+            }
+        };
+        let link = IsoTpSession::new(channel, config);
+        link.send(device, request)?;
+        link.receive(device)
+    }
+
     pub fn receive(device: &mut dyn PassThruDevice, channel: u32, timeout_ms: u32) -> Result<Vec<u8>, String> {
         let mut link = IsoTpSession::new(channel, IsoTpConfig {
             rx_id: 0x7E8,
@@ -449,10 +502,9 @@ impl EcuIdentifier {
         let uds = profile.diagnostic == DiagnosticProtocol::Uds;
 
         let mut client = UdsClient::for_profile(device, channel, profile);
-        // OBD Mode 09 goes out functionally, as scan tools send it; replies still come from the
-        // profile's response id and flow control still goes to its request id.
-        let mut obd = UdsClient::for_profile(device, channel, profile);
-        obd.set_functional_id(profile.obd_functional_id());
+        // OBD Mode 09 goes out functionally, as scan tools send it; replies come from the OBD
+        // response id and flow control goes to the OBD request id.
+        let mut obd = UdsClient::for_obd(channel, profile);
 
         // 1. VIN: OBD Mode 09 02, then UDS 22 F1 90
         let mut vin_error = String::new();
@@ -633,5 +685,37 @@ impl FlashDownload {
         client.request(device, &[0x37], 0x77)?;
         let _ = client.request(device, &[0x11, 0x01], 0x51);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::isotp::mock::ScriptCan;
+
+    #[test]
+    fn telemetry_routes_obd_to_functional_and_dids_to_diagnostic_ids() {
+        let prof = EcuProfile::tacoma_can();
+
+        let mut obd = ScriptCan::new(0x7E0, 0x7E8);
+        obd.enqueue_rx(&[0x04, 0x41, 0x0C, 0x1A, 0xF8]);
+        let resp = IsoTpLink::exchange_for_profile(&mut obd, 1, &prof, &[0x01, 0x0C], 100).unwrap();
+        assert_eq!(resp, vec![0x41, 0x0C, 0x1A, 0xF8]);
+        assert_eq!(obd.tx_ids, vec![0x7DF]);
+
+        let mut diag = ScriptCan::new(0x700, 0x708);
+        diag.enqueue_rx(&[0x05, 0x62, 0x01, 0x03, 0x02, 0x98]);
+        let resp = IsoTpLink::exchange_for_profile(&mut diag, 1, &prof, &[0x22, 0x01, 0x03], 100).unwrap();
+        assert_eq!(resp, vec![0x62, 0x01, 0x03, 0x02, 0x98]);
+        assert_eq!(diag.tx_ids, vec![0x700]);
+    }
+
+    #[test]
+    fn tacoma_filter_passes_diagnostic_and_obd_replies() {
+        let prof = EcuProfile::tacoma_can();
+        let mask = prof.rx_filter_mask();
+        assert_eq!(0x708 & mask, prof.response_id & mask);
+        assert_eq!(0x7E8 & mask, prof.response_id & mask);
+        assert_eq!(EcuProfile::silverado_can().rx_filter_mask(), 0x1FFFFFFF);
     }
 }

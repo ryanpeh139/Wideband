@@ -157,6 +157,7 @@ fn bench_rx_id_for_tx(tx_id: u32) -> (u32, BenchEcuRole) {
     match tx_id {
         0x7E1 => (0x7E9, BenchEcuRole::Tcm),
         0x7E0 => (0x7E8, BenchEcuRole::Ecm),
+        0x700 => (0x708, BenchEcuRole::Ecm),
         0x18DA28F1 => (0x18DAF128, BenchEcuRole::Tcm),
         0x18DA10F1 => (0x18DAF110, BenchEcuRole::Ecm),
         _ => (0x7E8, BenchEcuRole::Ecm),
@@ -1372,12 +1373,14 @@ pub fn connect_for_profile(
     profile: &crate::protocols::EcuProfile,
 ) -> Result<u32, String> {
     use crate::protocols::VehicleBus;
-    device.set_connect_hints(profile.extended_id, profile.response_id, profile.filter_mask);
+    // One acceptance filter covers both the diagnostic and the OBD response ids.
+    let rx_mask = profile.rx_filter_mask();
+    device.set_connect_hints(profile.extended_id, profile.response_id, rx_mask);
     device.set_flow_control_id(profile.request_id);
     let channel = device.connect(profile.protocol_id, profile.connect_flags, profile.bitrate)?;
     if profile.bus == VehicleBus::CanIsoTp {
-        let mut pass_mask = PassThruMsg::new_can(profile.filter_mask, &[]);
-        pass_mask.write_id(profile.filter_mask);
+        let mut pass_mask = PassThruMsg::new_can(rx_mask, &[]);
+        pass_mask.write_id(rx_mask);
         let mut pass_pat = PassThruMsg::new_can(profile.response_id, &[]);
         pass_pat.write_id(profile.response_id);
         device.start_filter(channel, PASS_FILTER, &pass_mask, &pass_pat, None)?;

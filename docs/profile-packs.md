@@ -20,7 +20,7 @@ Required fields:
 - `bus`: `can_isotp` \| `kline` \| `vpw`
 - `diagnostic`: `uds` \| `kwp`
 - `bitrate`, `j2534` (`protocol`, `connect_flags`, `extended_id`)
-- `can` (`request_id`, `response_id`, `filter_mask` as hex strings)
+- `can` (`request_id`, `response_id`, `filter_mask` as hex strings; optional `obd_request_id`, `obd_response_id` when the ECU answers OBD-II on different ids than its diagnostics, as the 2017 Tacoma ECM does: `0x700`/`0x708` diagnostics, `0x7E0`/`0x7E8` OBD)
 - `kline` (`tester`, `ecu`)
 - `memory` (`max_chunk`, `address_bytes`, `size_bytes`)
 - `sessions` (`programming`, `read`)
