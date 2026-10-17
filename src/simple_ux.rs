@@ -315,7 +315,9 @@ impl WidebandApp {
 
     pub fn run_identify_ecu(&mut self) {
         let allow_demo = self.cable_is_virtual();
-        if let Some(dev) = &mut self.active_device {
+        let device = self.active_device.clone();
+        let mut slot = device.lock().unwrap();
+        if let Some(dev) = slot.as_mut() {
             let prof = &self.profiles[self.selected_profile_idx];
             match crate::protocols::EcuIdentifier::query(dev.as_mut(), 1, prof, allow_demo) {
                 Ok(id) => {

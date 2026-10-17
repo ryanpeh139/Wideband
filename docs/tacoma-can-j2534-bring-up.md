@@ -50,6 +50,8 @@ The ECM answers no single-frame request sent physically to `0x7E0`. That include
 
 In profile packs, `can.request_id` / `can.response_id` are the diagnostic pair, and the optional `can.obd_request_id` / `can.obd_response_id` give the OBD pair (default: the diagnostic pair). Live data routes by service: Mode 01 goes to `0x7DF` and `0x22` DIDs go to `0x700`. Raw CAN has one acceptance filter, so its mask passes both `0x708` and `0x7E8`.
 
+Live data, `READ_VBATT` (once a second), and the idle TesterPresent run on a background worker (`src/live_poller.rs`), so the window only draws. Each J2534Host round trip takes ~30 ms; on the UI thread that held the window to a few frames per second. The scheduler serves the most overdue channel first, so every channel gets polled on a slow bus. A channel the ECU refuses (`7F xx 11/12/31`) or leaves unanswered three times in a row is dropped with a log line; **Clear live** retries it. On the 2017 Tacoma, `01 0B` (MAP) and `01 2F` (fuel level) are not supported. DIDs `0x1801`–`0x1803`, `0x1810`, and `0x1811` from `telemetry-channels.json` answer `7F 22 31` and need the ECM's real Data List DIDs.
+
 Read-only bench check with the cable (ignition ON):
 
 ```

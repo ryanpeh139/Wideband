@@ -14,6 +14,7 @@ pub mod patch_recipe;
 pub mod gauges;
 pub mod histogram;
 pub mod isotp;
+pub mod live_poller;
 pub mod live_trace;
 pub mod j2534;
 pub mod j2534_host;

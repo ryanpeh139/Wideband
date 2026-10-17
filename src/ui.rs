@@ -33,12 +33,12 @@ use crate::live_trace;
 use crate::surface_mesh;
 use crate::table_edit::{self, CellSelection, MathOp, UndoStack};
 use crate::ve_correction::{self, CorrectionResult, CorrectionSettings, FrameSource, TargetLambda};
-use crate::telemetry::{decode_channel_value, TelemetryBuffer, TelemetryChannelFile, TelemetryFrame};
+use crate::telemetry::{TelemetryBuffer, TelemetryChannelFile, TelemetryFrame};
 use crate::telemetry_playback::{
     import_log_csv, ImportedLog, LogMarker, MathChannelDef, TelemetryPlaybackState,
     TelemetryViewMode,
 };
-use crate::tester_present::{IdleTesterOutcome, IdleTesterPresent};
+use crate::live_poller::{LivePoller, LiveStatus, SharedDevice};
 use crate::theme::{
     self, paint_live_cell_glow, paint_studio_badge, studio_tab_button, ACCENT_CYAN, CARD_FILL,
     EMERALD, MUTED, STROKE, TEXT, heatmap_color,
@@ -46,12 +46,9 @@ use crate::theme::{
 use eframe::egui::{self, Color32, Stroke, Vec2};
 use egui_extras::{Column, TableBuilder};
 use egui_plot::{Line, Plot, PlotPoints, PlotUi};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-
-/// How long one live-data poll waits for its reply. The ECM answers in ~15–30 ms through
-/// J2534Host; a shorter wait left late replies in the cable buffer for the next request.
-const LIVE_REPLY_MS: u32 = 100;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceTab {
@@ -77,7 +74,10 @@ pub struct WidebandApp {
     pub selected_device_idx: usize,
     pub profiles: Vec<EcuProfile>,
     pub selected_profile_idx: usize,
-    pub active_device: Option<Box<dyn PassThruDevice>>,
+    /// Shared with the live-data worker (`live_poller`); lock it for each cable exchange.
+    pub active_device: SharedDevice,
+    pub live_status: Arc<LiveStatus>,
+    live_poller: Option<LivePoller>,
     pub active_device_virtual: bool,
     pub is_connected: bool,
 
@@ -137,9 +137,7 @@ pub struct WidebandApp {
     pub trace_rpm: f32,
     pub trace_map: f32,
     pub live_poller_active: bool,
-    pub last_poll_time: Instant,
     pub telemetry_playback: TelemetryPlaybackState,
-    pub idle_tester_present: IdleTesterPresent,
 
     // 3D Surface Mesh
     pub mesh_yaw: f32,
@@ -237,7 +235,9 @@ impl WidebandApp {
             selected_device_idx,
             profiles,
             selected_profile_idx: 0,
-            active_device: None,
+            active_device: Arc::new(Mutex::new(None)),
+            live_status: Arc::new(LiveStatus::default()),
+            live_poller: None,
             active_device_virtual: false,
             is_connected: false,
             xdf,
@@ -286,9 +286,7 @@ impl WidebandApp {
             trace_rpm: 2400.0,
             trace_map: 70.0,
             live_poller_active: true,
-            last_poll_time: Instant::now(),
             telemetry_playback: TelemetryPlaybackState::default(),
-            idle_tester_present: IdleTesterPresent::new(),
             mesh_yaw: 0.785,  // 45 degrees
             mesh_pitch: 0.523, // 30 degrees
             mesh_zoom: 1.0,
@@ -695,52 +693,56 @@ impl WidebandApp {
         let ch = dev.channel_id();
         self.header_vbatt = read_pass_thru_vbatt(dev.as_mut(), ch);
         self.active_device_virtual = is_virtual;
-        self.active_device = Some(dev);
+        *self.active_device.lock().unwrap() = Some(dev);
         self.is_connected = true;
         self.connected_device_label = dev_name.clone();
         self.connection_last_error.clear();
-        if is_virtual {
-            self.idle_tester_present.disarm();
-        } else {
-            self.idle_tester_present.arm_for_real_hardware();
+        if !is_virtual {
             self.log(
                 "Idle session hold: TesterPresent (0x3E) every 2 s on this profile (real Pass-Thru only).",
             );
         }
+        self.start_live_poller();
+    }
+
+    /// Live data, VBATT, and the idle keepalive run on a worker thread so the window stays smooth.
+    fn start_live_poller(&mut self) {
+        self.stop_live_poller();
+        self.live_status.session_lost.store(false, Ordering::SeqCst);
+        *self.live_status.vbatt.lock().unwrap() = None;
+        self.telemetry.lock().unwrap().scheduler.reset_support();
+        self.sync_live_flags();
+        let prof = self.profiles[self.selected_profile_idx].clone();
+        self.live_poller = Some(LivePoller::start(
+            self.active_device.clone(),
+            self.telemetry.clone(),
+            prof,
+            self.live_status.clone(),
+            !self.active_device_virtual,
+        ));
+    }
+
+    fn stop_live_poller(&mut self) {
+        if let Some(mut poller) = self.live_poller.take() {
+            poller.stop();
+        }
+    }
+
+    fn sync_live_flags(&self) {
+        self.live_status.enabled.store(self.live_poller_active, Ordering::SeqCst);
+        self.live_status.paused.store(self.is_flashing, Ordering::SeqCst);
     }
 
     pub fn disconnect_cable(&mut self) {
-        self.idle_tester_present.disarm();
+        self.stop_live_poller();
         self.live_trace.clear();
-        if let Some(mut dev) = self.active_device.take() {
+        let dev = self.active_device.lock().unwrap().take();
+        if let Some(mut dev) = dev {
             let _ = dev.close();
             self.is_connected = false;
             self.header_vbatt = None;
             PlatformSecurity::install(&PlatformSecurity::default_config_path());
             self.log("Cable disconnected.");
-        }
-    }
-
-    pub fn poll_idle_tester_present(&mut self) {
-        if !self.is_connected || self.active_device_virtual || self.is_flashing {
-            return;
-        }
-        let prof = self.profiles[self.selected_profile_idx].clone();
-        if let Some(dev) = &mut self.active_device {
-            match self.idle_tester_present.tick(
-                dev.as_mut(),
-                &prof,
-                self.is_connected,
-                self.active_device_virtual,
-                self.is_flashing,
-            ) {
-                IdleTesterOutcome::Skipped | IdleTesterOutcome::Sent => {}
-                IdleTesterOutcome::Failed => {
-                    self.log(
-                        "TesterPresent was not answered; idle keepalive stopped (channel stays open). Reconnect to retry.",
-                    );
-                }
-            }
         }
     }
 
@@ -859,91 +861,43 @@ impl WidebandApp {
             });
     }
 
+    /// Per-frame bridge to the live-data worker: pass the live and flash flags, pick up VBATT,
+    /// worker messages, and a lost session, and refresh the live trace. No cable I/O here.
     pub fn poll_telemetry(&mut self) {
-        if !self.is_connected || !self.live_poller_active || self.is_flashing {
+        if !self.is_connected {
             return;
         }
-        // The J2534Host bridge closes itself when the host/DLL hangs or exits; reflect that in
-        // the UI instead of polling a dead session forever.
-        if self.active_device.as_ref().map_or(false, |d| !d.is_connected()) {
+        self.sync_live_flags();
+        if self.live_status.session_lost.swap(false, Ordering::SeqCst) {
             self.log("Cable session lost (J2534Host closed or not responding). Reconnect to continue.");
             self.disconnect_cable();
             return;
         }
-
-        let tick = {
-            let buf = self.telemetry.lock().unwrap();
-            buf.scheduler.tick_interval()
-        };
-        if self.last_poll_time.elapsed() < tick {
+        if let Some(v) = *self.live_status.vbatt.lock().unwrap() {
+            self.header_vbatt = Some(v);
+        }
+        for message in self.live_status.take_messages() {
+            self.log(&message);
+        }
+        if !self.live_poller_active || self.is_flashing {
             return;
         }
-        self.last_poll_time = Instant::now();
         let now = Instant::now();
-
-        if let Some(dev) = &mut self.active_device {
-            let ch = dev.channel_id();
-            if let Some(v) = read_pass_thru_vbatt(dev.as_mut(), ch) {
-                self.header_vbatt = Some(v);
-            }
-            let prof = &self.profiles[self.selected_profile_idx];
-            let poll_list: Vec<(usize, Vec<u8>, String)> = {
-                let mut buf = self.telemetry.lock().unwrap();
-                let plan = buf.scheduler.plan(&buf.channels, now);
-                buf.scheduler.apply_budget_skips(&plan.budget_skipped, now);
-                let poll_list = plan
-                    .poll_indices
-                    .into_iter()
-                    .map(|idx| {
-                        let ch = &buf.channels[idx];
-                        (
-                            idx,
-                            ch.build_request_bytes(),
-                            ch.decode.clone(),
-                        )
-                    })
-                    .collect();
-                poll_list
-            };
-
-            let channel = dev.channel_id();
-            for (idx, req, decode_id) in poll_list {
-                let mut ok = false;
-                if let Ok(resp) =
-                    crate::protocols::IsoTpLink::exchange_for_profile(dev.as_mut(), channel, prof, &req, LIVE_REPLY_MS)
-                {
-                    if let Some(value) = decode_channel_value(&decode_id, &resp) {
-                        let mut buf = self.telemetry.lock().unwrap();
-                        buf.set_channel_value(idx, value, now);
-                        buf.scheduler.mark_polled(idx, now);
-                        ok = true;
-                    }
-                }
-                if !ok {
-                    let mut buf = self.telemetry.lock().unwrap();
-                    buf.bus_fail_count += 1;
-                    // An unsupported PID or DID waits its interval too; otherwise it stays
-                    // "most overdue" and takes every tick's budget from channels that answer.
-                    buf.scheduler.mark_polled(idx, now);
-                }
-            }
-            let live_pos = {
-                let mut buf = self.telemetry.lock().unwrap();
-                self.trace_rpm = buf.value("rpm");
-                self.trace_map = buf.value("map");
-                buf.push_frame();
-                // Live operating point on the selected table. Deliberately NOT written to
-                // `active_cell`: that is the user's edit selection, and math ops write to it.
-                let table = self.xdf.tables.get(self.selected_table_idx);
-                self.live_trace.out_of_range = table
-                    .map(|t| live_trace::out_of_range(t, |id| buf.value(id)))
-                    .unwrap_or_default();
-                table.and_then(|t| live_trace::table_position(t, |id| buf.value(id)))
-            };
-            match live_pos {
-                Some(pos) => self.live_trace.push(pos, now),
-                None => self.live_trace.clear(),
-            }
+        let live_pos = {
+            let buf = self.telemetry.lock().unwrap();
+            self.trace_rpm = buf.value("rpm");
+            self.trace_map = buf.value("map");
+            // Live operating point on the selected table. Deliberately NOT written to
+            // `active_cell`: that is the user's edit selection, and math ops write to it.
+            let table = self.xdf.tables.get(self.selected_table_idx);
+            self.live_trace.out_of_range = table
+                .map(|t| live_trace::out_of_range(t, |id| buf.value(id)))
+                .unwrap_or_default();
+            table.and_then(|t| live_trace::table_position(t, |id| buf.value(id)))
+        };
+        match live_pos {
+            Some(pos) => self.live_trace.push(pos, now),
+            None => self.live_trace.clear(),
         }
     }
 
@@ -1335,7 +1289,6 @@ impl WidebandApp {
 impl eframe::App for WidebandApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_telemetry();
-        self.poll_idle_tester_present();
         self.tick_virtual_ladder();
         let dt = ctx.input(|i| i.stable_dt) as f64;
         self.telemetry_playback.tick_playback(dt);
@@ -2730,7 +2683,7 @@ fn yes_no(v: bool) -> &'static str {
     if v { "Yes" } else { "No" }
 }
 
-fn read_pass_thru_vbatt(dev: &mut dyn PassThruDevice, channel: u32) -> Option<f32> {
+pub(crate) fn read_pass_thru_vbatt(dev: &mut dyn PassThruDevice, channel: u32) -> Option<f32> {
     if let Ok(out) = dev.ioctl(channel, READ_VBATT, &[]) {
         if out.len() >= 4 {
             let mv = u32::from_le_bytes([out[0], out[1], out[2], out[3]]);
@@ -2795,7 +2748,9 @@ impl WidebandApp {
                         .clicked()
                     {
                         self.tcm_identify_error.clear();
-                        if let Some(dev) = &mut self.active_device {
+                        let device = self.active_device.clone();
+                        let mut slot = device.lock().unwrap();
+                        if let Some(dev) = slot.as_mut() {
                             let allow_demo = self.active_device_virtual;
                             let channel = dev.channel_id();
                             match TcmIdentifier::query(dev.as_mut(), channel, &tcm, allow_demo) {
@@ -3002,13 +2957,17 @@ impl WidebandApp {
         let prof = self.profiles[self.selected_profile_idx].clone();
         let allow_demo = self.active_device_virtual;
         let device_name = self.connected_device_label.clone();
-        let (result, vbatt) = match self.active_device.as_mut() {
-            Some(dev) => {
+        let outcome = {
+            let mut slot = self.active_device.lock().unwrap();
+            slot.as_mut().map(|dev| {
                 let channel = dev.channel_id();
                 let result = EcuIdentifier::query(dev.as_mut(), channel, &prof, allow_demo);
                 let vbatt = read_pass_thru_vbatt(dev.as_mut(), channel);
                 (result, vbatt)
-            }
+            })
+        };
+        let (result, vbatt) = match outcome {
+            Some(r) => r,
             None => {
                 self.log("Update assistant: connect the cable first.");
                 return None;
@@ -3225,7 +3184,9 @@ impl WidebandApp {
 
                 ui.horizontal_wrapped(|ui| {
                     if ui.button(egui::RichText::new("🔍 Identify ECU").strong()).clicked() {
-                        if let Some(dev) = &mut self.active_device {
+                        let device = self.active_device.clone();
+                        let mut slot = device.lock().unwrap();
+                        if let Some(dev) = slot.as_mut() {
                             let prof = &self.profiles[self.selected_profile_idx];
                             let allow_demo = self.active_device_virtual;
                             let channel = dev.channel_id();
@@ -3557,12 +3518,14 @@ impl WidebandApp {
 
     pub(crate) fn refresh_diagnostics(&mut self) {
         self.diag_last_error.clear();
-        if self.active_device.is_none() {
+        let device = self.active_device.clone();
+        let mut slot = device.lock().unwrap();
+        if slot.is_none() {
             self.diag_last_error = "Connect cable first.".to_string();
             return;
         }
         let prof = self.profiles[self.selected_profile_idx].clone();
-        if let Some(dev) = &mut self.active_device {
+        if let Some(dev) = slot.as_mut() {
             let channel = dev.channel_id();
             match diagnostics::DiagnosticsReader::read(dev.as_mut(), channel, &prof) {
                 Ok(snap) => {
@@ -3586,15 +3549,18 @@ impl WidebandApp {
     }
 
     fn execute_stock_read(&mut self) {
-        if self.active_device.is_none() {
+        let device = self.active_device.clone();
+        let mut slot = device.lock().unwrap();
+        if slot.is_none() {
             self.log("Stock read blocked: Connect cable first.");
             return;
         }
         let prof = self.profiles[self.selected_profile_idx].clone();
         self.log(&format!("Starting multi-block stock read for {}...", prof.name));
         self.is_flashing = true;
+        self.sync_live_flags();
         self.transfer_progress = 0.0;
-        if let Some(dev) = &mut self.active_device {
+        if let Some(dev) = slot.as_mut() {
             let channel = dev.channel_id();
             let label = dev.device_label();
             let mut read_progress = 0.0f32;
@@ -3647,7 +3613,7 @@ impl WidebandApp {
     }
 
     fn execute_flash_active(&mut self) {
-        if self.active_device.is_none() {
+        if self.active_device.lock().unwrap().is_none() {
             self.log("Flashing blocked: Connect cable first.");
             return;
         }
@@ -3691,10 +3657,13 @@ impl WidebandApp {
 
         self.log(&format!("Starting layout-driven cal flash for {}...", prof.name));
         self.is_flashing = true;
+        self.sync_live_flags();
         self.transfer_progress = 0.0;
         self.flash_status_detail.clear();
 
-        if let Some(dev) = &mut self.active_device {
+        let device = self.active_device.clone();
+        let mut slot = device.lock().unwrap();
+        if let Some(dev) = slot.as_mut() {
             let channel = dev.channel_id();
             let label = dev.device_label();
             let mut last_frac = 0.0f32;

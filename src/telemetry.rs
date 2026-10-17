@@ -326,11 +326,17 @@ pub struct SchedulerPlan {
     pub budget_skipped: Vec<usize>,
 }
 
+/// Consecutive failed polls (no reply, or a reply that does not decode) before a channel is
+/// treated as unsupported by this ECU and left out of the schedule.
+const UNSUPPORTED_AFTER_FAILURES: u8 = 3;
+
 pub struct TelemetryScheduler {
     last_poll: Vec<Instant>,
     settings: TelemetrySchedulerSettings,
     pub budget_skip_total: u64,
     pub per_channel_budget_skips: Vec<u64>,
+    fail_streak: Vec<u8>,
+    unsupported: Vec<bool>,
 }
 
 impl TelemetryScheduler {
@@ -341,28 +347,68 @@ impl TelemetryScheduler {
             settings,
             budget_skip_total: 0,
             per_channel_budget_skips: vec![0; channel_count],
+            fail_streak: vec![0; channel_count],
+            unsupported: vec![false; channel_count],
         }
+    }
+
+    /// The ECU does not have this PID or DID: stop polling it until `reset_support`.
+    pub fn mark_unsupported(&mut self, idx: usize) {
+        if idx < self.unsupported.len() {
+            self.unsupported[idx] = true;
+        }
+    }
+
+    pub fn is_unsupported(&self, idx: usize) -> bool {
+        self.unsupported.get(idx).copied().unwrap_or(false)
+    }
+
+    /// A failed poll waits its interval like any other, and after
+    /// `UNSUPPORTED_AFTER_FAILURES` in a row the channel is dropped. Returns true when this
+    /// failure dropped it.
+    pub fn record_failure(&mut self, idx: usize, when: Instant) -> bool {
+        self.mark_polled(idx, when);
+        if idx >= self.fail_streak.len() || self.unsupported[idx] {
+            return false;
+        }
+        self.fail_streak[idx] = self.fail_streak[idx].saturating_add(1);
+        if self.fail_streak[idx] >= UNSUPPORTED_AFTER_FAILURES {
+            self.unsupported[idx] = true;
+            return true;
+        }
+        false
+    }
+
+    /// Poll every channel again (after a reconnect or Clear live).
+    pub fn reset_support(&mut self) {
+        self.fail_streak.fill(0);
+        self.unsupported.fill(false);
     }
 
     pub fn settings(&self) -> &TelemetrySchedulerSettings {
         &self.settings
     }
 
-    /// Channels due this tick, ordered by priority band then index; capped by `max_requests_per_tick`.
+    /// Channels due this tick, most overdue first (elapsed time in units of the channel's own
+    /// interval), then by priority band and index; capped by `max_requests_per_tick`.
+    /// Unsupported channels are left out. Ranking by overdue ratio means a slow bus serves
+    /// every channel in turn instead of the first few priority-1 channels forever.
     pub fn plan(&self, channels: &[TelemetryChannelDef], now: Instant) -> SchedulerPlan {
-        let mut due: Vec<(u8, u64, usize)> = channels
+        let mut due: Vec<(u64, u8, usize)> = channels
             .iter()
             .enumerate()
+            .filter(|(idx, _)| !self.is_unsupported(*idx))
             .filter_map(|(idx, ch)| {
                 let elapsed = now.duration_since(self.last_poll[idx]).as_millis() as u64;
                 if elapsed >= ch.interval_ms {
-                    Some((ch.priority, elapsed, idx))
+                    let overdue = elapsed.saturating_mul(1000) / ch.interval_ms.max(1);
+                    Some((overdue, ch.priority, idx))
                 } else {
                     None
                 }
             })
             .collect();
-        due.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        due.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
 
         let cap = self.settings.max_requests_per_tick.max(1);
         let poll_indices: Vec<usize> = due
@@ -381,7 +427,10 @@ impl TelemetryScheduler {
         }
     }
 
-    pub fn apply_budget_skips(&mut self, skipped: &[usize], now: Instant) {
+    /// Counts channels that were due but over this tick's budget. Their clocks keep running so
+    /// they rank higher next tick; there is no catch-up burst either way, because one poll
+    /// restarts a channel's interval (`skip_backlog` is kept for config compatibility).
+    pub fn apply_budget_skips(&mut self, skipped: &[usize], _now: Instant) {
         if skipped.is_empty() {
             return;
         }
@@ -390,15 +439,20 @@ impl TelemetryScheduler {
             if idx < self.per_channel_budget_skips.len() {
                 self.per_channel_budget_skips[idx] += 1;
             }
-            if self.settings.skip_backlog && idx < self.last_poll.len() {
-                self.last_poll[idx] = now;
-            }
         }
     }
 
+    /// A successful poll: restart the channel's interval and clear its failure streak.
     pub fn mark_polled(&mut self, idx: usize, when: Instant) {
         if idx < self.last_poll.len() {
             self.last_poll[idx] = when;
+        }
+    }
+
+    pub fn record_success(&mut self, idx: usize, when: Instant) {
+        self.mark_polled(idx, when);
+        if idx < self.fail_streak.len() {
+            self.fail_streak[idx] = 0;
         }
     }
 
@@ -570,6 +624,7 @@ impl TelemetryBuffer {
         for t in &mut self.scheduler.last_poll {
             *t = stale;
         }
+        self.scheduler.reset_support();
     }
 
     pub fn set_recording(&mut self, on: bool) {
@@ -767,23 +822,45 @@ mod tests {
     }
 
     #[test]
-    fn test_scheduler_skip_backlog_advances_skipped_channels() {
+    fn test_scheduler_serves_every_channel_on_a_slow_bus() {
+        // The real truck: each tick took ~250 ms, so the fast priority-1 channels were due on
+        // every tick and the old scheduler never reached the rest.
+        let def = TelemetryChannelFile::load_default();
+        let channels = def.channels.clone();
+        let mut sched = TelemetryScheduler::new(channels.len(), def.scheduler.clone());
+        let mut now = Instant::now();
+        let mut polled = vec![0u32; channels.len()];
+        for _ in 0..40 {
+            let plan = sched.plan(&channels, now);
+            sched.apply_budget_skips(&plan.budget_skipped, now);
+            for idx in plan.poll_indices {
+                polled[idx] += 1;
+                sched.record_success(idx, now);
+            }
+            now += Duration::from_millis(250);
+        }
+        for (idx, ch) in channels.iter().enumerate() {
+            assert!(polled[idx] > 0, "{} was never polled", ch.id);
+        }
+        let rpm = channels.iter().position(|c| c.id == "rpm").unwrap();
+        assert!(polled[rpm] >= polled.iter().copied().min().unwrap(), "fast channels still poll most");
+    }
+
+    #[test]
+    fn test_scheduler_drops_unsupported_channels() {
         let channels = sample_channels();
-        let settings = TelemetrySchedulerSettings {
-            tick_ms: 25,
-            max_requests_per_tick: 1,
-            skip_backlog: true,
-        };
-        let mut sched = TelemetryScheduler::new(channels.len(), settings);
+        let mut sched = TelemetryScheduler::new(channels.len(), TelemetrySchedulerSettings::default());
         let now = Instant::now();
-        let plan = sched.plan(&channels, now);
-        assert_eq!(plan.poll_indices.len(), 1);
-        sched.apply_budget_skips(&plan.budget_skipped, now);
-        let plan2 = sched.plan(&channels, now);
-        assert!(
-            plan2.poll_indices.len() <= 1,
-            "skipped channels should not all remain due immediately"
-        );
+        assert!(!sched.record_failure(0, now));
+        assert!(!sched.record_failure(0, now));
+        assert!(sched.record_failure(0, now), "third failure in a row drops the channel");
+        sched.mark_unsupported(1);
+        let later = now + Duration::from_secs(10);
+        let plan = sched.plan(&channels, later);
+        assert!(!plan.poll_indices.contains(&0) && !plan.budget_skipped.contains(&0));
+        assert!(!plan.poll_indices.contains(&1) && !plan.budget_skipped.contains(&1));
+        sched.reset_support();
+        assert!(sched.plan(&channels, later).poll_indices.contains(&0) || sched.plan(&channels, later).budget_skipped.contains(&0));
     }
 
     #[test]
