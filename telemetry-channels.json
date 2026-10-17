@@ -166,75 +166,50 @@
       "plot": { "scale": 50.0, "color": [139, 195, 74] }
     },
     {
-      "id": "ecu_v",
-      "label": "ECU SUPPLY",
+      "id": "vbatt",
+      "label": "BATTERY",
       "unit": "V",
       "priority": 4,
       "interval_ms": 1000,
       "request": { "service": "mode01", "pid": 66 },
       "decode": "pid_42_ecu_v",
       "gauge": false,
-      "plot": { "scale": 100.0, "color": [255, 235, 59] }
-    },
-    {
-      "id": "vbatt",
-      "label": "BATTERY (UDS)",
-      "unit": "V",
-      "priority": 4,
-      "interval_ms": 1000,
-      "request": { "service": "uds22", "did": 6160 },
-      "decode": "did_f010_vbatt",
-      "oem_note": "Common bench placeholder DID F010; verify on OEM ECU",
-      "gauge": false,
       "plot": { "scale": 100.0, "color": [255, 213, 79] }
     },
     {
       "id": "oil_temp",
-      "label": "OIL TEMP (UDS)",
+      "label": "OIL TEMP",
       "unit": "°C",
       "priority": 4,
       "interval_ms": 1000,
-      "request": { "service": "uds22", "did": 6161 },
-      "decode": "did_f011_oil_temp",
-      "oem_note": "Placeholder F011 — Tacoma/Denso DID may differ",
+      "request": { "service": "uds22", "did": 4219 },
+      "decode": "did_107b_oil_temp",
+      "oem_note": "Toyota ECM DID 0x107B byte 25 (2017 Tacoma 2GR-FKS, matched to Techstream)",
       "gauge": false,
       "plot": { "scale": 10.0, "color": [255, 87, 34] }
     },
     {
       "id": "tacoma_cat_temp",
-      "label": "CAT TEMP (UDS)",
-      "unit": "raw",
+      "label": "CAT TEMP B1S1",
+      "unit": "°C",
       "priority": 5,
       "interval_ms": 2000,
-      "request": { "service": "uds22", "did": 6145 },
-      "decode": "did_placeholder_u16",
-      "oem_note": "OEM DID TBD — 0x1801 placeholder for Tacoma catalyst temp",
+      "request": { "service": "mode01", "pid": 60 },
+      "decode": "pid_3c_cat_temp",
       "gauge": false,
       "plot": { "scale": 1.0, "color": [233, 30, 99] }
     },
     {
-      "id": "tacoma_torque_req",
-      "label": "TORQUE REQ (UDS)",
-      "unit": "raw",
+      "id": "atf_temp",
+      "label": "ATF TEMP",
+      "unit": "°C",
       "priority": 5,
       "interval_ms": 2000,
-      "request": { "service": "uds22", "did": 6146 },
-      "decode": "did_placeholder_u16",
-      "oem_note": "OEM DID TBD — 0x1802 placeholder (engine torque request)",
+      "request": { "service": "uds22", "did": 5671 },
+      "decode": "did_1627_atf_temp",
+      "oem_note": "Toyota DID 0x1627 A/T oil temperature No.1, read from the ECM (matched to Techstream)",
       "gauge": false,
-      "plot": { "scale": 1.0, "color": [171, 71, 188] }
-    },
-    {
-      "id": "tacoma_vvt_angle",
-      "label": "VVT ANGLE (UDS)",
-      "unit": "raw",
-      "priority": 5,
-      "interval_ms": 2000,
-      "request": { "service": "uds22", "did": 6147 },
-      "decode": "did_placeholder_u8",
-      "oem_note": "OEM DID TBD — 0x1803 placeholder for intake VVT",
-      "gauge": false,
-      "plot": { "scale": 50.0, "color": [102, 187, 106] }
+      "plot": { "scale": 10.0, "color": [171, 71, 188] }
     }
   ]
 }

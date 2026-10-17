@@ -297,6 +297,33 @@ pub fn decode_channel_value(decode: &str, resp: &[u8]) -> Option<f32> {
                 None
             }
         }
+        // OBD PID 3C, catalyst temperature bank 1 sensor 1: (A*256+B)/10 - 40 °C.
+        "pid_3c_cat_temp" => {
+            if resp[0] == 0x41 && resp.len() >= 4 && resp[1] == 0x3C {
+                let raw = ((resp[2] as u16) << 8) | (resp[3] as u16);
+                Some(raw as f32 / 10.0 - 40.0)
+            } else {
+                None
+            }
+        }
+        // Toyota ECM DID 107B, byte 25: engine oil temperature, A - 40 °C. Matched to a
+        // Techstream Data List on a 2017 Tacoma 2GR-FKS (41 °C shown as 106 °F).
+        "did_107b_oil_temp" => {
+            if resp[0] == 0x62 && resp.len() >= 3 + 26 && resp[1] == 0x10 && resp[2] == 0x7B {
+                Some(resp[3 + 25] as f32 - 40.0)
+            } else {
+                None
+            }
+        }
+        // Toyota DID 1627 (ECM and TCM): A/T oil temperature No.1, A + B/256 - 40 °C. Matched
+        // to Techstream: 52 80 = 42.5 °C (108.5 °F) on the ECM, 57 80 = 47.5 °C on the TCM.
+        "did_1627_atf_temp" => {
+            if resp[0] == 0x62 && resp.len() >= 5 && resp[1] == 0x16 && resp[2] == 0x27 {
+                Some(resp[3] as f32 + resp[4] as f32 / 256.0 - 40.0)
+            } else {
+                None
+            }
+        }
         "did_placeholder_u16" => {
             if resp[0] == 0x62 && resp.len() >= 5 {
                 let raw = ((resp[3] as u16) << 8) | (resp[4] as u16);
@@ -873,6 +900,24 @@ mod tests {
         }
         assert_eq!(buf.frames.len(), 3);
         assert_eq!(buf.ring_drop_count, 2);
+    }
+
+    #[test]
+    fn test_decode_tacoma_channels_from_techstream_capture() {
+        // Replies captured from a 2017 Tacoma alongside a Techstream Data List.
+        let mut oil = vec![0x62, 0x10, 0x7B];
+        oil.extend_from_slice(&[
+            0x00, 0x00, 0x05, 0x80, 0x04, 0x00, 0x00, 0x7F, 0xB7, 0x84, 0x7F, 0x7F, 0xEF, 0x7F, 0xB8, 0x81, 0x54,
+            0x80, 0x00, 0x80, 0x06, 0x00, 0x00, 0x81, 0x36, 0x51, 0x6E, 0x30, 0x30, 0x02, 0x90,
+        ]);
+        assert_eq!(decode_channel_value("did_107b_oil_temp", &oil), Some(41.0), "Techstream: 106 °F");
+        let atf = decode_channel_value("did_1627_atf_temp", &[0x62, 0x16, 0x27, 0x52, 0x80]).unwrap();
+        assert!((atf - 42.5).abs() < 0.01, "Techstream: 108.5 °F");
+        let cat = decode_channel_value("pid_3c_cat_temp", &[0x41, 0x3C, 0x12, 0x01]).unwrap();
+        assert!((cat - 420.9).abs() < 0.01);
+        let v = decode_channel_value("pid_42_ecu_v", &[0x41, 0x42, 0x35, 0x80]).unwrap();
+        assert!((v - 13.696).abs() < 0.01, "Techstream: 13.7 V");
+        assert_eq!(decode_channel_value("did_107b_oil_temp", &[0x62, 0x10, 0x7B, 0x00]), None, "short reply");
     }
 
     #[test]

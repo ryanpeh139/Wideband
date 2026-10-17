@@ -50,7 +50,18 @@ The ECM answers no single-frame request sent physically to `0x7E0`. That include
 
 In profile packs, `can.request_id` / `can.response_id` are the diagnostic pair, and the optional `can.obd_request_id` / `can.obd_response_id` give the OBD pair (default: the diagnostic pair). Live data routes by service: Mode 01 goes to `0x7DF` and `0x22` DIDs go to `0x700`. Raw CAN has one acceptance filter, so its mask passes both `0x708` and `0x7E8`.
 
-Live data, `READ_VBATT` (once a second), and the idle TesterPresent run on a background worker (`src/live_poller.rs`), so the window only draws. Each J2534Host round trip takes ~30 ms; on the UI thread that held the window to a few frames per second. The scheduler serves the most overdue channel first, so every channel gets polled on a slow bus. A channel the ECU refuses (`7F xx 11/12/31`) or leaves unanswered three times in a row is dropped with a log line; **Clear live** retries it. On the 2017 Tacoma, `01 0B` (MAP) and `01 2F` (fuel level) are not supported. DIDs `0x1801`–`0x1803`, `0x1810`, and `0x1811` from `telemetry-channels.json` answer `7F 22 31` and need the ECM's real Data List DIDs.
+Live data, `READ_VBATT` (once a second), and the idle TesterPresent run on a background worker (`src/live_poller.rs`), so the window only draws. Each J2534Host round trip takes ~30 ms; on the UI thread that held the window to a few frames per second. The scheduler serves the most overdue channel first, so every channel gets polled on a slow bus. A channel the ECU refuses (`7F xx 11/12/31`) or leaves unanswered three times in a row is dropped with a log line; **Clear live** retries it. On the 2017 Tacoma, `01 0B` (MAP) and `01 2F` (fuel level) are not supported, and the old placeholder DIDs (`0x1801`–`0x1803`, `0x1810`, `0x1811`) answer `7F 22 31`.
+
+Toyota channels matched against a logged Techstream Data List (All Data) on this truck:
+
+| Channel | Request | Decode | Techstream check |
+| --- | --- | --- | --- |
+| Battery | `01 42` | `(A·256+B)/1000` V | `35 80` = 13.70 V vs "Battery Voltage 13.7" |
+| Oil temp | `22 10 7B`, byte 25 of the data | `A − 40` °C | 41 °C vs "Engine Oil Temperature 106 F" |
+| Cat temp B1S1 | `01 3C` | `(A·256+B)/10 − 40` °C | banks equal, ~420 °C vs 798 F |
+| ATF temp | `22 16 27` (ECM; the TCM has the same DID on `0x701`) | `A + B/256 − 40` °C | `52 80` = 42.5 °C vs "A/T Oil Temperature No.1 108.5 F" |
+
+Techstream's All Data view reads block DIDs `F301`/`F302`, which concatenate single DIDs (`F301` starts with `107B`, `109E`, `107F`, …). Intake VVT angle and torque request were not identified with confidence, so they are not in the channel file.
 
 Read-only bench check with the cable (ignition ON):
 
