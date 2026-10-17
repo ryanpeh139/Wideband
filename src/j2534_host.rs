@@ -566,6 +566,52 @@ mod hardware {
         assert_eq!(rpm.expect("Mode 01 PID 0C")[..2], [0x41, 0x0C]);
         assert_eq!(did.expect("DID 0103")[..3], [0x62, 0x01, 0x03]);
     }
+
+    /// Read-only: every channel in telemetry-channels.json through the live-data path, then a
+    /// burst of 10 ms RPM polls (leaves late replies in the buffer) followed by Identify.
+    #[test]
+    #[ignore]
+    fn hardware_live_channels_then_identify_after_stale_replies() {
+        let dll = match std::env::var("WIDEBAND_HW_DLL") {
+            Ok(path) => path,
+            Err(_) => return,
+        };
+        let channels = crate::telemetry::TelemetryChannelFile::load(std::path::Path::new("telemetry-channels.json"))
+            .expect("telemetry-channels.json")
+            .channels;
+        let profile = EcuProfile::tacoma_can();
+        let mut dev = super::create_host_device(&dll);
+        dev.open().expect("open cable");
+        let channel = crate::j2534::connect_for_profile(dev.as_mut(), &profile).expect("connect");
+        let mut answered = 0;
+        for ch in &channels {
+            let req = ch.build_request_bytes();
+            let started = Instant::now();
+            let resp = crate::protocols::IsoTpLink::exchange_for_profile(dev.as_mut(), channel, &profile, &req, 100);
+            let value = resp.as_ref().ok().and_then(|r| crate::telemetry::decode_channel_value(&ch.decode, r));
+            if value.is_some() {
+                answered += 1;
+            }
+            println!(
+                "{:<18} {:02X?} -> {:02X?} value={:?} ({} ms)",
+                ch.id,
+                req,
+                resp,
+                value,
+                started.elapsed().as_millis()
+            );
+        }
+        for _ in 0..20 {
+            let _ = crate::protocols::IsoTpLink::exchange_for_profile(dev.as_mut(), channel, &profile, &[0x01, 0x0C], 10);
+        }
+        let id = EcuIdentifier::query(dev.as_mut(), channel, &profile, false);
+        let _ = dev.close();
+        println!("{} of {} channels decoded", answered, channels.len());
+        let id = id.expect("identify after stale replies");
+        println!("{}", id.details);
+        assert_eq!(id.vin.len(), 17, "VIN after stale replies: {:?}", id.details);
+        assert!(answered > 0, "no live channel decoded");
+    }
 }
 
 #[cfg(not(windows))]

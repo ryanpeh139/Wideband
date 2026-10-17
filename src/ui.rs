@@ -922,6 +922,9 @@ impl WidebandApp {
                 if !ok {
                     let mut buf = self.telemetry.lock().unwrap();
                     buf.bus_fail_count += 1;
+                    // An unsupported PID or DID waits its interval too; otherwise it stays
+                    // "most overdue" and takes every tick's budget from channels that answer.
+                    buf.scheduler.mark_polled(idx, now);
                 }
             }
             let live_pos = {
