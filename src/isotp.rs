@@ -51,6 +51,10 @@ impl IsoTpLink {
         }
     }
 
+    pub fn channel(&self) -> u32 {
+        self.channel
+    }
+
     pub fn set_ids(&mut self, tx_id: u32, rx_id: u32) {
         self.config.tx_id = tx_id;
         self.config.rx_id = rx_id;

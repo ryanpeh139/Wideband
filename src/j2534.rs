@@ -158,6 +158,7 @@ fn bench_rx_id_for_tx(tx_id: u32) -> (u32, BenchEcuRole) {
         0x7E1 => (0x7E9, BenchEcuRole::Tcm),
         0x7E0 => (0x7E8, BenchEcuRole::Ecm),
         0x700 => (0x708, BenchEcuRole::Ecm),
+        0x701 => (0x709, BenchEcuRole::Tcm),
         0x18DA28F1 => (0x18DAF128, BenchEcuRole::Tcm),
         0x18DA10F1 => (0x18DAF110, BenchEcuRole::Ecm),
         _ => (0x7E8, BenchEcuRole::Ecm),
@@ -448,6 +449,12 @@ pub trait PassThruDevice: Send + Sync {
     /// answers flow control, so each message is written and read whole.
     fn cable_isotp(&self) -> bool {
         false
+    }
+
+    /// Drops replies still queued from earlier requests (`CLEAR_RX_BUFFER`). Best effort: a
+    /// device without it just keeps its buffer.
+    fn clear_rx(&mut self, channel: u32) {
+        let _ = self.ioctl(channel, CLEAR_RX_BUFFER, &[]);
     }
 
     /// ISO 14230 fast init after connect (K-Line). Default uses `FAST_INIT` ioctl.

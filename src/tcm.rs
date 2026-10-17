@@ -7,9 +7,14 @@ use crate::definitions::XdfDocument;
 use crate::flash_layout::FlashLayoutMap;
 use crate::j2534::PassThruDevice;
 use crate::protocols::{
-    DiagnosticProtocol, EcuIdentification, EcuProfile, VehicleBus,
+    clean_id_text, parse_mode09_cal_ids, parse_mode09_cvns, DiagnosticProtocol, EcuIdentification,
+    EcuProfile, VehicleBus,
 };
 use crate::security_config::PlatformSecurity;
+
+/// How long TCM identify waits for each OBD Mode 09 reply; the TCM answers in ~15–30 ms and
+/// stays silent for a PID it lacks.
+const OBD_REPLY_MS: u32 = 500;
 use crate::uds::UdsClient;
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -59,8 +64,13 @@ pub struct TcmProfile {
     pub protocol_id: u32,
     pub connect_flags: u32,
     pub extended_id: bool,
+    /// Diagnostic (UDS) request and response ids.
     pub request_id: u32,
     pub response_id: u32,
+    /// OBD-II physical ids (replies to functional `0x7DF` requests); same as the diagnostic ids
+    /// unless the TCM splits them.
+    pub obd_request_id: u32,
+    pub obd_response_id: u32,
     pub filter_mask: u32,
     pub tester: u8,
     pub ecu: u8,
@@ -88,8 +98,12 @@ impl TcmProfile {
             protocol_id: crate::j2534::ISO15765,
             connect_flags: 0,
             extended_id: false,
-            request_id: 0x7E1,
-            response_id: 0x7E9,
+            // The 2017 Tacoma TCM answers UDS on 0x701/0x709 and OBD on 0x7DF -> 0x7E9; it ignores
+            // physical requests to 0x7E1 except flow control.
+            request_id: 0x701,
+            response_id: 0x709,
+            obd_request_id: 0x7E1,
+            obd_response_id: 0x7E9,
             filter_mask: 0x7FF,
             tester: 0xF1,
             ecu: 0x18,
@@ -119,6 +133,8 @@ impl TcmProfile {
             extended_id: false,
             request_id: 0x13,
             response_id: 0xF1,
+            obd_request_id: 0x13,
+            obd_response_id: 0xF1,
             filter_mask: 0xFF,
             tester: 0xF1,
             ecu: 0x18,
@@ -148,6 +164,8 @@ impl TcmProfile {
             extended_id: true,
             request_id: 0x18DA28F1,
             response_id: 0x18DAF128,
+            obd_request_id: 0x18DA28F1,
+            obd_response_id: 0x18DAF128,
             filter_mask: 0x1FFFFFFF,
             tester: 0xF1,
             ecu: 0x28,
@@ -177,6 +195,8 @@ impl TcmProfile {
             extended_id: false,
             request_id: 0x6C,
             response_id: 0x6C,
+            obd_request_id: 0x6C,
+            obd_response_id: 0x6C,
             filter_mask: 0xFF,
             tester: 0xF1,
             ecu: 0x28,
@@ -214,8 +234,8 @@ impl TcmProfile {
             extended_id: self.extended_id,
             request_id: self.request_id,
             response_id: self.response_id,
-            obd_request_id: self.request_id,
-            obd_response_id: self.response_id,
+            obd_request_id: self.obd_request_id,
+            obd_response_id: self.obd_response_id,
             filter_mask: self.filter_mask,
             tester: self.tester,
             ecu: self.ecu,
@@ -380,41 +400,73 @@ impl TcmIdentifier {
         let mut id = EcuIdentification::default();
         let mut field_errors: Vec<String> = Vec::new();
         let mut client = UdsClient::for_profile(device, channel, &transport);
+        // OBD Mode 09 first, as for the ECM: functional request, reply from the TCM's OBD id.
+        // A TCM that lacks a PID stays silent, so do not wait the full 2 s P2 for it.
+        let mut obd = UdsClient::for_obd(channel, &transport);
+        obd.set_timers(OBD_REPLY_MS, OBD_REPLY_MS);
 
-        let vin_req = vec![0x22, 0xF1, 0x90];
-        match client.request(device, &vin_req, 0x62) {
-            Ok(resp) if resp.len() >= 4 => {
-                id.vin = String::from_utf8_lossy(&resp[3..]).trim().to_string();
+        // VIN: Mode 09 02, then DID F190.
+        let mut vin_error = String::new();
+        match obd.request(device, &[0x09, 0x02], 0x49) {
+            Ok(resp) if resp.len() >= 4 => id.vin = clean_id_text(&resp[3..]),
+            Ok(_) => vin_error = "Mode 09 response too short".to_string(),
+            Err(e) => vin_error = format!("Mode 09: {}", e),
+        }
+        if id.vin.is_empty() {
+            match client.request(device, &[0x22, 0xF1, 0x90], 0x62) {
+                Ok(resp) if resp.len() >= 4 => id.vin = clean_id_text(&resp[3..]),
+                Ok(_) => vin_error = format!("{}; DID F190 response too short", vin_error),
+                Err(e) => vin_error = format!("{}; DID F190: {}", vin_error, e),
             }
-            Ok(_) => field_errors.push("VIN: TCM response too short".to_string()),
-            Err(e) => field_errors.push(format!("VIN: {}", e)),
+        }
+        if id.vin.is_empty() {
+            field_errors.push(format!("VIN: {}", vin_error));
         }
 
-        let cal_req = if profile.platform.contains("Toyota") {
-            vec![0x22, 0xF1, 0x82]
-        } else {
-            vec![0x22, 0x00, 0xC2]
-        };
-        match client.request(device, &cal_req, 0x62) {
-            Ok(resp) if resp.len() >= 4 => {
-                id.cal_id = String::from_utf8_lossy(&resp[3..]).trim().to_string();
+        // Cal IDs: Mode 09 04, then the platform DID.
+        let mut cal_error = String::new();
+        match obd.request(device, &[0x09, 0x04], 0x49) {
+            Ok(resp) => {
+                id.cal_ids = parse_mode09_cal_ids(&resp);
+                if id.cal_ids.is_empty() {
+                    cal_error = "Mode 09 response had no calibration ID".to_string();
+                }
             }
-            Ok(_) => field_errors.push("TCM Cal ID: response too short".to_string()),
-            Err(e) => field_errors.push(format!("TCM Cal ID: {}", e)),
+            Err(e) => cal_error = format!("Mode 09: {}", e),
+        }
+        if id.cal_ids.is_empty() {
+            let cal_req = if profile.platform.contains("Toyota") {
+                vec![0x22, 0xF1, 0x82]
+            } else {
+                vec![0x22, 0x00, 0xC2]
+            };
+            match client.request(device, &cal_req, 0x62) {
+                Ok(resp) if resp.len() >= 4 => {
+                    let cal = clean_id_text(&resp[3..]);
+                    if !cal.is_empty() {
+                        id.cal_ids.push(cal);
+                    }
+                }
+                Ok(_) => cal_error = format!("{}; DID response too short", cal_error),
+                Err(e) => cal_error = format!("{}; DID: {}", cal_error, e),
+            }
+        }
+        if id.cal_ids.is_empty() {
+            field_errors.push(format!("TCM Cal ID: {}", cal_error));
         }
 
-        let cvn_req = vec![0x09, 0x06];
-        match client.request(device, &cvn_req, 0x49) {
-            Ok(resp) if resp.len() >= 4 => {
-                id.cvn = resp[3..]
-                    .iter()
-                    .map(|b| format!("{:02X}", b))
-                    .collect::<Vec<_>>()
-                    .join("");
+        // CVNs: Mode 09 06.
+        match obd.request(device, &[0x09, 0x06], 0x49) {
+            Ok(resp) => {
+                id.cvns = parse_mode09_cvns(&resp);
+                if id.cvns.is_empty() {
+                    field_errors.push("CVN: Mode 09 response had no CVN".to_string());
+                }
             }
-            Ok(_) => field_errors.push("CVN: response too short".to_string()),
             Err(e) => field_errors.push(format!("CVN: {}", e)),
         }
+        id.cal_id = id.cal_ids.join(", ");
+        id.cvn = id.cvns.join(", ");
 
         if allow_demo_defaults {
             if id.vin.is_empty() {
@@ -426,13 +478,15 @@ impl TcmIdentifier {
             if id.cvn.is_empty() {
                 id.cvn = crate::j2534::VIRTUAL_TACOMA_CVN_HEX.to_string();
             }
-        } else if !field_errors.is_empty() {
-            return Err(field_errors.join("; "));
+            field_errors.clear();
         } else if id.vin.is_empty() && id.cal_id.is_empty() && id.cvn.is_empty() {
-            return Err(
+            let mut message =
                 "TCM did not respond to identification (ignition ON, matching TCM profile, and bus traffic required)."
-                    .to_string(),
-            );
+                    .to_string();
+            if !field_errors.is_empty() {
+                message = format!("{} {}", message, field_errors.join("; "));
+            }
+            return Err(message);
         }
 
         id.details = format!(
@@ -443,6 +497,10 @@ impl TcmIdentifier {
             profile.name,
             profile.transmission_family
         );
+        // A TCM often has no VIN; list what it did not answer instead of failing the read.
+        if !field_errors.is_empty() {
+            id.details = format!("{} — not read: {}", id.details, field_errors.join("; "));
+        }
 
         Ok(id)
     }
@@ -642,6 +700,10 @@ struct TcmCanSection {
     request_id: String,
     response_id: String,
     filter_mask: String,
+    #[serde(default)]
+    obd_request_id: Option<String>,
+    #[serde(default)]
+    obd_response_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -679,6 +741,16 @@ impl TcmPackFile {
                 SUPPORTED_TCM_PACK_VERSION
             ));
         }
+        let request_id = parse_u32_hex(&self.can.request_id, "can.request_id")?;
+        let response_id = parse_u32_hex(&self.can.response_id, "can.response_id")?;
+        let obd_request_id = match &self.can.obd_request_id {
+            Some(raw) => parse_u32_hex(raw, "can.obd_request_id")?,
+            None => request_id,
+        };
+        let obd_response_id = match &self.can.obd_response_id {
+            Some(raw) => parse_u32_hex(raw, "can.obd_response_id")?,
+            None => response_id,
+        };
         Ok(TcmProfile {
             id: self.id.trim().to_string(),
             name: self.name,
@@ -694,8 +766,10 @@ impl TcmPackFile {
             protocol_id: parse_j2534_protocol(&self.j2534.protocol)?,
             connect_flags: self.j2534.connect_flags,
             extended_id: self.j2534.extended_id,
-            request_id: parse_u32_hex(&self.can.request_id, "can.request_id")?,
-            response_id: parse_u32_hex(&self.can.response_id, "can.response_id")?,
+            request_id,
+            response_id,
+            obd_request_id,
+            obd_response_id,
             filter_mask: parse_u32_hex(&self.can.filter_mask, "can.filter_mask")?,
             tester: parse_u8_hex(&self.kline.tester, "kline.tester")?,
             ecu: parse_u8_hex(&self.kline.ecu, "kline.ecu")?,
@@ -765,7 +839,8 @@ mod tests {
             .find(|p| p.id == "tacoma-can-tcm")
             .expect("tacoma-can-tcm");
         assert_eq!(tacoma.paired_ecm_profile_id, "tacoma-can");
-        assert_eq!(tacoma.request_id, 0x7E1);
+        assert_eq!((tacoma.request_id, tacoma.response_id), (0x701, 0x709));
+        assert_eq!((tacoma.obd_request_id, tacoma.obd_response_id), (0x7E1, 0x7E9));
         assert_eq!(catalog.index_for_ecm("tacoma-can"), Some(catalog.profiles.iter().position(|p| p.id == "tacoma-can-tcm").unwrap()));
     }
 

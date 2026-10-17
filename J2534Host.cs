@@ -31,6 +31,8 @@ sealed class J2534Host
     // SAE J2534-1: FAST_INIT is 0x05. 0x03 is READ_VBATT.
     const uint ReadVbatt = 0x03;
     const uint FastInit = 0x05;
+    // Drops replies still queued from an earlier request; Techstream sends it before each request.
+    const uint ClearRxBuffer = 0x08;
     static readonly byte[] Zeros = new byte[MessageBytes];
 
     [DllImport("kernel32", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -286,6 +288,12 @@ sealed class J2534Host
         {
             string hex = parts.Length >= 2 ? parts[1].Replace(" ", "") : "";
             return Init(hex);
+        }
+        if (ioctlId == ClearRxBuffer)
+        {
+            int status = ioctlFn(channelId, ClearRxBuffer, IntPtr.Zero, IntPtr.Zero);
+            if (status != 0) return Fail(Describe(status), status);
+            return Ok();
         }
         return Fail("Unsupported IOCTL id for host bridge.", -1);
     }

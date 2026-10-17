@@ -172,6 +172,16 @@ impl DiagnosticTransport {
         link
     }
 
+    /// Clears the cable's receive buffer on this link's channel.
+    pub fn clear_rx(&self, device: &mut dyn PassThruDevice) {
+        let channel = match &self.inner {
+            Transport::IsoTp(l) => l.channel(),
+            Transport::KLine(l) => l.channel,
+            Transport::Vpw(l) => l.channel,
+        };
+        device.clear_rx(channel);
+    }
+
     /// CAN only: send single-frame requests to this functional id (OBD `0x7DF`).
     pub fn set_functional_id(&mut self, functional_id: Option<u32>) {
         if let Transport::IsoTp(l) = &mut self.inner {

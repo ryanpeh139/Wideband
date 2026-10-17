@@ -99,7 +99,9 @@ impl EcuProfile {
             response_id: 0x708,
             obd_request_id: 0x7E0,
             obd_response_id: 0x7E8,
-            filter_mask: 0x7FF,
+            // Passes 0x708–0x70F and 0x7E8–0x7EF so the TCM (0x709 / 0x7E9) answers on the same
+            // connection; ISO-TP still checks the exact response id.
+            filter_mask: 0x718,
             tester: 0xF1,
             ecu: 0x10,
             max_chunk: 1024,
@@ -374,6 +376,19 @@ impl ChecksumEngine {
 
 pub struct IsoTpLink;
 
+/// True when `resp` answers `request`: a negative reply for the same service, or a positive
+/// reply that echoes the request's PID / DID bytes (`41 0C ..` for `01 0C`, `62 01 03 ..` for
+/// `22 01 03`).
+fn reply_answers(request: &[u8], resp: &[u8]) -> bool {
+    match (request.first(), resp.first()) {
+        (Some(&service), Some(&0x7F)) => resp.len() >= 2 && resp[1] == service,
+        (Some(&service), Some(&first)) => {
+            first == (service | 0x40) && resp.len() >= request.len() && resp[1..request.len()] == request[1..]
+        }
+        _ => false,
+    }
+}
+
 impl IsoTpLink {
     pub fn send(device: &mut dyn PassThruDevice, channel: u32, can_id: u32, payload: &[u8]) -> Result<(), String> {
         let link = IsoTpSession::new(channel, IsoTpConfig {
@@ -413,7 +428,15 @@ impl IsoTpLink {
         };
         let link = IsoTpSession::new(channel, config);
         link.send(device, request)?;
-        link.receive(device)
+        // A late reply to an earlier poll can be queued ahead of this one; keep reading until a
+        // reply answers this service and PID/DID, or the wait runs out.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+        loop {
+            let resp = link.receive(device)?;
+            if reply_answers(request, &resp) || std::time::Instant::now() >= deadline {
+                return Ok(resp);
+            }
+        }
     }
 
     pub fn receive(device: &mut dyn PassThruDevice, channel: u32, timeout_ms: u32) -> Result<Vec<u8>, String> {
@@ -711,11 +734,25 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_skips_a_late_reply_for_another_pid() {
+        let prof = EcuProfile::tacoma_can();
+        let mut obd = ScriptCan::new(0x7E0, 0x7E8);
+        obd.enqueue_rx(&[0x03, 0x41, 0x11, 0x30]);
+        obd.enqueue_rx(&[0x04, 0x41, 0x0C, 0x1A, 0xF8]);
+        let resp = IsoTpLink::exchange_for_profile(&mut obd, 1, &prof, &[0x01, 0x0C], 100).unwrap();
+        assert_eq!(resp, vec![0x41, 0x0C, 0x1A, 0xF8]);
+        assert!(reply_answers(&[0x22, 0x18, 0x10], &[0x7F, 0x22, 0x31]));
+        assert!(!reply_answers(&[0x22, 0x01, 0x03], &[0x62, 0x01, 0x04, 0x00]));
+    }
+
+    #[test]
     fn tacoma_filter_passes_diagnostic_and_obd_replies() {
         let prof = EcuProfile::tacoma_can();
         let mask = prof.rx_filter_mask();
-        assert_eq!(0x708 & mask, prof.response_id & mask);
-        assert_eq!(0x7E8 & mask, prof.response_id & mask);
+        for id in [0x708, 0x7E8, 0x709, 0x7E9] {
+            assert_eq!(id & mask, prof.response_id & mask, "0x{:X} must pass", id);
+        }
+        assert_ne!(0x7DF & mask, prof.response_id & mask, "requests are not received");
         assert_eq!(EcuProfile::silverado_can().rx_filter_mask(), 0x1FFFFFFF);
     }
 }

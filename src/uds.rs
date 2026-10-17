@@ -108,6 +108,9 @@ impl UdsClient {
         if request.is_empty() {
             return Err("Empty UDS request".to_string());
         }
+        // Late live-data replies queued ahead of this answer made the ECM give up waiting for
+        // flow control while they were read one by one; Techstream clears before each request.
+        self.link.clear_rx(device);
         self.link.send(device, request)?;
         let response = self.receive_with_pending(device, request[0])?;
         if response.len() >= 3 && response[0] == NEGATIVE {
