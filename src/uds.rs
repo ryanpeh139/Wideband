@@ -29,6 +29,12 @@ impl UdsClient {
         }
     }
 
+    /// CAN only: address single-frame requests to this functional id (OBD `0x7DF`); replies are
+    /// still read from the profile's response id.
+    pub fn set_functional_id(&mut self, functional_id: Option<u32>) {
+        self.link.set_functional_id(functional_id);
+    }
+
     pub fn set_timers(&mut self, p2_ms: u32, p2_star_ms: u32) {
         if p2_ms > 0 {
             self.p2_ms = p2_ms;

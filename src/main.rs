@@ -44,9 +44,13 @@ use eframe::egui;
 use ui::WidebandApp;
 
 fn main() -> eframe::Result<()> {
-    // `--raw-can` keeps CAN profiles on raw CAN with Wideband's own ISO-TP (same as WIDEBAND_RAW_CAN=1).
+    // CAN profiles use raw CAN with Wideband's own ISO-TP. `--cable-isotp` (WIDEBAND_CABLE_ISOTP=1)
+    // opts into the cable's J2534 ISO15765 mode; `--raw-can` (WIDEBAND_RAW_CAN=1) forces raw CAN.
     if std::env::args().any(|a| a == "--raw-can") {
         std::env::set_var("WIDEBAND_RAW_CAN", "1");
+    }
+    if std::env::args().any(|a| a == "--cable-isotp") {
+        std::env::set_var("WIDEBAND_CABLE_ISOTP", "1");
     }
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

@@ -15,6 +15,9 @@ pub struct IsoTpConfig {
     pub block_size: u8,
     pub stmin_ms: u8,
     pub max_flow_waits: u32,
+    /// ISO 15765-4 functional request id (`0x7DF`). When set, single-frame requests go here
+    /// instead of `tx_id`; flow control and multi-frame requests stay on `tx_id`.
+    pub functional_id: Option<u32>,
 }
 
 impl Default for IsoTpConfig {
@@ -27,6 +30,7 @@ impl Default for IsoTpConfig {
             block_size: 0,
             stmin_ms: 0,
             max_flow_waits: 5,
+            functional_id: None,
         }
     }
 }
@@ -47,13 +51,23 @@ impl IsoTpLink {
         }
     }
 
+    pub fn set_functional_id(&mut self, functional_id: Option<u32>) {
+        self.config.functional_id = functional_id;
+    }
+
     pub fn send(&self, device: &mut dyn PassThruDevice, payload: &[u8]) -> Result<(), String> {
         if payload.is_empty() {
             return Err("ISO-TP cannot send an empty payload".to_string());
         }
+        // Functional addressing only carries single frames (ISO 15765-4).
+        let single_id = if payload.len() <= 7 {
+            self.config.functional_id.unwrap_or(self.config.tx_id)
+        } else {
+            self.config.tx_id
+        };
         if device.cable_isotp() {
             // The cable segments and pads the message and handles flow control itself.
-            device.write_msgs(self.channel, &[PassThruMsg::new_can(self.config.tx_id, payload)], self.config.timeout_ms)?;
+            device.write_msgs(self.channel, &[PassThruMsg::new_can(single_id, payload)], self.config.timeout_ms)?;
             return Ok(());
         }
         if payload.len() <= 7 {
@@ -62,7 +76,7 @@ impl IsoTpLink {
             while buf.len() < 8 {
                 buf.push(self.config.pad_byte);
             }
-            device.write_msgs(self.channel, &[PassThruMsg::new_can(self.config.tx_id, &buf)], self.config.timeout_ms)?;
+            device.write_msgs(self.channel, &[PassThruMsg::new_can(single_id, &buf)], self.config.timeout_ms)?;
             return Ok(());
         }
 
@@ -285,6 +299,8 @@ pub(crate) mod mock {
         pub connected: bool,
         pub rx_script: VecDeque<Vec<u8>>,
         pub tx_captured: Vec<Vec<u8>>,
+        /// CAN id of each captured frame, in the same order as `tx_captured`.
+        pub tx_ids: Vec<u32>,
         /// Behave like a J2534 ISO15765 channel: whole messages, no padding.
         pub cable_isotp: bool,
     }
@@ -297,6 +313,7 @@ pub(crate) mod mock {
                 connected: true,
                 rx_script: VecDeque::new(),
                 tx_captured: Vec::new(),
+                tx_ids: Vec::new(),
                 cable_isotp: false,
             }
         }
@@ -341,6 +358,7 @@ pub(crate) mod mock {
             }
             for msg in msgs {
                 self.tx_captured.push(msg.payload().to_vec());
+                self.tx_ids.push(msg.read_id());
             }
             Ok(msgs.len() as u32)
         }
@@ -482,6 +500,29 @@ mod tests {
         );
         let payload = link.receive(&mut dev).expect("per-frame timeout, not whole-message");
         assert_eq!(payload, (0..total).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn functional_request_sends_single_frame_to_7df_and_flow_control_to_ecu() {
+        // A 2017 Tacoma ECM answered Mode 09 on 0x7DF but ignored the same request on 0x7E0;
+        // its flow control still has to go to the physical id.
+        let mut dev = ScriptCan::new(0x7E0, 0x7E8);
+        dev.enqueue_rx(&[0x10, 0x14, 0x49, 0x02, 0x01, b'3', b'T', b'M']);
+        dev.enqueue_rx(&[0x21, b'C', b'Z', b'5', b'A', b'N', b'1', b'H']);
+        dev.enqueue_rx(&[0x22, b'M', b'1', b'1', b'6', b'9', b'1', b'1']);
+        let link = IsoTpLink::new(
+            1,
+            IsoTpConfig {
+                functional_id: Some(0x7DF),
+                ..IsoTpConfig::default()
+            },
+        );
+        link.send(&mut dev, &[0x09, 0x02]).unwrap();
+        let reply = link.receive(&mut dev).unwrap();
+        assert_eq!(&reply[3..], b"3TMCZ5AN1HM116911");
+        assert_eq!(dev.tx_ids, vec![0x7DF, 0x7E0]);
+        assert_eq!(dev.tx_captured[0][..3], [0x02, 0x09, 0x02]);
+        assert_eq!(dev.tx_captured[1][0], 0x30);
     }
 
     #[test]

@@ -9,7 +9,7 @@ using System.Text;
 // Protocol 5 is CAN. Protocol 4 is ISO 14230. Protocol 1 is J1850 VPW.
 // CAN data starts with the id, big-endian, as SAE J2534-1 requires.
 // K-Line and VPW data is the frame. ISO 14230 can send FAST_INIT.
-// Commands: OPEN, CONNECT, INIT, FILTER, READ, WRITE, IOCTL, VERSION, CLOSE, QUIT.
+// Commands: OPEN, CONNECT, INIT, FILTER, READ [ms], WRITE, IOCTL, VERSION, CLOSE, QUIT.
 // Programming voltage and periodic messages are not available.
 sealed class J2534Host
 {
@@ -108,7 +108,8 @@ sealed class J2534Host
         string line;
         while ((line = Console.ReadLine()) != null)
         {
-            line = line.Trim();
+            // A redirected stdin from PowerShell or .NET can start with a UTF-8 BOM.
+            line = line.Trim().TrimStart('﻿');
             if (line.Length == 0) continue;
             if (line == "QUIT")
             {
@@ -152,7 +153,7 @@ sealed class J2534Host
             if (verb == "CONNECT") return Connect(rest);
             if (verb == "INIT") return Init(rest);
             if (verb == "FILTER") return Filter(rest);
-            if (verb == "READ") return Read();
+            if (verb == "READ") return Read(rest);
             if (verb == "WRITE") return Write(rest);
             if (verb == "IOCTL") return Ioctl(rest);
             if (verb == "VERSION") return Version();
@@ -397,15 +398,28 @@ sealed class J2534Host
         }
     }
 
-    string Read()
+    // READ [ms]: how long PassThruReadMsgs may wait for a message (default 0, at most 2000).
+    // The XHorse Mini-VCI driver ignores this on an ISO15765 channel and blocks about 5 s when
+    // nothing arrives, which is why Wideband uses raw CAN by default.
+    static uint ReadTimeout(string rest)
+    {
+        string[] parts = Parts(rest);
+        uint timeout;
+        if (parts.Length < 1 || !uint.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out timeout))
+            return 0;
+        return timeout > 2000 ? 2000 : timeout;
+    }
+
+    string Read(string rest)
     {
         if (!channelOpen) return Fail("The channel is not open.", -1);
-        if (!IsCan) return ReadRaw();
+        uint timeout = ReadTimeout(rest);
+        if (!IsCan) return ReadRaw(timeout);
         IntPtr message = AllocMessage();
         try
         {
             uint count = 1;
-            int status = readFn(channelId, message, ref count, 0);
+            int status = readFn(channelId, message, ref count, timeout);
             if (status == 0x09 || status == 0x10 || (status == 0 && count == 0))
                 return "{\"ok\":true,\"empty\":true}";
             if (status != 0) return Fail(Describe(status), status);
@@ -621,13 +635,13 @@ sealed class J2534Host
         }
     }
 
-    string ReadRaw()
+    string ReadRaw(uint timeout)
     {
         IntPtr message = AllocMessage();
         try
         {
             uint count = 1;
-            int status = readFn(channelId, message, ref count, 0);
+            int status = readFn(channelId, message, ref count, timeout);
             if (status == 0x09 || status == 0x10 || (status == 0 && count == 0))
                 return "{\"ok\":true,\"empty\":true}";
             if (status != 0) return Fail(Describe(status), status);

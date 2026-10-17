@@ -33,7 +33,11 @@ Wideband discovers devices from `PassThruSupport.04.04` registry keys and common
 
 ## How Wideband talks to the cable on CAN
 
-On CAN profiles Wideband opens the cable in **ISO 15765** mode (J2534 protocol 6) with a flow-control filter, the same way Techstream does: the cable segments and reassembles diagnostic messages and answers flow control itself. Clone Mini-VCI cables are tested for this mode by their makers; several do not answer reliably in raw CAN mode. The Connect log line ends with `ISO 15765 (cable ISO-TP)` when this mode is active. If a cable refuses it, Wideband falls back to raw CAN (protocol 5) with its own ISO-TP and the log says `raw CAN (cable refused ISO 15765: …)`. Start Wideband with `--raw-can` (Start menu: **Wideband (raw CAN mode)**) or set `WIDEBAND_RAW_CAN=1` to force raw CAN.
+On CAN profiles Wideband opens the cable in **raw CAN** mode (J2534 protocol 5) and runs ISO-TP itself: segmentation, reassembly, and flow control. Raw CAN reads honor their timeout, so a quiet bus never stalls the program.
+
+The cable's own **ISO 15765** mode (J2534 protocol 6, with a flow-control filter) is opt-in: start Wideband with `--cable-isotp` or set `WIDEBAND_CABLE_ISOTP=1`. The Connect log line then ends with `ISO 15765 (cable ISO-TP)`. On the XHorse Mini-VCI driver (`MVCI32.dll` 1.4.3, firmware `J2534 MINIV1.03`), every read on an ISO 15765 channel with nothing to receive blocks about 5 s, whatever timeout it is given. Calling the driver from a second thread while that read is pending makes writes hang, so this mode stays off by default. `--raw-can` / `WIDEBAND_RAW_CAN=1` still force raw CAN.
+
+**Identify ECU** sends the OBD Mode 09 requests (VIN `09 02`, Cal ID `09 04`, CVN `09 06`) to the functional id `0x7DF`, as scan tools do. Replies are read from `0x7E8`, and flow control goes to `0x7E0`. On the bench 2017 Tacoma (ignition ON), the ECM answered these requests on `0x7DF` and accepted flow control on `0x7E0`. It did not answer any single-frame request sent physically to `0x7E0` (`01 00`, `09 02`, `3E 00`, `10 81`, `22 11 90`, `1A 90`, with `AA`, `00`, or `55` padding). Services that must go to the physical id therefore still need investigation on this truck.
 
 Each cable session writes `j2534-trace.log` beside `wideband.exe`: every command sent to `J2534Host.exe`, its reply, and how long it took. If Wideband stops responding with a cable connected, the last lines show which call the cable driver did not return from.
 

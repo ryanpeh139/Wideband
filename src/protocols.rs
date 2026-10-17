@@ -188,6 +188,15 @@ impl EcuProfile {
         }
     }
 
+    /// ISO 15765-4 functional OBD request id for CAN profiles (`0x7DF`, or `0x18DB33F1` on
+    /// 29-bit). The 2017 Tacoma ECM answers OBD Mode 09 there but not on its physical `0x7E0`.
+    pub fn obd_functional_id(&self) -> Option<u32> {
+        if self.bus != VehicleBus::CanIsoTp {
+            return None;
+        }
+        Some(if self.extended_id { 0x18DB33F1 } else { 0x7DF })
+    }
+
     pub fn builtin_defaults() -> Vec<Self> {
         vec![
             Self::tacoma_can(),
@@ -440,10 +449,14 @@ impl EcuIdentifier {
         let uds = profile.diagnostic == DiagnosticProtocol::Uds;
 
         let mut client = UdsClient::for_profile(device, channel, profile);
+        // OBD Mode 09 goes out functionally, as scan tools send it; replies still come from the
+        // profile's response id and flow control still goes to its request id.
+        let mut obd = UdsClient::for_profile(device, channel, profile);
+        obd.set_functional_id(profile.obd_functional_id());
 
         // 1. VIN: OBD Mode 09 02, then UDS 22 F1 90
         let mut vin_error = String::new();
-        match client.request(device, &[0x09, 0x02], 0x49) {
+        match obd.request(device, &[0x09, 0x02], 0x49) {
             Ok(resp) if resp.len() >= 4 => id.vin = clean_id_text(&resp[3..]),
             Ok(_) => vin_error = "Mode 09 response too short".to_string(),
             Err(e) => vin_error = format!("Mode 09: {}", e),
@@ -461,7 +474,7 @@ impl EcuIdentifier {
 
         // 2. Cal IDs: OBD Mode 09 04, then the platform DID
         let mut cal_error = String::new();
-        match client.request(device, &[0x09, 0x04], 0x49) {
+        match obd.request(device, &[0x09, 0x04], 0x49) {
             Ok(resp) => {
                 id.cal_ids = parse_mode09_cal_ids(&resp);
                 if id.cal_ids.is_empty() {
@@ -492,7 +505,7 @@ impl EcuIdentifier {
         }
 
         // 3. CVNs: OBD Mode 09 06
-        match client.request(device, &[0x09, 0x06], 0x49) {
+        match obd.request(device, &[0x09, 0x06], 0x49) {
             Ok(resp) => {
                 id.cvns = parse_mode09_cvns(&resp);
                 if id.cvns.is_empty() {

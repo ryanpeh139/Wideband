@@ -133,6 +133,7 @@ impl DiagnosticTransport {
                     block_size: 0,
                     stmin_ms: 0,
                     max_flow_waits: 5,
+                    functional_id: None,
                 },
             )),
             VehicleBus::KLine => Transport::KLine(KLineLink::new(
@@ -157,6 +158,13 @@ impl DiagnosticTransport {
             Transport::IsoTp(l) => l.set_timeout_ms(timeout_ms),
             Transport::KLine(l) => l.set_timeout_ms(timeout_ms),
             Transport::Vpw(l) => l.set_timeout_ms(timeout_ms),
+        }
+    }
+
+    /// CAN only: send single-frame requests to this functional id (OBD `0x7DF`).
+    pub fn set_functional_id(&mut self, functional_id: Option<u32>) {
+        if let Transport::IsoTp(l) = &mut self.inner {
+            l.set_functional_id(functional_id);
         }
     }
 

@@ -12,9 +12,12 @@ mod imp {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    /// Floor for any host reply. READ itself is non-blocking in the host, so hitting this means
-    /// the host or vendor DLL is wedged — not that the bus is quiet.
-    const MIN_HOST_REPLY_MS: u32 = 5000;
+    /// Floor for any host reply. A raw CAN READ waits at most its own timeout in the DLL, but the
+    /// XHorse Mini-VCI driver blocks about 5 s on an empty ISO15765 channel whatever timeout it is
+    /// given, so the floor sits above that. Hitting it means the host or vendor DLL is wedged.
+    const MIN_HOST_REPLY_MS: u32 = 8000;
+    /// Longest wait handed to the DLL for one READ; the ISO-TP and K-Line loops poll again.
+    const MAX_READ_WAIT_MS: u32 = 50;
     /// SAE J2534-1 protocol id for ISO15765 on the host wire (raw CAN is 5).
     const WIRE_ISO15765: u32 = 6;
 
@@ -318,7 +321,12 @@ mod imp {
 
         fn connect(&mut self, protocol: u32, flags: u32, baud: u32) -> Result<u32, String> {
             self.cable_isotp = false;
-            if protocol == 5 && std::env::var_os("WIDEBAND_RAW_CAN").is_none() {
+            // Raw CAN with Wideband's own ISO-TP is the default. The cable's ISO15765 mode is
+            // opt-in (`--cable-isotp`): on the Mini-VCI every empty read there stalls ~5 s.
+            if protocol == 5
+                && std::env::var_os("WIDEBAND_CABLE_ISOTP").is_some()
+                && std::env::var_os("WIDEBAND_RAW_CAN").is_none()
+            {
                 match self.connect_cable_isotp(flags, baud) {
                     Ok(channel) => {
                         self.channel_id = channel;
@@ -369,7 +377,8 @@ mod imp {
         }
 
         fn read_msgs(&mut self, _channel: u32, timeout_ms: u32) -> Result<Vec<PassThruMsg>, String> {
-            let resp = self.command("READ", timeout_ms.max(50))?;
+            let wait = timeout_ms.min(MAX_READ_WAIT_MS);
+            let resp = self.command(&format!("READ {}", wait), timeout_ms.max(50))?;
             Self::require_ok(&resp)?;
             if resp.get("empty").and_then(|v| v.as_bool()) == Some(true) {
                 return Ok(Vec::new());
@@ -502,6 +511,36 @@ mod imp {
 
 #[cfg(windows)]
 pub use imp::{create_host_device, HostPassThruDevice};
+
+/// Read-only bench check against a real cable and ECM (ignition ON). Skipped unless
+/// `WIDEBAND_HW_DLL` names the J2534 DLL, e.g.
+/// `WIDEBAND_HW_DLL=...\MVCI32.dll cargo test --release hardware_identify -- --ignored --nocapture`.
+#[cfg(all(test, windows))]
+mod hardware {
+    use crate::protocols::{EcuIdentifier, EcuProfile};
+    use std::time::Instant;
+
+    #[test]
+    #[ignore]
+    fn hardware_identify_returns_vin_and_cal_id() {
+        let dll = match std::env::var("WIDEBAND_HW_DLL") {
+            Ok(path) => path,
+            Err(_) => return,
+        };
+        let profile = EcuProfile::tacoma_can();
+        let mut dev = super::create_host_device(&dll);
+        dev.open().expect("open cable");
+        let channel = crate::j2534::connect_for_profile(dev.as_mut(), &profile).expect("connect");
+        let started = Instant::now();
+        let result = EcuIdentifier::query(dev.as_mut(), channel, &profile, false);
+        let elapsed = started.elapsed();
+        let _ = dev.close();
+        let id = result.expect("identify");
+        println!("{} ({} ms)", id.details, elapsed.as_millis());
+        assert_eq!(id.vin.len(), 17, "VIN: {:?}", id.vin);
+        assert!(!id.cal_ids.is_empty(), "no Cal ID");
+    }
+}
 
 #[cfg(not(windows))]
 pub fn create_host_device(_dll_path: &str) -> Box<dyn crate::j2534::PassThruDevice> {
