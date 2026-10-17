@@ -34,6 +34,16 @@ If you cannot run the script, copy into the same folder as `wideband.exe`:
 | `profiles\` | repo `profiles\` (at least `tacoma-can.json`) |
 | `device_check.ps1` | repo root (recommended before connect) |
 
+## Installer (Wideband-Setup.exe)
+
+On Windows, with NSIS 3 installed (`winget install NSIS.NSIS`):
+
+```powershell
+.\scripts\Build-WindowsInstaller.ps1
+```
+
+It builds the release, compiles and checks `J2534Host.exe`, stages the same files as `scripts/build-windows-installer.sh`, and writes `dist\Wideband-Setup.exe`. The installer installs per user to `%LOCALAPPDATA%\Programs\Wideband` with Start menu and desktop shortcuts, updates an existing install in place, and keeps an existing `security-config.json`.
+
 ## Related
 
 - [tacoma-can-j2534-bring-up.md](./tacoma-can-j2534-bring-up.md)
