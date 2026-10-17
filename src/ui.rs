@@ -227,9 +227,10 @@ impl WidebandApp {
             });
         let flash_audit = FlashAuditLog::new(FlashAuditLog::default_path());
 
+        let selected_device_idx = TransportDevice::preferred_index(&devices);
         let mut app = Self {
             devices,
-            selected_device_idx: 0,
+            selected_device_idx,
             profiles,
             selected_profile_idx: 0,
             active_device: None,

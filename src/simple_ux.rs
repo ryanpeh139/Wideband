@@ -95,7 +95,11 @@ pub struct SimpleUxState {
 
 impl SimpleUxState {
     pub fn load() -> Self {
-        let path = Self::prefs_path();
+        let fallback = Self::user_prefs_path();
+        let path = match &fallback {
+            Some(p) if p.exists() => p.clone(),
+            _ => Self::prefs_path(),
+        };
         let file: UxPrefsFile = if path.exists() {
             fs::read_to_string(&path)
                 .ok()
@@ -128,6 +132,13 @@ impl SimpleUxState {
         PathBuf::from("wideband-ux-prefs.json")
     }
 
+    /// Per-user copy, used when the program folder is not writable (for example Program Files).
+    fn user_prefs_path() -> Option<PathBuf> {
+        std::env::var_os("LOCALAPPDATA")
+            .or_else(|| std::env::var_os("APPDATA"))
+            .map(|dir| PathBuf::from(dir).join("Wideband").join("wideband-ux-prefs.json"))
+    }
+
     pub fn is_beginner(&self) -> bool {
         self.skill_level == SkillLevel::Beginner
     }
@@ -145,7 +156,16 @@ impl SimpleUxState {
             skill_level: self.skill_level,
         };
         if let Ok(json) = serde_json::to_string_pretty(&body) {
-            let _ = fs::write(&self.prefs_path, json);
+            if fs::write(&self.prefs_path, &json).is_err() {
+                if let Some(user_path) = Self::user_prefs_path() {
+                    if let Some(dir) = user_path.parent() {
+                        let _ = fs::create_dir_all(dir);
+                    }
+                    if fs::write(&user_path, &json).is_ok() {
+                        self.prefs_path = user_path;
+                    }
+                }
+            }
             self.dirty = false;
         }
     }
@@ -577,12 +597,15 @@ impl WidebandApp {
                             }
                             if ui.button("Next →").clicked() {
                                 self.simple_ux.wizard_step = WizardStep::ConnectCheck;
+                                if !self.is_connected {
+                                    self.selected_device_idx =
+                                        crate::transport::TransportDevice::preferred_index(&self.devices);
+                                }
                             }
                         });
                     }
                     WizardStep::ConnectCheck => {
                         ui.heading("Connection check");
-                        self.select_virtual_device();
                         self.paint_connect_controls(ui, 260.0);
                         ui.add_space(6.0);
                         if self.is_connected {
@@ -608,8 +631,13 @@ impl WidebandApp {
                             self.simple_ux.complete_first_run();
                             self.simple_ux.set_skill_level(SkillLevel::Beginner);
                             self.simple_ux.beginner_step = BeginnerStep::Connect;
-                            if !self.is_connected {
-                                self.select_virtual_device();
+                            // Practice runs on the Virtual ECU only; a real cable connects when the user asks.
+                            let virtual_selected = self
+                                .devices
+                                .get(self.selected_device_idx)
+                                .map(|d| d.is_virtual_bench())
+                                .unwrap_or(false);
+                            if !self.is_connected && virtual_selected {
                                 self.connect_cable();
                             }
                         }

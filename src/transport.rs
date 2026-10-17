@@ -85,6 +85,15 @@ impl TransportDevice {
         self.kind == TransportKind::VirtualBench
     }
 
+    /// Index to preselect: the first ready USB J2534 cable, else the first row (Virtual ECU).
+    /// The Virtual ECU stays an explicit choice whenever a real cable is installed.
+    pub fn preferred_index(devices: &[TransportDevice]) -> usize {
+        devices
+            .iter()
+            .position(|d| d.kind == TransportKind::UsbJ2534 && d.availability == TransportAvailability::Ready)
+            .unwrap_or(0)
+    }
+
     pub fn is_connectable(&self) -> bool {
         if self.kind == TransportKind::VirtualBench {
             return self.availability == TransportAvailability::Ready;
@@ -605,6 +614,22 @@ mod tests {
         });
         assert!(dev.list_label().contains("DLL not found"));
         assert_eq!(dev.kind, TransportKind::UsbJ2534);
+    }
+
+    #[test]
+    fn preferred_index_picks_ready_cable_over_virtual() {
+        let missing = from_j2534(&J2534DeviceInfo {
+            name: "Gone".into(),
+            vendor: "V".into(),
+            library_path: r"C:\missing.dll".into(),
+            is_virtual: false,
+            exists: false,
+        });
+        let mut ready = missing.clone();
+        ready.display_name = "MVCI Autokent-X64 - 1.4.3".into();
+        ready.availability = TransportAvailability::Ready;
+        assert_eq!(TransportDevice::preferred_index(&[virtual_device(), missing.clone()]), 0);
+        assert_eq!(TransportDevice::preferred_index(&[virtual_device(), missing, ready]), 2);
     }
 
     #[test]
